@@ -116,6 +116,15 @@ class EchoTool:
 
 `Bash` runs `/bin/bash -c <command>` with the agent process permissions. The default timeout is 120 seconds and the maximum is 600 seconds.
 
+Commands run at lowered CPU priority so a build or test run started by the agent yields CPU time to interactive work under contention. The `nice` setting is an increment, as in `nice -n`, and defaults to `19`; children inherit it. On Linux kernels with scheduler autogroups, Bash also attempts to lower the command's autogroup priority, since process nice alone may not compete across autogroups. This write is best-effort: the kernel can reject rapid concurrent writes, so some simultaneous commands may keep autogroup nice `0` even though their processes are niced. On macOS the command also runs under `taskpolicy -c utility`. If `nice` is not on `PATH`, process niceness is unchanged (macOS `taskpolicy` can still apply). Niceness orders CPU time only; it does not limit memory use.
+
+```bash
+sagent --tool Bash.nice=10   # milder
+sagent --tool Bash.nice=0    # normal priority
+```
+
+Inside the REPL, `/tool Bash.nice=0` changes it for later commands. Subagents spawned from then on inherit the new value. Values outside `0..19` are rejected.
+
 When `Bash` is constructed with peer tools, it can warn the model when a dedicated tool should be used instead of a shell command.
 
 ## Web tools

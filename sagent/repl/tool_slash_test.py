@@ -72,6 +72,18 @@ def test_invalid_value_names_the_choices() -> None:
     assert _output_of(agent) == "on"
 
 
+def test_bash_nice_is_live_settable_and_range_checked() -> None:
+    agent = _agent()
+    printer = RecordingPrinter()
+    _dispatch_tool(agent, "Bash.nice=99", printer)
+    assert printer.tool_errors
+    assert "Bash.nice" in printer.tool_errors[0]
+    _dispatch_tool(agent, "Bash.nice=0", printer)
+    tool = agent.tools_map["Bash"]
+    assert isinstance(tool, Bash)
+    assert tool.nice == 0
+
+
 if __name__ == "__main__":
     from sagent.lib.testing.main import test_main
 

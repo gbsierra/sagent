@@ -98,6 +98,8 @@ Use `--tools none` for a model-only run with no tools.
 
 `Bash` is wired with its sibling tools so it can suggest dedicated alternatives, such as `Grep` instead of shell grep, when those tools are available.
 
+`Bash` commands run at lowered CPU priority (`nice` increment `19` by default). Use `--tool Bash.nice=N` with `N` in `0..19` to change it; `--tool Bash.nice=0` runs commands at normal priority. See [Tools](tools.md#bash).
+
 `--add-dir DIR...` adds extra directories whose `AGENTS.md` files extend the prompt beyond the current working directory.
 
 ## Sessions

@@ -18,8 +18,10 @@ import functools
 import logging
 import os
 import secrets
+import shutil
 import signal
 import subprocess
+import sys
 import time
 
 from sagent.agent.runtime import EXCLUSIVE_KEY
@@ -41,7 +43,7 @@ from sagent.tools.lib.bash import (
     cached_parse_bash,
     is_read_only,
 )
-from sagent.tools.tool_spec import CLI_SETTABLE
+from sagent.tools.tool_spec import CLI_SETTABLE, ToolSpecError
 from sagent.types.runtime import ToolResult
 
 
@@ -57,6 +59,7 @@ logger = logging.getLogger(__name__)
 
 BASH_DEFAULT_TIMEOUT_MS = 120_000  # house-ignore[globals] -- Default timeout dial.
 BASH_MAX_TIMEOUT_MS = 600_000  # house-ignore[globals] -- Max timeout dial.
+_MAX_NICE = 19  # house-ignore[globals] -- Lowest priority an unprivileged process gets.
 
 # Kept-alive references to background subprocesses so their Popen
 # objects don't get garbage-collected mid-run.
@@ -119,6 +122,9 @@ class Bash:
       output_max_width: Cell width cap; ``0`` uses the pane width.
       output_wrap: ``wrap`` continues an over-wide line on the next row,
           ``chop`` keeps its head and marks the cut.
+      nice: Niceness increment for every command, as in ``nice -n``;
+          ``0`` leaves the priority alone. Commands then yield the CPU to
+          the user's interactive work instead of competing with it.
 
     """
 
@@ -174,6 +180,16 @@ class Bash:
     output_tail_rows: Annotated[int, CLI_SETTABLE] = 2
     output_max_width: Annotated[int, CLI_SETTABLE] = 0
     output_wrap: Annotated[Wrap, CLI_SETTABLE] = "wrap"
+    nice: Annotated[int, CLI_SETTABLE] = 19
+
+    # ``ToolSpecError`` rather than a bare ``ValueError``: it is what both the
+    # ``--tool`` and ``/tool`` paths report as a usage error instead of a traceback.
+    def __post_init__(self) -> None:
+        """Reject a niceness an unprivileged process cannot request."""
+        if not 0 <= self.nice <= _MAX_NICE:
+            raise ToolSpecError(
+                f"Bash.nice: expected 0..{_MAX_NICE}, got {self.nice}",
+            )
 
     def summary(self, args: Mapping[str, object]) -> str:
         """Return the header and input rows for this invocation.
@@ -281,12 +297,13 @@ class Bash:
         state = get_tool_state()
         _ensure_valid_cwd(state)
         if run_as_fully_detached:
-            text = _run_as_fully_detached(command, state=state)
+            text = _run_as_fully_detached(command, state=state, nice=self.nice)
         else:
             text = await _run_foreground(
                 command,
                 state=state,
                 timeout_s=_timeout_seconds(timeout),
+                nice=self.nice,
             )
         body = text
         if not self._peer_matchers:
@@ -326,10 +343,57 @@ def _ensure_valid_cwd(state: ToolState) -> None:
         state.bash_cwd = state.start_cwd if Path(state.start_cwd).is_dir() else "/"
 
 
-def _run_as_fully_detached(command: str, *, state: ToolState) -> str:
+# An argv prefix, not ``preexec_fn``: that runs Python between ``fork`` and ``exec``,
+# which is unsafe in a process with threads. ``nice`` and ``taskpolicy`` both exec
+# their target, so the pid ``killpg`` addresses is still the bash session leader's.
+def _priority_prefix(nice: int, *, platform: str | None = None) -> list[str]:
+    """Return the argv prefix that runs a command at lowered CPU priority.
+
+    Args:
+      nice: Niceness increment; ``0`` returns no prefix.
+      platform: ``sys.platform`` string. Override for testing; ``None``
+        reads ``sys.platform``.
+
+    Returns:
+      prefix: Absolute-path argv to place before ``/bin/bash``.
+
+    """
+    if nice == 0:
+        return []
+    platform = platform or sys.platform
+    prefix: list[str] = []
+    # macOS schedules by QoS class, which ``nice`` does not change.
+    taskpolicy = shutil.which("taskpolicy") if platform == "darwin" else None
+    if taskpolicy is not None:
+        prefix += [taskpolicy, "-c", "utility"]
+    nice_bin = shutil.which("nice")
+    if nice_bin is None:
+        logger.debug("nice not on PATH; Bash commands run at normal priority")
+    else:
+        prefix += [nice_bin, "-n", str(nice)]
+    return prefix
+
+
+# With scheduler autogroups enabled, ``start_new_session`` puts every command in a
+# fresh autogroup, and per-process nice ranks threads only WITHIN their autogroup: a
+# niced build would still split the CPU evenly with the desktop. The write is
+# best-effort and silent -- the file is absent without autogroups (WSL2, macOS), and
+# the kernel limits unprivileged writers to one write per 100ms. Same line as what
+# follows, so bash's error line numbers for the command do not shift.
+def _autogroup_prelude(nice: int) -> str:
+    """Return shell text that nices the command's own autogroup."""
+    return f"echo {nice} 2>/dev/null >/proc/self/autogroup; " if nice else ""
+
+
+def _run_as_fully_detached(command: str, *, state: ToolState, nice: int = 0) -> str:
     """Spawn an unmanaged detached background process."""
     proc = subprocess.Popen(  # noqa: S603 -- The agent's own command runs through a fixed bash argv; that is this tool's purpose.
-        ["/bin/bash", "-c", command],
+        [
+            *_priority_prefix(nice),
+            "/bin/bash",
+            "-c",
+            f"{_autogroup_prelude(nice)}{command}",
+        ],
         cwd=state.bash_cwd,
         # Bash must not share the REPL terminal; interactive children
         # otherwise steal prompt-toolkit keystrokes from the user.
@@ -353,7 +417,13 @@ def _timeout_seconds(timeout_ms: float) -> float:
     return min(max(timeout_ms, 1), BASH_MAX_TIMEOUT_MS) / 1000
 
 
-async def _run_foreground(command: str, *, state: ToolState, timeout_s: float) -> str:
+async def _run_foreground(
+    command: str,
+    *,
+    state: ToolState,
+    timeout_s: float,
+    nice: int = 0,
+) -> str:
     """Run a foreground bash command via :mod:`asyncio.subprocess`."""
     sentinel = f"__SAGENT_CWD_{secrets.token_hex(4)}__"
     # ``printf`` with a LEADING newline, not ``echo``: a command whose
@@ -376,8 +446,12 @@ async def _run_foreground(command: str, *, state: ToolState, timeout_s: float) -
     # into this text: bash reads a script line-wise, so a command ending
     # in a continuation (``echo hi \``) consumed the very next line and
     # printed ``__rc=0`` as its own output.
-    tracked_cmd = f"trap '{report}' EXIT\neval \"$1\"\n__rc=$?\n{report}\nexit $__rc"
+    tracked_cmd = (
+        f"{_autogroup_prelude(nice)}trap '{report}' EXIT\n"
+        f'eval "$1"\n__rc=$?\n{report}\nexit $__rc'
+    )
     proc = await asyncio.create_subprocess_exec(
+        *_priority_prefix(nice),
         "/bin/bash",
         "-c",
         tracked_cmd,

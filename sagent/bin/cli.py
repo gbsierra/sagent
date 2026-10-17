@@ -221,10 +221,14 @@ def resolve_tools(
     peers = tuple(non_bash.values())
     for name in names:
         if name == "Bash":
-            bash = tools.Bash(
-                peers=peers,
-                **_tool_kwargs(tools.Bash, by_tool.get(name, {})),
-            )
+            # The constructor range-checks values that coerced cleanly, e.g. ``nice``.
+            try:
+                bash = tools.Bash(
+                    peers=peers,
+                    **_tool_kwargs(tools.Bash, by_tool.get(name, {})),
+                )
+            except ToolSpecError as exc:
+                raise SystemExit(str(exc)) from exc
             resolved.append(bash)
         else:
             resolved.append(non_bash[name])

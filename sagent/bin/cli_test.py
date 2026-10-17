@@ -1023,6 +1023,11 @@ def test_resolve_tools_known_subset_includes_bash() -> None:
     assert names == ["Read", "Bash"]
 
 
+def test_resolve_tools_out_of_range_bash_nice_exits_cleanly() -> None:
+    with pytest.raises(SystemExit, match=r"Bash\.nice"):
+        _ = resolve_tools(["Bash"], overrides={"Bash": {"nice": "20"}})
+
+
 def test_last_assistant_text_empty() -> None:
     assert _last_assistant_text([]) == ""
 

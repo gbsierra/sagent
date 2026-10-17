@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, cast
 from unittest.mock import MagicMock
 
 import asyncio
+import os
 import re
 import warnings
 
@@ -21,8 +22,10 @@ from sagent.tools.bash import (
     BASH_DEFAULT_TIMEOUT_MS,
     BASH_MAX_TIMEOUT_MS,
     Bash,
+    _autogroup_prelude,
     _ensure_valid_cwd,
     _kill_process_group,
+    _priority_prefix,
     _process_output,
     _reap_at_exit,
     _render_bash_description,
@@ -32,6 +35,7 @@ from sagent.tools.bash import (
     reap_background_processes,
 )
 from sagent.tools.core import result_token_budget
+from sagent.tools.tool_spec import ToolSpecError
 
 
 if TYPE_CHECKING:
@@ -724,6 +728,172 @@ def test_a_writer_serializes_against_a_same_cohort_file_edit() -> None:
 def test_an_unparseable_command_is_treated_as_a_writer() -> None:
     """A command we cannot classify must not be assumed harmless."""
     assert Bash().serialize_key({"command": "cat <<'EOF'\nhi\nEOF"}) is not None
+
+
+# ``nice`` is an increment clamped at 19, so the expectation depends on the
+# niceness the test process itself already runs at (pre-commit runs at 19).
+def _niced(increment: int) -> int:
+    return min(19, os.nice(0) + increment)
+
+
+async def _run_in(tool: Bash, tmp_path: Path, command: str) -> str:
+    with with_fake_agent() as agent:
+        agent.tool_state.bash_cwd = str(tmp_path)
+        result = await tool.run({"command": command})
+    return result.content
+
+
+@pytest.mark.asyncio
+async def test_commands_run_at_lowered_cpu_priority_by_default(tmp_path: Path) -> None:
+    out = await _run_in(Bash(), tmp_path, "ps -o ni= -p $$")
+    assert int(out) == _niced(19), out
+
+
+@pytest.mark.asyncio
+async def test_descendants_inherit_the_lowered_priority(tmp_path: Path) -> None:
+    out = await _run_in(Bash(), tmp_path, "sh -c 'ps -o ni= -p $$'")
+    assert int(out) == _niced(19), out
+
+
+@pytest.mark.asyncio
+async def test_nice_setting_is_an_increment(tmp_path: Path) -> None:
+    out = await _run_in(Bash(nice=5), tmp_path, "ps -o ni= -p $$")
+    assert int(out) == _niced(5), out
+
+
+@pytest.mark.asyncio
+async def test_nice_zero_leaves_priority_unchanged(tmp_path: Path) -> None:
+    out = await _run_in(Bash(nice=0), tmp_path, "ps -o ni= -p $$")
+    assert int(out) == os.nice(0), out
+
+
+@pytest.mark.asyncio
+async def test_lowering_priority_adds_no_output(tmp_path: Path) -> None:
+    """The autogroup write is best-effort; its failure must stay silent."""
+    assert await _run_in(Bash(), tmp_path, "echo hi") == "hi"
+    assert await _run_in(Bash(), tmp_path, "echo hi; exit 3") == "hi\n[exit code: 3]"
+
+
+@pytest.mark.asyncio
+async def test_lowered_priority_keeps_cwd_tracking_and_exit_code(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "sub").mkdir()
+    with with_fake_agent() as agent:
+        agent.tool_state.bash_cwd = str(tmp_path)
+        result = await Bash().run({"command": "cd sub; ps -o ni= -p $$; exit 4"})
+        assert agent.tool_state.bash_cwd == str(tmp_path / "sub")
+    assert result.content == f"{_niced(19)}\n[exit code: 4]"
+
+
+def test_autogroup_prelude_attempts_to_lower_the_group() -> None:
+    assert _autogroup_prelude(19) == "echo 19 2>/dev/null >/proc/self/autogroup; "
+    assert _autogroup_prelude(0) == ""
+
+
+@pytest.mark.skipif(
+    not Path("/proc/self/autogroup").exists(),
+    reason="kernel has no scheduler autogroups",
+)
+@pytest.mark.asyncio
+async def test_new_session_autogroup_write_is_best_effort(tmp_path: Path) -> None:
+    """A rejected autogroup write must not prevent the command from running."""
+    out = await _run_in(Bash(), tmp_path, "cat /proc/self/autogroup")
+    # Rapid concurrent writes can be rejected by the kernel. Process nice is
+    # asserted separately; both group outcomes are valid for this tool.
+    assert out.endswith(("nice 0", "nice 19")), out
+
+
+@pytest.mark.asyncio
+async def test_missing_nice_binary_degrades_to_normal_priority(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def _not_found(name: str) -> None:
+        del name
+
+    monkeypatch.setattr("sagent.tools.bash.shutil.which", _not_found)
+    (tmp_path / "sub").mkdir()
+    with with_fake_agent() as agent:
+        agent.tool_state.bash_cwd = str(tmp_path)
+        result = await Bash().run({"command": "cd sub; ps -o ni= -p $$; exit 4"})
+        assert agent.tool_state.bash_cwd == str(tmp_path / "sub")
+    assert result.content == f"{os.nice(0)}\n[exit code: 4]"
+
+
+@pytest.mark.asyncio
+async def test_detached_commands_run_at_lowered_priority(tmp_path: Path) -> None:
+    out = tmp_path / "ni"
+    with with_fake_agent() as agent:
+        agent.tool_state.bash_cwd = str(tmp_path)
+        _ = await Bash().run(
+            {
+                "command": f"ps -o ni= -p $$ > {out}.tmp; mv {out}.tmp {out}",
+                "run_as_fully_detached": True,
+            },
+        )
+    for _ in range(100):
+        if out.exists():
+            break
+        await asyncio.sleep(0.05)
+    reap_background_processes()
+    assert int(out.read_text()) == _niced(19)
+
+
+@pytest.mark.asyncio
+async def test_timeout_still_kills_the_niced_group(tmp_path: Path) -> None:
+    """``nice`` execs bash, so the group leader's pid is still the session id."""
+    pid_file = tmp_path / "pid"
+    with with_fake_agent() as agent:
+        agent.tool_state.bash_cwd = str(tmp_path)
+        result = await asyncio.wait_for(
+            Bash().run(
+                {"command": f"sleep 30 & echo $! > {pid_file}; wait", "timeout": 300},
+            ),
+            timeout=5.0,
+        )
+    assert "timeout" in result.content
+    pid = int(pid_file.read_text())
+    for _ in range(50):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        await asyncio.sleep(0.05)
+    else:
+        pytest.fail(f"backgrounded sleep {pid} survived the timeout")
+
+
+def _which_usr_bin(name: str) -> str:
+    return f"/usr/bin/{name}"
+
+
+def test_priority_prefix_uses_taskpolicy_on_macos(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("sagent.tools.bash.shutil.which", _which_usr_bin)
+    assert _priority_prefix(19, platform="darwin") == [
+        "/usr/bin/taskpolicy",
+        "-c",
+        "utility",
+        "/usr/bin/nice",
+        "-n",
+        "19",
+    ]
+    assert _priority_prefix(0, platform="darwin") == []
+
+
+def test_priority_prefix_skips_taskpolicy_off_macos(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("sagent.tools.bash.shutil.which", _which_usr_bin)
+    assert _priority_prefix(10, platform="linux") == ["/usr/bin/nice", "-n", "10"]
+
+
+@pytest.mark.parametrize("value", [-1, 20])
+def test_nice_outside_the_unprivileged_range_is_rejected(value: int) -> None:
+    with pytest.raises(ToolSpecError, match=r"Bash\.nice"):
+        _ = Bash(nice=value)
 
 
 if __name__ == "__main__":
