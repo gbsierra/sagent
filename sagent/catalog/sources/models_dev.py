@@ -103,8 +103,13 @@ _MINIMAX_OUTPUT: Final = (
     "text-chat-openai caps max_completion_tokens at 524,288 for M3 and "
     "204,800 for the rest (read 2026-10-18)"
 )
-_QWEN36_FLASH: Final = (
-    "the international table states $0.25 / $1.5 (model-pricing read 2026-10-18)"
+_QWEN_INPUT: Final = (
+    "models.dev lists the 1M context as the input cap; the model page states "
+    "991,808 (read 2026-10-20)"
+)
+_DELISTED: Final = (
+    "the vendor's pages no longer list this model (read 2026-10-20); Sagent "
+    "keeps the 2026-10-03 read"
 )
 
 ACCEPTED: Final[Mapping[tuple[str, str], tuple[float, str]]] = MappingProxyType(
@@ -116,6 +121,12 @@ ACCEPTED: Final[Mapping[tuple[str, str], tuple[float, str]]] = MappingProxyType(
         ("gpt-5.2", "limit.input"): (272_000, _WINDOW),
         ("gpt-5.2-pro", "limit.input"): (272_000, _WINDOW),
         ("gpt-5.1", "limit.input"): (272_000, _WINDOW),
+        ("qwen3.8-max", "limit.input"): (1_000_000, _QWEN_INPUT),
+        ("qwen3.8-flash", "limit.input"): (1_000_000, _QWEN_INPUT),
+        ("qwen3.7-max", "limit.input"): (1_000_000, _QWEN_INPUT),
+        ("qwen3.7-plus", "limit.input"): (1_000_000, _QWEN_INPUT),
+        ("qwen3.6-plus", "limit.input"): (1_000_000, _QWEN_INPUT),
+        ("qwen3.6-flash", "limit.input"): (1_000_000, _QWEN_INPUT),
         ("qwen3.8-max", "cost.cache_write"): (2.5, _IMPLICIT_WRITE),
         ("qwen3.8-flash", "cost.cache_write"): (0.2, _IMPLICIT_WRITE),
         ("qwen3.7-max", "cost.cache_write"): (3.125, _IMPLICIT_WRITE),
@@ -123,17 +134,20 @@ ACCEPTED: Final[Mapping[tuple[str, str], tuple[float, str]]] = MappingProxyType(
         ("qwen3.7-flash", "cost.cache_write"): (0.0375, _IMPLICIT_WRITE),
         ("qwen3.6-max-preview", "cost.cache_write"): (1.625, _IMPLICIT_WRITE),
         ("qwen3.6-plus", "cost.cache_write"): (0.625, _IMPLICIT_WRITE),
-        ("qwen3.6-flash", "cost.cache_write"): (0.234375, _IMPLICIT_WRITE),
+        ("qwen3.6-flash", "cost.cache_write"): (0.3125, _IMPLICIT_WRITE),
         ("qwen3.7-plus", "cost.cache_read"): (0.04, _IMPLICIT_HIT),
         ("qwen3.7-flash", "cost.cache_read"): (0.003, _IMPLICIT_HIT),
         ("qwen3.6-max-preview", "cost.cache_read"): (0.13, _EXPLICIT_ONLY),
         ("qwen3.6-plus", "cost.cache_read"): (0.05, _EXPLICIT_ONLY),
-        ("qwen3.6-flash", "cost.input"): (0.1875, _QWEN36_FLASH),
-        ("qwen3.6-flash", "cost.output"): (1.125, _QWEN36_FLASH),
+        ("qwen3.6-flash", "cost.cache_read"): (0.025, _EXPLICIT_ONLY),
+        ("qwen3-32b", "limit.input"): (131_072, _DELISTED),
+        ("qwen3-32b", "limit.output"): (16_384, _DELISTED),
+        ("qwen3-32b", "cost.input"): (0.7, _DELISTED),
+        ("qwen3-32b", "cost.output"): (2.8, _DELISTED),
+        ("qwen-turbo", "limit.output"): (16_384, _DELISTED),
         ("kimi-k2.6", "limit.output"): (262_144, _K2_OUTPUT),
         ("kimi-k2.7-code", "limit.output"): (262_144, _K2_OUTPUT),
         ("kimi-k2.7-code-highspeed", "limit.output"): (262_144, _K2_OUTPUT),
-        ("MiniMax-M3", "limit.output"): (512_000, _MINIMAX_OUTPUT),
         ("MiniMax-M2.7", "limit.output"): (131_072, _MINIMAX_OUTPUT),
         ("MiniMax-M2.7-highspeed", "limit.output"): (131_072, _MINIMAX_OUTPUT),
         ("MiniMax-M2.5", "limit.output"): (131_072, _MINIMAX_OUTPUT),
@@ -160,10 +174,14 @@ async def fetch(*, warn: Warn) -> dict[str, dict[str, object]] | None:
         try:
             r = await client.get(URL)
             r.raise_for_status()
+            body = r.json()
         except httpx2.HTTPError as e:
             warn(f"models.dev: {describe(e)}")
             return None
-    body = from_plain(r.json(), dict[str, object], default={})
+        except ValueError:
+            warn("models.dev: response is not JSON")
+            return None
+    body = from_plain(body, dict[str, object], default={})
     out: dict[str, dict[str, object]] = {}
     for key, raw in body.items():
         provider = from_plain(raw, dict[str, object], default={})

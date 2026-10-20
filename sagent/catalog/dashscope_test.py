@@ -1,4 +1,6 @@
-"""DashScope catalog rows against Model Studio's published tables (2026-10-03)."""
+"""DashScope catalog rows against the qwencloud model pages (2026-10-20)
+and Model Studio's published tables (2026-10-03).
+"""
 
 from __future__ import annotations
 
@@ -51,10 +53,15 @@ def test_a_prompt_bills_its_whole_band(
 @pytest.mark.parametrize(
     ("model_id", "cache_read"),
     [
+        # The 3.8 pages publish the implicit-cache hit price.
+        ("qwen3.8-max", 0.25),
+        ("qwen3.8-flash", 0.016),
+        ("qwen3.8-27b", 0.1),
+        ("qwen3.8-2.4t-a95b", 0.25),
+        # 3.7 states the rate instead: implicit hits bill 20% of input
+        # (qwen-turbo keeps its 2026-10-03 read).
         ("qwen3.7-plus", 0.08),
         ("qwen-turbo", 0.01),
-        # Unpublished (console only): billed at the input rate.
-        ("qwen3.8-max", 2.0),
         # Explicit-cache only in Singapore: no implicit discount.
         ("qwen3.6-plus", 0.5),
     ],
@@ -62,6 +69,62 @@ def test_a_prompt_bills_its_whole_band(
 def test_cache_hits_bill_the_published_rate(model_id: str, cache_read: float) -> None:
     price = dashscope.models()[model_id].prices[PriceKey("auto")]
     assert price.cache_read == pytest.approx(cache_read)
+
+
+@pytest.mark.parametrize(
+    ("model_id", "max_request", "max_response"),
+    [
+        # Live pages (2026-10-20): 991,808 of the 1M window in, one output
+        # cap per family.
+        ("qwen3.8-max", 991_808, 131_072),
+        ("qwen3.8-flash", 991_808, 131_072),
+        ("qwen3.8-27b", 991_808, 131_072),
+        ("qwen3.8-2.4t-a95b", 991_808, 131_072),
+        ("qwen3.7-max", 991_808, 131_072),
+        ("qwen3.7-plus", 991_808, 131_072),
+        ("qwen3.7-flash", 991_808, 131_072),
+        ("qwen3.6-plus", 991_808, 65_536),
+        ("qwen3.6-flash", 991_808, 65_536),
+        # Pages gone; the 2026-10-03 read stands.
+        ("qwen3.6-max-preview", 262_144, 65_536),
+        ("qwen3-32b", 262_144, 65_536),
+        ("qwen-plus", 1_000_000, 32_768),
+        ("qwen-turbo", 1_000_000, 32_768),
+    ],
+)
+def test_the_model_pages_state_the_caps_the_api_enforces(
+    model_id: str,
+    max_request: int,
+    max_response: int,
+) -> None:
+    limits = dashscope.models()[model_id].context[""]
+    assert limits.max_request_tokens == max_request
+    assert limits.max_response_tokens == max_response
+
+
+@pytest.mark.parametrize(
+    ("model_id", "takes_images"),
+    [
+        ("qwen3.8-max", True),
+        ("qwen3.8-flash", True),
+        # The 27B page lists image and video input.
+        ("qwen3.8-27b", True),
+        ("qwen3.7-plus", True),
+        ("qwen3.7-flash", True),
+        ("qwen3.6-plus", True),
+        ("qwen3.6-flash", True),
+        # qwen3.7-max "currently offers a pure-text-only interface"; the
+        # 2.4T release ships no image input either.
+        ("qwen3.7-max", False),
+        ("qwen3.8-2.4t-a95b", False),
+    ],
+)
+def test_image_input_follows_the_model_pages(
+    model_id: str,
+    takes_images: bool,
+) -> None:
+    limits = dashscope.models()[model_id].context[""]
+    assert bool(limits.max_image_bytes) is takes_images
 
 
 def test_roles_name_the_vendor_recommendations() -> None:

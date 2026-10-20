@@ -41,7 +41,8 @@ ProviderClass.from_env().model("utility")
 Catalog keys are the provider's own model IDs, exactly as its API takes and
 reports them: `gpt-6.1-sol`, `claude-opus-5-5`, `gemini-3.1-pro-preview`,
 `MiniMax-M3`. Sagent infers nothing from how an ID is spelled, so a family word
-such as `opus` or `sol` is not a model. The roles `default`, `utility`, and
+such as `opus` is not a model. (`sol` and `luna` work because OpenAI declares
+them as explicit aliases, not because Sagent guesses.) The roles `default`, `utility`, and
 `best` each name one ID explicitly. When a provider publishes both a moving
 alias and the dated snapshot it points at, both are rows with the same facts.
 The names Sagent used before (`opus-5.5`, `sol-6.1`) still load from saved

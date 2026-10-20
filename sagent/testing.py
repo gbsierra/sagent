@@ -108,7 +108,7 @@ class MockModelCaps:
     @property
     def capability(self) -> ModelCapability:
         """Derive the capability row from this mock's configured limits."""
-        thinking: frozenset[ThinkingEffort] = frozenset({"none", *self.valid_efforts})
+        thinking: frozenset[ThinkingEffort] = frozenset(self.valid_efforts)
         return ModelCapability(
             model_id=self.model_id,
             context=MappingProxyType(

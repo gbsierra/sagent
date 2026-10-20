@@ -236,18 +236,26 @@ async def check_drift(report_path: pathlib.Path | None) -> int:
         needs review; nothing is written otherwise.
 
     Returns:
-      error_count: Disagreements needing review, plus stale triage entries;
-        ``1`` when models.dev could not be read.
+      error_count: Disagreements needing review, plus stale triage entries,
+        plus providers models.dev no longer lists; ``1`` when models.dev
+        could not be read.
 
     """
     upstream = await models_dev.fetch(warn=_warn)
     if upstream is None:
         return 1
-    drifts = [
-        drift
-        for key, table in models_dev.CATALOGS.items()
-        for drift in models_dev.compare(key, table(), upstream.get(key, {}))
-    ]
+    drifts: list[models_dev.Drift] = []
+    errors = 0
+    for key, table in models_dev.CATALOGS.items():
+        rows = upstream.get(key)
+        # A provider key vanishing or emptying upstream must not read as "no
+        # drift": Anthropic and Google carry no triage pins, so nothing else
+        # would notice their comparisons silently stopping.
+        if not rows:
+            _out(f"  {key}: models.dev lists no models; provider key moved?")
+            errors += 1
+            continue
+        drifts.extend(models_dev.compare(key, table(), rows))
     for d in drifts:
         if not d.accepted:
             _out(
@@ -264,7 +272,7 @@ async def check_drift(report_path: pathlib.Path | None) -> int:
     leftover = models_dev.stale(drifts)
     for mid, field in leftover:
         _out(f"  {mid}: {field} triage matches no current disagreement")
-    return sum(1 for d in drifts if not d.accepted) + len(leftover)
+    return errors + sum(1 for d in drifts if not d.accepted) + len(leftover)
 
 
 def main() -> int:

@@ -1,14 +1,17 @@
 """DashScope/Qwen model catalog, expressed as ``ModelCapability`` rows.
 
-Sources (international / Singapore deployment, list prices): limits, prices,
-and thinking per ``_SOURCES``; also
+Sources (international / Singapore deployment, list prices): each live
+model's page at https://www.qwencloud.com/models/<id> (read 2026-10-20)
+for its limits and flat prices, ``_SOURCES`` for the rest; also
   https://www.alibabacloud.com/help/en/model-studio/context-cache
   https://www.alibabacloud.com/help/en/model-studio/vision
 
 A row carries only what the MODEL can do; caching, retry, and auth mode
-are transport facts declared by ``openai.compatible()``. Model Studio
-publishes max output only in its console, so every row keeps the 64K cap
-it has always shipped.
+are transport facts declared by ``openai.compatible()``. The model pages
+state the caps the API enforces: a 991,808-token input cap inside the
+advertised 1M window (thinking mode trims it to 983K), and one output
+cap per family, 131,072 for Qwen 3.7 / 3.8 and 65,536 for 3.6. Rows
+whose page is gone keep the 2026-10-03 read of the text-generation table.
 
 Thinking axes: ``budget`` ``none`` is ``enable_thinking=false``; ``auto``
 thinks at the model's default depth; ``fixed`` caps it with
@@ -68,44 +71,53 @@ def models() -> ModelTable:
         output=frozenset({"none", "text"}),
     )
     # Images ride as base64 data URIs, capped at 20 MB as a STRING; base64
-    # inflates 4/3, so raw bytes above ~15 MB would be rejected.
-    vision = _limits(image_bytes=14_000_000)
+    # inflates 4/3, so raw bytes above ~15 MB would be rejected. Every live
+    # model page states the input cap the API enforces, 991,808 of the 1M
+    # window, and the output cap per family: 131,072 for Qwen 3.7 / 3.8,
+    # 65,536 for 3.6. Thinking mode trims the input cap to 983K.
+    vision = _limits(max_tokens=991_808, output_tokens=131_072, image_bytes=14_000_000)
+    vision_64k = _limits(
+        max_tokens=991_808,
+        output_tokens=65_536,
+        image_bytes=14_000_000,
+    )
+    # Text-only rows: qwen3.7-max "currently offers a pure-text-only
+    # interface", and the 2.4T release ships no image input.
+    text = _limits(max_tokens=991_808, output_tokens=131_072)
     rows = (
         ModelCapability(
             model_id="qwen3.8-max",
             context=vision,
-            # Cache-hit rate unpublished (console only).
-            prices=_prices((0, 2.0, 6.0), cache_hit=1.0),
+            prices=_prices((0, 2.0, 6.0), cache_read=0.25),
             thinking=levels,
             effort_as_level=True,
         ),
         ModelCapability(
             model_id="qwen3.8-flash",
             context=vision,
-            # Cache-hit rate unpublished (console only).
-            prices=_prices((0, 0.15, 0.47), cache_hit=1.0),
+            prices=_prices((0, 0.15, 0.47), cache_read=0.016),
             thinking=levels,
             effort_as_level=True,
         ),
         ModelCapability(
             model_id="qwen3.8-27b",
-            context=_limits(),
-            prices=_prices((0, 0.5, 3.0), cache_hit=0.2),
+            # The model page lists image and video input for this release.
+            context=vision,
+            prices=_prices((0, 0.5, 3.0), cache_read=0.1),
             thinking=levels,
             effort_as_level=True,
         ),
         ModelCapability(
             model_id="qwen3.8-2.4t-a95b",
-            context=_limits(),
-            # Cache-hit rate unpublished (console only).
-            prices=_prices((0, 2.0, 6.0), cache_hit=1.0),
+            context=text,
+            prices=_prices((0, 2.0, 6.0), cache_read=0.25),
             # "Supports thinking mode only": no ``enable_thinking=false``.
             thinking=replace(levels, budget=frozenset({"auto"})),
             effort_as_level=True,
         ),
         ModelCapability(
             model_id="qwen3.7-max",
-            context=vision,
+            context=text,
             prices=_prices((0, 2.5, 7.5), cache_hit=0.2),
             thinking=hybrid,
         ),
@@ -136,13 +148,13 @@ def models() -> ModelTable:
         ),
         ModelCapability(
             model_id="qwen3.6-plus",
-            context=vision,
+            context=vision_64k,
             prices=_prices((0, 0.5, 3.0), (256_000, 2.0, 6.0), cache_hit=1.0),
             thinking=hybrid,
         ),
         ModelCapability(
             model_id="qwen3.6-flash",
-            context=vision,
+            context=vision_64k,
             prices=_prices((0, 0.25, 1.5), (256_000, 1.0, 4.0), cache_hit=1.0),
             thinking=hybrid,
         ),
@@ -192,8 +204,9 @@ def models() -> ModelTable:
         ModelCapability(
             model_id="qwen-plus",
             context=_limits(output_tokens=32_768),
-            # Non-thinking card; thinking output bills $4 / $12, which no
-            # ``PriceKey`` axis can select.
+            # The page states a 995K input cap but not the exact figure, so
+            # the row keeps the 1M context. Non-thinking card; thinking
+            # output bills $4 / $12, which no ``PriceKey`` axis can select.
             prices=_prices((0, 0.4, 1.2), (256_000, 1.2, 3.6), cache_hit=0.2),
             thinking=hybrid,
         ),
@@ -250,6 +263,9 @@ def models() -> ModelTable:
             "qwen-turbo-3.0": "qwen-turbo",
         },
         sources=_SOURCES,
+        # The live rows read their limits, and where the page states every
+        # band their prices, from each model's own qwencloud page.
+        row_sources=_PAGE_READ,
     )
 
 
@@ -264,10 +280,49 @@ _SOURCES: Final[Mapping[Fact, Source]] = MappingProxyType(
 )
 
 
+def _page(mid: str, *facts: Fact) -> Mapping[Fact, Source]:
+    """Return ``facts`` sourced from the model's qwencloud page (2026-10-20)."""
+    page = Source(f"https://www.qwencloud.com/models/{mid}", date(2026, 10, 20))
+    return MappingProxyType(dict.fromkeys(facts, page))
+
+
+# Tiered rows keep the table-wide pricing source for their higher bands,
+# which no model page states.
+_PAGE_READ: Final[Mapping[str, Mapping[Fact, Source]]] = MappingProxyType(
+    {
+        mid: _page(mid, *facts)
+        for mid, facts in (
+            ("qwen3.8-max", ("limits", "prices")),
+            ("qwen3.8-flash", ("limits", "prices")),
+            ("qwen3.8-27b", ("limits", "prices")),
+            ("qwen3.8-2.4t-a95b", ("limits", "prices")),
+            ("qwen3.7-max", ("limits", "prices")),
+            ("qwen3.7-plus", ("limits",)),
+            ("qwen3.7-flash", ("limits",)),
+            ("qwen3.6-plus", ("limits",)),
+            ("qwen3.6-flash", ("limits",)),
+        )
+    },
+)
+
+
 # Implicit cache creation bills as plain input, and this transport never writes the
-# explicit marker, so a reported write bills at the input rate.
-def _prices(*bands: tuple[int, float, float], cache_hit: float) -> PriceCatalog:
+# explicit marker, so a reported write bills at the input rate. A hit bills the
+# price the model page publishes (``cache_read``) or the input rate times the
+# rate the vendor states (``cache_hit``; Qwen 3.7 hits bill 20%).
+def _prices(
+    *bands: tuple[int, float, float],
+    cache_hit: float | None = None,
+    cache_read: float | None = None,
+) -> PriceCatalog:
     """Return the published bands; each bills a whole prompt larger than its floor."""
+    if (cache_hit is None) == (cache_read is None):
+        msg = "pass exactly one of cache_hit and cache_read"
+        raise ValueError(msg)
+
+    def hit(request: float) -> float:
+        return cache_read if cache_read is not None else request * (cache_hit or 0.0)
+
     return PriceCatalog(
         {
             PriceKey("auto", floor): TokenPrice(
@@ -275,7 +330,7 @@ def _prices(*bands: tuple[int, float, float], cache_hit: float) -> PriceCatalog:
                 response=response,
                 cache_write=request,
                 cache_write_1h=0.0,
-                cache_read=request * cache_hit,
+                cache_read=hit(request),
             )
             for floor, request, response in bands
         },

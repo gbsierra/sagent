@@ -61,10 +61,14 @@ async def fetch(
             try:
                 r = await client.get(api, headers=headers, params=params)
                 r.raise_for_status()
+                body = r.json()
             except httpx2.HTTPError as e:
                 warn(f"models list: {describe(e)}")
                 break
-            body = from_plain(r.json(), dict[str, object])
+            except ValueError:
+                warn("models list: response is not JSON")
+                break
+            body = from_plain(body, dict[str, object])
             for raw in from_plain(body.get("data"), list[object], default=[]):
                 info = from_plain(raw, dict[str, object])
                 mid = from_plain(info.get("id"), str, default="")
@@ -92,7 +96,12 @@ async def fetch(
             except httpx2.HTTPError as e:
                 warn(f"{mid}: {describe(e)}")
                 continue
-            info = from_plain(r.json(), dict[str, object])
+            try:
+                info = r.json()
+            except ValueError:
+                warn(f"{mid}: response is not JSON")
+                continue
+            info = from_plain(info, dict[str, object])
             live = _model_info(mid, info, warn)
             if live is not None:
                 answered = from_plain(info.get("id"), str, default=mid)

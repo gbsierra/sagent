@@ -61,9 +61,11 @@ CACHE_TTL_SEC: Final = frozenset({300.0, 3600.0})
 # offers both, because 4.7-and-later default to ``omitted`` but accept an
 # explicit ``summarized``.
 #
-# Every row states ``none`` in each thinking set: a model that CAN think can
-# also omit an explicit thinking request, and the axis is total, so omitting it
-# would make the provider default unselectable.
+# Budget and output sets state ``none``: a model that CAN think can also skip
+# an explicit thinking request, and each axis is total, so omitting ``none``
+# would make the provider default unselectable. Effort sets omit ``none`` --
+# the Anthropic wire cannot spell it -- and the capability type adds
+# ``default`` itself.
 #
 # Knowledge cutoffs are the vendor's "reliable knowledge cutoff", and prices
 # its published table (input, output, 5m/1h cache write, cache hit), both

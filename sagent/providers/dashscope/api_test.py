@@ -98,6 +98,18 @@ def test_a_none_budget_disables_thinking() -> None:
     assert out == {"enable_thinking": False}
 
 
+def test_a_none_effort_sends_no_depth_knob() -> None:
+    """Hybrid and level rows offer effort ``none``; it must not reach the wire.
+
+    A hybrid row once crashed indexing the budget-cap table with ``none``,
+    and a level row sent the invalid ``reasoning_effort: "none"``.
+    """
+    hybrid = _body(_model("qwen3.7-plus", budget="fixed", effort="none"))
+    assert hybrid == {"enable_thinking": True}
+    level = _body(_model("qwen3.8-max", budget="auto", effort="none"))
+    assert level == {"enable_thinking": True}
+
+
 def test_a_level_row_sends_reasoning_effort_and_never_a_budget() -> None:
     """Qwen 3.8 errors when ``reasoning_effort`` and ``thinking_budget`` co-occur."""
     out = _body(_model("qwen3.8-max", budget="auto", effort="xhigh"))

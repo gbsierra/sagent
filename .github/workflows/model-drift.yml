@@ -42,9 +42,12 @@ jobs:
           uv run --frozen python -m sagent.bin.verify_models --drift --report drift.md
           status=$?
           set -e
+          # pipefail: a failed `gh issue list` must fail the step, not read as
+          # "no open issue" and create a duplicate.
+          set -o pipefail
           number="$(gh issue list --state open --search "in:title \"$TITLE\"" \
-            --json number,title --jq ".[] | select(.title == env.TITLE) | .number" \
-            | head -n 1)"
+            --json number,title \
+            --jq "[.[] | select(.title == env.TITLE)] | .[0].number // \"\"")"
           if [ -f drift.md ]; then
             if [ -n "$number" ]; then
               gh issue edit "$number" --body-file drift.md

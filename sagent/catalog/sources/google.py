@@ -44,10 +44,14 @@ async def fetch(api_key: str, *, warn: Warn) -> dict[str, LiveLimits]:
             try:
                 r = await client.get(api, headers=headers, params=params)
                 r.raise_for_status()
+                body = r.json()
             except httpx2.HTTPError as e:
                 warn(f"models list: {describe(e)}")
                 return out
-            body = from_plain(r.json(), dict[str, object])
+            except ValueError:
+                warn("models list: response is not JSON")
+                return out
+            body = from_plain(body, dict[str, object])
             for raw_model in from_plain(body.get("models"), list[object], default=[]):
                 model = from_plain(raw_model, dict[str, object])
                 short = from_plain(model.get("name"), str, default="").removeprefix(

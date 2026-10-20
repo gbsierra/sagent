@@ -73,7 +73,12 @@ class _DashScopeModel(OpenAICompatModel):
             return body
         settings = self.settings
         body["enable_thinking"] = settings.thinking_budget != "none"
-        if settings.thinking_budget == "none" or settings.thinking_effort == "default":
+        # Hybrid and level rows still offer effort ``none``; like ``default``
+        # it sends no depth knob (and indexes no budget-cap table).
+        if settings.thinking_budget == "none" or settings.thinking_effort in {
+            "default",
+            "none",
+        }:
             return body
         # Qwen 3.8 errors when ``reasoning_effort`` and ``thinking_budget``
         # arrive together, so a level row never sends the cap.

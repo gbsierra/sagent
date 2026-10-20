@@ -487,6 +487,10 @@ def _triaged_upstream() -> _Upstream:
         key = next(k for k, build in models_dev.CATALOGS.items() if mid in build())
         group, name = field.split(".")
         out.setdefault(key, {}).setdefault(mid, {}).setdefault(group, {})[name] = pinned
+    # A provider key absent upstream is an error, so every compared provider
+    # lists something; a row matching no catalog id compares nothing.
+    for key in models_dev.CATALOGS:
+        out.setdefault(key, {"__placeholder__": {}})
     return out
 
 
@@ -541,6 +545,32 @@ class TestDrift:
         out = capsys.readouterr().out
         assert "  anthropic.claude-opus-5-5: cost.input sagent=4 models.dev=99" in out
         assert out.splitlines()[-1] == "1 problem(s) found."
+
+    @pytest.mark.anyio
+    async def test_a_provider_absent_upstream_is_an_error(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        tmp_path: Path,
+    ) -> None:
+        """A renamed or dropped provider key must not read as "no drift"."""
+        report = tmp_path / "drift.md"
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["verify", "--drift", "--report", str(report)],
+        )
+        upstream = _triaged_upstream()
+        del upstream["anthropic"]
+
+        async def fake_fetch(**_: object) -> _Upstream:
+            return upstream
+
+        monkeypatch.setattr(models_dev, "fetch", fake_fetch)
+        assert await verify_models._run() == 1
+        assert "  anthropic: models.dev lists no models; provider key moved?" in (
+            capsys.readouterr().out
+        )
 
     @pytest.mark.anyio
     async def test_an_unreadable_models_dev_fails_without_a_report(
