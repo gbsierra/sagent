@@ -2,24 +2,34 @@
 
 from __future__ import annotations
 
-from functools import partial
+from dataclasses import replace
+from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
+import json
 import sys
 
-import httpx2
 import pytest
 
 from sagent.bin import verify_models
+from sagent.catalog.sources import (
+    anthropic as anthropic_source,
+    google as google_source,
+    models_dev,
+    openai as openai_source,
+)
+from sagent.catalog.sources.live import LiveLimits
 from sagent.providers.anthropic.api import Anthropic
 from sagent.providers.google.api import Google
 from sagent.providers.openai.api import OpenAI
-from sagent.types.capability import ModelCapability, ModelLimits
+from sagent.types.capability import ModelCapability, ModelLimits, ThinkingCapability
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from pathlib import Path
+
+    from sagent.catalog.table import ModelCatalog
 
 
 def _cap(request: int, response: int) -> ModelCapability:
@@ -31,216 +41,29 @@ def _cap(request: int, response: int) -> ModelCapability:
     )
 
 
-def _limits(request: int, response: int) -> verify_models.LiveLimits:
-    return verify_models.LiveLimits(
+def _limits(request: int, response: int) -> LiveLimits:
+    return LiveLimits(
         max_request_tokens=request,
         max_response_tokens=response,
     )
 
 
-def _serve(
-    monkeypatch: pytest.MonkeyPatch,
-    handler: Callable[[httpx2.Request], httpx2.Response],
-) -> list[httpx2.Request]:
-    """Route every ``httpx2.AsyncClient`` through `handler`; return the requests."""
-    seen: list[httpx2.Request] = []
-
-    def record(request: httpx2.Request) -> httpx2.Response:
-        seen.append(request)
-        return handler(request)
-
-    monkeypatch.setattr(
-        httpx2,
-        "AsyncClient",
-        partial(httpx2.AsyncClient, transport=httpx2.MockTransport(record)),
-    )
-    return seen
-
-
-class TestParseOpenaiPage:
-    def test_parses_limits_with_markup_and_commas(self) -> None:
-        html = """
-        <!-- hidden
-        <b>999,999 context window</b> -->
-        <div>128,000 context window</div>
-        <span>16,384 max output tokens</span>
-        """
-        assert verify_models._parse_openai_page(html) == _limits(128_000, 16_384)
-
-    def test_prefers_maximum_input_tokens_over_context_window(self) -> None:
-        page = (
-            "- 1,050,000 context window\n"
-            "- Maximum input tokens: 922,000\n"
-            "- 128,000 max output tokens\n"
-        )
-        assert verify_models._parse_openai_page(page) == _limits(922_000, 128_000)
-
-    def test_returns_none_without_both_limits(self) -> None:
-        assert verify_models._parse_openai_page("128,000 context window") is None
-
-
-class TestFetchGoogle:
-    @pytest.mark.anyio
-    async def test_fetches_model_limits(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        body = {
-            "models": [
-                {
-                    "name": "models/gemini-test",
-                    "inputTokenLimit": 10,
-                    "outputTokenLimit": 20,
-                },
-                {"name": "models/incomplete", "inputTokenLimit": 1},
-            ],
-        }
-        _serve(monkeypatch, lambda _: httpx2.Response(200, json=body))
-        assert await verify_models.fetch_google("key") == {
-            "gemini-test": _limits(10, 20),
-        }
-
-    @pytest.mark.anyio
-    async def test_follows_next_page_token(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        def handler(request: httpx2.Request) -> httpx2.Response:
-            if request.url.params.get("pageToken") == "p2":
-                model = {
-                    "name": "models/b",
-                    "inputTokenLimit": 3,
-                    "outputTokenLimit": 4,
-                }
-                return httpx2.Response(200, json={"models": [model]})
-            model = {"name": "models/a", "inputTokenLimit": 1, "outputTokenLimit": 2}
-            return httpx2.Response(
-                200,
-                json={"models": [model], "nextPageToken": "p2"},
-            )
-
-        _serve(monkeypatch, handler)
-        assert await verify_models.fetch_google("key") == {
-            "a": _limits(1, 2),
-            "b": _limits(3, 4),
-        }
-
-    @pytest.mark.anyio
-    async def test_key_rides_a_header_never_the_url(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        seen = _serve(monkeypatch, lambda _: httpx2.Response(403))
-        assert await verify_models.fetch_google("s3cr3t-key") == {}
-        assert seen
-        assert all("s3cr3t-key" not in str(request.url) for request in seen)
-        assert seen[0].headers["x-goog-api-key"] == "s3cr3t-key"
-        out = capsys.readouterr().out
-        assert "HTTP 403" in out
-        assert "s3cr3t-key" not in out
-
-    @pytest.mark.anyio
-    async def test_network_error_warns_instead_of_raising(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        def refuse(request: httpx2.Request) -> httpx2.Response:
-            raise httpx2.ConnectError(f"refused {request.url.host}")
-
-        _serve(monkeypatch, refuse)
-        assert await verify_models.fetch_google("key") == {}
-        assert "ConnectError" in capsys.readouterr().out
-
-
-class TestFetchOpenai:
-    @pytest.mark.anyio
-    async def test_fetches_parseable_pages(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        pages = {
-            "ok": httpx2.Response(
-                200,
-                text="1,000 context window 200 max output tokens",
-            ),
-            "bad": httpx2.Response(200, text="not parseable"),
-            "missing": httpx2.Response(404),
-        }
-
-        def handler(request: httpx2.Request) -> httpx2.Response:
-            if request.url.path.endswith("/down.md"):
-                raise httpx2.ConnectError("refused")
-            return pages[request.url.path.rsplit("/", 1)[1].removesuffix(".md")]
-
-        seen = _serve(monkeypatch, handler)
-        limits = await verify_models.fetch_openai(["ok", "bad", "missing", "down"])
-        assert limits == {"ok": _limits(1000, 200)}
-        # The markdown rendering states "Maximum input tokens"; the HTML omits it.
-        assert all(request.url.path.endswith(".md") for request in seen)
-        out = capsys.readouterr().out
-        assert "could not parse" in out
-        assert "HTTP 404" in out
-        assert "ConnectError" in out
-
-
-class TestFetchAnthropic:
-    @pytest.mark.anyio
-    async def test_fetches_and_warns(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        bodies: dict[str, httpx2.Response] = {
-            "ok": httpx2.Response(
-                200,
-                json={"max_input_tokens": 100, "max_tokens": 10},
-            ),
-            "bad": httpx2.Response(200, json={"max_input_tokens": 0, "max_tokens": 10}),
-            "err": httpx2.Response(500),
-            "missing": httpx2.Response(404),
-        }
-
-        def handler(request: httpx2.Request) -> httpx2.Response:
-            if request.url.path.endswith("/down"):
-                raise httpx2.ConnectError("refused")
-            return bodies[request.url.path.rsplit("/", 1)[1]]
-
-        _serve(monkeypatch, handler)
-        limits = await verify_models.fetch_anthropic(
-            "key",
-            ["ok", "bad", "err", "missing", "down"],
-        )
-        assert limits == {"ok": _limits(100, 10)}
-        out = capsys.readouterr().out
-        assert "missing limits" in out
-        assert "HTTP 500" in out
-        assert "not found in API" in out
-        assert "ConnectError" in out
-
-
 class TestCanonicalModels:
-    def test_keys_rows_by_vendor_wire_id(self) -> None:
-        known = verify_models._canonical_models(Anthropic.catalog)
-        assert "claude-opus-5-5" in known
-        assert "opus-5.5" not in known
-        assert known["claude-opus-5-5"].model_id == "opus-5.5"
+    @pytest.mark.parametrize("catalog", [Anthropic.catalog, OpenAI.catalog])
+    def test_keys_every_row_by_its_vendor_id(self, catalog: ModelCatalog) -> None:
+        known = verify_models._canonical_models(catalog)
+        assert list(known) == list(catalog.models)
+        assert all(cap.model_id == mid for mid, cap in known.items())
+        names = (
+            catalog.models.roles.keys()
+            | catalog.models.aliases.keys()
+            | catalog.models.renamed.keys()
+        )
+        assert not names & known.keys()
 
-    def test_falls_back_to_model_id_without_a_wire_id(self) -> None:
-        known = verify_models._canonical_models(OpenAI.catalog)
-        assert all(cap.wire_model_id in {mid, ""} for mid, cap in known.items())
-        assert len(known) == len(OpenAI.catalog.models)
-
-    @pytest.mark.anyio
-    async def test_anthropic_is_queried_by_wire_id(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        seen = _serve(monkeypatch, lambda _: httpx2.Response(404))
+    def test_an_alias_and_its_snapshot_are_each_verified(self) -> None:
         known = verify_models._canonical_models(Anthropic.catalog)
-        await verify_models.fetch_anthropic("key", list(known))
-        paths = {request.url.path for request in seen}
-        assert "/v1/models/claude-opus-5-5" in paths
-        assert "/v1/models/opus-5.5" not in paths
+        assert {"claude-haiku-4-5", "claude-haiku-4-5-20251001"} <= known.keys()
 
 
 class TestCompare:
@@ -271,6 +94,70 @@ class TestCompare:
         assert verify_models.compare("Provider", {"m": _cap(1, 2)}, live) == 0
         assert "all 1 models OK" in capsys.readouterr().out
 
+    @pytest.mark.parametrize(
+        ("catalog_effort", "live_effort", "errors"),
+        [
+            # Both sides list the same levels, ``none`` included.
+            (
+                frozenset({"none", "low", "high"}),
+                frozenset({"none", "low", "high"}),
+                0,
+            ),
+            # Anthropic has no ``none`` effort -- thinking off rides the
+            # separate ``thinking`` parameter -- so a row offering it sends
+            # a level the API rejects.
+            (
+                frozenset({"none", "low", "high"}),
+                frozenset({"low", "high"}),
+                1,
+            ),
+            # A level only the vendor lists is one the catalog hides.
+            (
+                frozenset({"low", "high"}),
+                frozenset({"low", "high", "max"}),
+                1,
+            ),
+            # A vendor that states no effort list is not checked.
+            (frozenset({"low", "high"}), None, 0),
+        ],
+    )
+    def test_effort_must_match_the_vendors_level_list_exactly(
+        self,
+        capsys: pytest.CaptureFixture[str],
+        catalog_effort: frozenset[str],
+        live_effort: frozenset[str] | None,
+        errors: int,
+    ) -> None:
+        known = {
+            "m": replace(
+                _cap(1, 2),
+                thinking=ThinkingCapability(effort=catalog_effort),
+            ),
+        }
+        live = {"m": replace(_limits(1, 2), effort=live_effort)}
+        assert verify_models.compare("P", known, live) == errors
+        assert ("P.m: effort" in capsys.readouterr().out) == bool(errors)
+
+    def test_notes_the_served_id_and_warns_on_a_retiring_model(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        live = {
+            "alias": replace(_limits(1, 2), served_as="alias-2026"),
+            "old": replace(
+                _limits(1, 2),
+                lifecycle="deprecated",
+                retires_at="2026-11-30",
+            ),
+            "fine": replace(_limits(1, 2), lifecycle="active"),
+        }
+        known = {mid: _cap(1, 2) for mid in live}
+        assert verify_models.compare("P", known, live) == 0
+        lines = capsys.readouterr().out.splitlines()
+        assert "  P.alias: the API answers as alias-2026" in lines
+        assert "  [warn] P.old: lifecycle deprecated, retires 2026-11-30" in lines
+        assert not any("P.fine: lifecycle" in line for line in lines)
+
     def test_zero_coverage_is_an_error(
         self,
         capsys: pytest.CaptureFixture[str],
@@ -281,7 +168,7 @@ class TestCompare:
         assert "0/1 models verified" in out
 
 
-def _exact(known: dict[str, ModelCapability]) -> dict[str, verify_models.LiveLimits]:
+def _exact(known: dict[str, ModelCapability]) -> dict[str, LiveLimits]:
     """Live limits that agree with every catalog row."""
     return {
         mid: _limits(
@@ -290,6 +177,70 @@ def _exact(known: dict[str, ModelCapability]) -> dict[str, verify_models.LiveLim
         )
         for mid, cap in known.items()
     }
+
+
+class TestSnapshot:
+    def test_records_what_was_reported_and_when(self) -> None:
+        live = {
+            "Anthropic": {
+                "claude-haiku-4-5": replace(
+                    _limits(200_000, 64_000),
+                    effort=frozenset(),
+                    lifecycle="active",
+                    served_as="claude-haiku-4-5-20251001",
+                ),
+            },
+            "OpenAI": {"gpt-4.1": _limits(1_047_576, 32_768)},
+        }
+        at = datetime(2026, 10, 17, 12, 0, tzinfo=UTC)
+        text = verify_models.snapshot_json(live, at=at)
+        assert json.loads(text) == {
+            "fetched_at": "2026-10-17T12:00:00+00:00",
+            "providers": {
+                "Anthropic": {
+                    "claude-haiku-4-5": {
+                        "max_request_tokens": 200_000,
+                        "max_response_tokens": 64_000,
+                        "effort": [],
+                        "lifecycle": "active",
+                        "served_as": "claude-haiku-4-5-20251001",
+                    },
+                },
+                "OpenAI": {
+                    "gpt-4.1": {
+                        "max_request_tokens": 1_047_576,
+                        "max_response_tokens": 32_768,
+                    },
+                },
+            },
+        }
+        assert text == verify_models.snapshot_json(live, at=at)
+
+    @pytest.mark.anyio
+    async def test_run_writes_the_snapshot_it_was_asked_for(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        path = tmp_path / "live.json"
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["verify", "--provider", "openai", "--snapshot", str(path)],
+        )
+
+        async def fake_fetch_openai(
+            ids: list[str],
+            **_: object,
+        ) -> dict[str, LiveLimits]:
+            del ids
+            return {"gpt-4.1": _limits(1, 2)}
+
+        monkeypatch.setattr(openai_source, "fetch", fake_fetch_openai)
+        await verify_models._run()
+        written = json.loads(path.read_text())
+        assert set(written["providers"]) == {"OpenAI"}
+        assert written["providers"]["OpenAI"]["gpt-4.1"]["max_request_tokens"] == 1
 
 
 class TestRun:
@@ -307,25 +258,26 @@ class TestRun:
         anthropic = verify_models._canonical_models(Anthropic.catalog)
         wrong = next(iter(openai))
 
-        async def fake_google(key: str) -> dict[str, verify_models.LiveLimits]:
+        async def fake_google(key: str, **_: object) -> dict[str, LiveLimits]:
             assert key == "gkey"
             return {**_exact(google), "zz-new": _limits(1, 1)}
 
-        async def fake_openai(ids: list[str]) -> dict[str, verify_models.LiveLimits]:
+        async def fake_openai(ids: list[str], **_: object) -> dict[str, LiveLimits]:
             assert ids == list(openai)
             return {**_exact(openai), wrong: _limits(1, 1)}
 
         async def fake_anthropic(
             key: str,
             ids: list[str],
-        ) -> dict[str, verify_models.LiveLimits]:
+            **_: object,
+        ) -> dict[str, LiveLimits]:
             assert key == "akey"
             assert ids == list(anthropic)
             return {**_exact(anthropic), "zz-new": _limits(1, 1)}
 
-        monkeypatch.setattr(verify_models, "fetch_google", fake_google)
-        monkeypatch.setattr(verify_models, "fetch_openai", fake_openai)
-        monkeypatch.setattr(verify_models, "fetch_anthropic", fake_anthropic)
+        monkeypatch.setattr(google_source, "fetch", fake_google)
+        monkeypatch.setattr(openai_source, "fetch", fake_openai)
+        monkeypatch.setattr(anthropic_source, "fetch", fake_anthropic)
         monkeypatch.setattr(verify_models, "audit_catalogs", lambda: 1)
         assert await verify_models._run() == 1
         lines = capsys.readouterr().out.splitlines()
@@ -352,11 +304,11 @@ class TestRun:
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         openai = verify_models._canonical_models(OpenAI.catalog)
 
-        async def fake_openai(ids: list[str]) -> dict[str, verify_models.LiveLimits]:
+        async def fake_openai(ids: list[str], **_: object) -> dict[str, LiveLimits]:
             del ids
             return _exact(openai)
 
-        monkeypatch.setattr(verify_models, "fetch_openai", fake_openai)
+        monkeypatch.setattr(openai_source, "fetch", fake_openai)
         monkeypatch.setattr(verify_models, "audit_catalogs", lambda: 1)
         assert await verify_models._run() == 1
         lines = capsys.readouterr().out.splitlines()
@@ -371,7 +323,7 @@ class TestRun:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         monkeypatch.setattr(sys, "argv", ["verify", "--offline"])
-        monkeypatch.delattr(verify_models, "fetch_openai")
+        monkeypatch.delattr(openai_source, "fetch")
         assert await verify_models._run() == 0
         assert capsys.readouterr().out.splitlines() == [
             "Catalog audit (offline):",
@@ -439,10 +391,11 @@ class TestMain:
 
         async def fake_fetch_openai(
             ids: list[str],
-        ) -> dict[str, verify_models.LiveLimits]:
+            **_: object,
+        ) -> dict[str, LiveLimits]:
             return {mid: _limits(1, 1) for mid in ids}
 
-        monkeypatch.setattr(verify_models, "fetch_openai", fake_fetch_openai)
+        monkeypatch.setattr(openai_source, "fetch", fake_fetch_openai)
         assert await verify_models._run() == 1
 
     @pytest.mark.anyio
@@ -456,7 +409,8 @@ class TestMain:
 
         async def fake_fetch_openai(
             ids: list[str],
-        ) -> dict[str, verify_models.LiveLimits]:
+            **_: object,
+        ) -> dict[str, LiveLimits]:
             return {
                 mid: _limits(
                     known[mid].context[""].max_request_tokens,
@@ -465,7 +419,7 @@ class TestMain:
                 for mid in ids
             }
 
-        monkeypatch.setattr(verify_models, "fetch_openai", fake_fetch_openai)
+        monkeypatch.setattr(openai_source, "fetch", fake_fetch_openai)
         assert await verify_models._run() == 0
         assert capsys.readouterr().out.splitlines()[-1] == "All limits verified."
 
@@ -479,11 +433,13 @@ class TestMain:
         monkeypatch.setenv("GOOGLE_API_KEY", "x")
 
         async def fake_fetch_google(
-            _: str,
-        ) -> dict[str, verify_models.LiveLimits]:
+            key: str,
+            **_: object,
+        ) -> dict[str, LiveLimits]:
+            del key
             return {}
 
-        monkeypatch.setattr(verify_models, "fetch_google", fake_fetch_google)
+        monkeypatch.setattr(google_source, "fetch", fake_fetch_google)
         assert await verify_models._run() == 1
         assert "All limits verified" not in capsys.readouterr().out
 
@@ -510,14 +466,101 @@ class TestMain:
         async def fake_fetch_anthropic(
             key: str,
             ids: list[str],
-        ) -> dict[str, verify_models.LiveLimits]:
+            **_: object,
+        ) -> dict[str, LiveLimits]:
             del key
             queried.extend(ids)
             return {}
 
-        monkeypatch.setattr(verify_models, "fetch_anthropic", fake_fetch_anthropic)
+        monkeypatch.setattr(anthropic_source, "fetch", fake_fetch_anthropic)
         assert await verify_models._run() == 1
         assert "claude-opus-5-5" in queried
+
+
+type _Upstream = dict[str, dict[str, dict[str, dict[str, float]]]]
+
+
+def _triaged_upstream() -> _Upstream:
+    """models.dev rows showing exactly the values already triaged."""
+    out: _Upstream = {}
+    for (mid, field), (pinned, _) in models_dev.ACCEPTED.items():
+        key = next(k for k, build in models_dev.CATALOGS.items() if mid in build())
+        group, name = field.split(".")
+        out.setdefault(key, {}).setdefault(mid, {}).setdefault(group, {})[name] = pinned
+    return out
+
+
+class TestDrift:
+    @pytest.mark.anyio
+    async def test_only_triaged_drift_passes_and_writes_no_report(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        tmp_path: Path,
+    ) -> None:
+        report = tmp_path / "drift.md"
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["verify", "--drift", "--report", str(report)],
+        )
+
+        async def fake_fetch(**_: object) -> _Upstream:
+            return _triaged_upstream()
+
+        monkeypatch.setattr(models_dev, "fetch", fake_fetch)
+        monkeypatch.delattr(openai_source, "fetch")
+        assert await verify_models._run() == 0
+        assert not report.exists()
+        out = capsys.readouterr().out
+        assert f"  {len(models_dev.ACCEPTED)} known disagreement(s) triaged" in out
+        assert out.splitlines()[-1] == "No untriaged drift."
+
+    @pytest.mark.anyio
+    async def test_untriaged_drift_fails_and_writes_the_report(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        tmp_path: Path,
+    ) -> None:
+        report = tmp_path / "drift.md"
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["verify", "--drift", "--report", str(report)],
+        )
+        upstream = _triaged_upstream()
+        upstream["anthropic"] = {"claude-opus-5-5": {"cost": {"input": 99}}}
+
+        async def fake_fetch(**_: object) -> _Upstream:
+            return upstream
+
+        monkeypatch.setattr(models_dev, "fetch", fake_fetch)
+        assert await verify_models._run() == 1
+        assert "`claude-opus-5-5` | cost.input" in report.read_text()
+        out = capsys.readouterr().out
+        assert "  anthropic.claude-opus-5-5: cost.input sagent=4 models.dev=99" in out
+        assert out.splitlines()[-1] == "1 problem(s) found."
+
+    @pytest.mark.anyio
+    async def test_an_unreadable_models_dev_fails_without_a_report(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        report = tmp_path / "drift.md"
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["verify", "--drift", "--report", str(report)],
+        )
+
+        async def fake_fetch(**_: object) -> None:
+            return None
+
+        monkeypatch.setattr(models_dev, "fetch", fake_fetch)
+        assert await verify_models._run() == 1
+        assert not report.exists()
 
 
 if __name__ == "__main__":

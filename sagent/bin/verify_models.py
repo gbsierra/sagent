@@ -7,23 +7,34 @@ Verify provider model limits.
 
 Checks that every provider's catalog entries have correct
 max_request_tokens and max_response_tokens by querying live APIs or
-scraping official documentation pages.
+scraping official documentation pages. Where the vendor reports them,
+also checks effort levels and warns about deprecated models. A model the
+vendor lists but the catalog lacks is a problem.
 
 Usage::
 
     uv --quiet --project . run python -m sagent.bin.verify_models
     uv --quiet --project . run python -m sagent.bin.verify_models --provider google
     uv --quiet --project . run python -m sagent.bin.verify_models --provider openai
+    uv --quiet --project . run python -m sagent.bin.verify_models --snapshot live.json
+    uv --quiet --project . run python -m sagent.bin.verify_models --drift --report drift.md
 
-Every model is looked up and reported by its vendor wire id
-(``claude-opus-5-5``), not the catalog name (``opus-5.5``). A run that
+Every row is looked up and reported by its vendor id (``claude-opus-5-5``),
+never by a Sagent role or retired name (``default``, ``opus-5.5``). A run that
 verifies no row of a requested provider fails: a missing key or an
 unreachable API is not a pass.
 
+``--drift`` instead compares every hosted catalog with models.dev, needs no
+key, and fails only on a disagreement not yet triaged; ``--report`` writes
+those as a Markdown issue body.
+
 Sources:
+- Readers: sagent/catalog/sources
 - Google: GET /v1beta/models (returns inputTokenLimit, outputTokenLimit)
 - OpenAI: scrapes https://developers.openai.com/api/docs/models/<id>.md
-- Anthropic: GET /v1/models/<id> (returns max_tokens, max_input_tokens)
+- Anthropic: GET /v1/models, then /v1/models/<id> for ids it omits
+  (max_tokens, max_input_tokens, lifecycle, retires_at, capabilities.effort)
+- Drift: https://models.dev/api.json
 
 Cross-reference: https://github.com/taylorwilsdon/llm-context-limits
 '''
@@ -31,19 +42,23 @@ Cross-reference: https://github.com/taylorwilsdon/llm-context-limits
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import argparse
 import asyncio
+import json
 import os
-import re
+import pathlib
 import sys
 
-import httpx2
-
 from sagent import providers
-from sagent.lib.codec import from_plain
+from sagent.catalog.sources import (
+    anthropic as anthropic_source,
+    google as google_source,
+    models_dev,
+    openai as openai_source,
+)
 from sagent.providers.anthropic.api import Anthropic
 from sagent.providers.google.api import Google
 from sagent.providers.openai.api import OpenAI
@@ -53,149 +68,9 @@ from sagent.types.providers import ModelResolver
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
+    from sagent.catalog.sources.live import LiveLimits
     from sagent.catalog.table import ModelCatalog
     from sagent.types.capability import ModelCapability
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class LiveLimits:
-    """Token limits a live API reported for one model."""
-
-    max_request_tokens: int
-    max_response_tokens: int
-
-
-# Source: https://ai.google.dev/api/models#method:-models.list
-# Returns inputTokenLimit and outputTokenLimit per model.
-
-
-async def fetch_google(api_key: str) -> dict[str, LiveLimits]:
-    """Fetch model limits from the Google Generative Language API.
-
-    Args:
-      api_key: Google API key.
-
-    Returns:
-      limits: Map of model ID to its token limits; partial when a page fails.
-
-    """
-    api = "https://generativelanguage.googleapis.com/v1beta/models"
-    out: dict[str, LiveLimits] = {}
-    page_token = ""
-    # The key rides a header: in the query string it would be echoed by every
-    # HTTPStatusError message, which this tool prints.
-    headers = {"x-goog-api-key": api_key}
-    async with httpx2.AsyncClient(timeout=30) as client:
-        while True:
-            params = {"pageToken": page_token} if page_token else {}
-            try:
-                r = await client.get(api, headers=headers, params=params)
-                r.raise_for_status()
-            except httpx2.HTTPError as e:
-                _out(f"  [warn] models list: {_describe(e)}")
-                return out
-            body = from_plain(r.json(), dict[str, object])
-            for raw_model in from_plain(body.get("models"), list[object], default=[]):
-                model = from_plain(raw_model, dict[str, object])
-                short = from_plain(model.get("name"), str, default="").removeprefix(
-                    "models/",
-                )
-                inp = from_plain(model.get("inputTokenLimit"), int, default=0)
-                outp = from_plain(model.get("outputTokenLimit"), int, default=0)
-                if inp and outp:
-                    out[short] = LiveLimits(
-                        max_request_tokens=inp,
-                        max_response_tokens=outp,
-                    )
-            page_token = from_plain(body.get("nextPageToken"), str, default="")
-            if not page_token:
-                return out
-
-
-# Source: https://developers.openai.com/api/docs/models/<model>.md
-# The markdown rendering states "N context window", "Maximum input tokens: N"
-# where the model has one, and "N max output tokens". The HTML page omits the
-# input cap, and the catalog stores that cap, not the window.
-
-
-async def fetch_openai(model_ids: list[str]) -> dict[str, LiveLimits]:
-    """Scrape model limits from OpenAI documentation pages.
-
-    Args:
-      model_ids: Model identifiers to look up.
-
-    Returns:
-      limits: Map of model ID to its token limits.
-
-    """
-    out: dict[str, LiveLimits] = {}
-    doc = "https://developers.openai.com/api/docs/models"
-    async with httpx2.AsyncClient(timeout=30, follow_redirects=True) as client:
-        for mid in model_ids:
-            url = f"{doc}/{mid}.md"
-            try:
-                r = await client.get(url)
-                r.raise_for_status()
-            except httpx2.HTTPError as e:
-                _out(f"  [warn] {mid}: {_describe(e)}")
-                continue
-            limits = _parse_openai_page(r.text)
-            if limits:
-                out[mid] = limits
-            else:
-                _out(f"  [warn] {mid}: could not parse limits from {url}")
-    return out
-
-
-# Source: GET /v1/models/{model_id}
-# Returns max_tokens (max output) and max_input_tokens.
-
-
-async def fetch_anthropic(
-    api_key: str,
-    model_ids: list[str],
-) -> dict[str, LiveLimits]:
-    """Fetch model limits from the Anthropic API.
-
-    Args:
-      api_key: Anthropic API key.
-      model_ids: Model identifiers to query.
-
-    Returns:
-      limits: Map of model ID to its token limits.
-
-    """
-    out: dict[str, LiveLimits] = {}
-    api = "https://api.anthropic.com/v1/models"
-    headers = {
-        "x-api-key": api_key,
-        "anthropic-version": "2023-06-01",
-    }
-    async with httpx2.AsyncClient(timeout=30) as client:
-        for mid in model_ids:
-            try:
-                r = await client.get(f"{api}/{mid}", headers=headers)
-                r.raise_for_status()
-            except httpx2.HTTPStatusError as e:
-                if e.response.status_code == 404:
-                    _out(f"  [warn] {mid}: not found in API")
-                else:
-                    _out(f"  [warn] {mid}: {_describe(e)}")
-                continue
-            except httpx2.HTTPError as e:
-                _out(f"  [warn] {mid}: {_describe(e)}")
-                continue
-            data = from_plain(r.json(), dict[str, object])
-            max_input = from_plain(data.get("max_input_tokens"), int, default=0)
-            max_output = from_plain(data.get("max_tokens"), int, default=0)
-            if max_input and max_output:
-                out[mid] = LiveLimits(
-                    max_request_tokens=max_input,
-                    max_response_tokens=max_output,
-                )
-            else:
-                _out(f"  [warn] {mid}: missing limits in API response")
-    return out
 
 
 def compare(
@@ -223,6 +98,12 @@ def compare(
     for mid in all_ids:
         k = known.get(mid)
         lv = live.get(mid)
+        if lv is not None:
+            if lv.served_as:
+                _out(f"  {provider_name}.{mid}: the API answers as {lv.served_as}")
+            if lv.lifecycle not in ("", "active"):
+                when = f", retires {lv.retires_at}" if lv.retires_at else ""
+                _warn(f"{provider_name}.{mid}: lifecycle {lv.lifecycle}{when}")
         if k is None:
             _out(f"  {provider_name}.{mid}: in API but not in the catalog")
             if lv:
@@ -251,6 +132,20 @@ def compare(
             _out(
                 f"  {provider_name}.{mid}: max_response_tokens"
                 f" code={k_resp:,} api={lv.max_response_tokens:,}",
+            )
+            errors += 1
+        # A selected level is sent verbatim -- ``output_config.effort`` on
+        # Anthropic, ``reasoning.effort`` on OpenAI, which spells ``min``
+        # ``minimal`` -- so the vendor's list and the row must match exactly:
+        # a level only the catalog offers is a guaranteed 400, one only the
+        # vendor lists is hidden. ``default`` means omit the knob, never a
+        # wire value; a source that spells effort otherwise (Google's
+        # ``thinkingLevel``, where ``none`` omits) must map before reporting.
+        k_effort = k.thinking.effort - {"default"}
+        if lv.effort is not None and k_effort != lv.effort:
+            _out(
+                f"  {provider_name}.{mid}: effort"
+                f" code={sorted(k_effort)} api={sorted(lv.effort)}",
             )
             errors += 1
     if known and not verified:
@@ -299,6 +194,79 @@ def audit_catalogs() -> int:
     return errors
 
 
+def snapshot_json(
+    fetched: Mapping[str, Mapping[str, LiveLimits]],
+    *,
+    at: datetime,
+) -> str:
+    """Render what each live source reported as stable, reviewable JSON.
+
+    Args:
+      fetched: Per provider, what its live source reported per model id.
+      at: When the sources were read.
+
+    Returns:
+      text: Sorted, indented JSON; unreported fields are omitted.
+
+    """
+    providers_out: dict[str, dict[str, dict[str, object]]] = {}
+    for provider_name, live in fetched.items():
+        rows: dict[str, dict[str, object]] = {}
+        for mid, lv in live.items():
+            row: dict[str, object] = {
+                "max_request_tokens": lv.max_request_tokens,
+                "max_response_tokens": lv.max_response_tokens,
+            }
+            if lv.effort is not None:
+                row["effort"] = sorted(lv.effort)
+            for name in ("lifecycle", "retires_at", "served_as"):
+                if value := getattr(lv, name):
+                    row[name] = value
+            rows[mid] = row
+        providers_out[provider_name] = rows
+    body = {"fetched_at": at.isoformat(), "providers": providers_out}
+    return json.dumps(body, indent=2, sort_keys=True) + "\n"
+
+
+async def check_drift(report_path: pathlib.Path | None) -> int:
+    """Compare every hosted catalog with models.dev.
+
+    Args:
+      report_path: Where to write the Markdown issue body when anything
+        needs review; nothing is written otherwise.
+
+    Returns:
+      error_count: Disagreements needing review, plus stale triage entries;
+        ``1`` when models.dev could not be read.
+
+    """
+    upstream = await models_dev.fetch(warn=_warn)
+    if upstream is None:
+        return 1
+    drifts = [
+        drift
+        for key, table in models_dev.CATALOGS.items()
+        for drift in models_dev.compare(key, table(), upstream.get(key, {}))
+    ]
+    for d in drifts:
+        if not d.accepted:
+            _out(
+                f"  {d.provider}.{d.model_id}: {d.field}"
+                f" sagent={models_dev.format_value(d.ours)}"
+                f" models.dev={models_dev.format_value(d.theirs)}",
+            )
+    body = models_dev.report(drifts, at=datetime.now(UTC).date())
+    triaged = sum(1 for d in drifts if d.accepted)
+    _out(f"  {triaged} known disagreement(s) triaged")
+    if body and report_path is not None:
+        await asyncio.to_thread(report_path.write_text, body)
+        _out(f"\nReport written to {report_path}")
+    leftover = models_dev.stale(drifts)
+    for mid, field in leftover:
+        _out(f"  {mid}: {field} triage matches no current disagreement")
+    return sum(1 for d in drifts if not d.accepted) + len(leftover)
+
+
 def main() -> int:
     """Run the program; return the process exit code."""
     return asyncio.run(_run())
@@ -308,34 +276,8 @@ def _out(msg: str) -> None:
     sys.stdout.write(msg + "\n")
 
 
-def _describe(e: httpx2.HTTPError) -> str:
-    """Name a request failure without echoing its URL."""
-    if isinstance(e, httpx2.HTTPStatusError):
-        return f"HTTP {e.response.status_code}"
-    return type(e).__name__
-
-
-# The input cap is "Maximum input tokens" where the page states one, else the context
-# window.
-def _parse_openai_page(page: str) -> LiveLimits | None:
-    """Extract the input cap and max output tokens from an OpenAI doc page."""
-    cleaned = re.sub(r"<!--.*?-->", " ", page, flags=re.DOTALL)
-    cleaned = re.sub(r"<[^>]+>", " ", cleaned)
-    request = re.search(r"Maximum\s+input\s+tokens:?\s+([\d,]+)", cleaned) or (
-        re.search(r"([\d,]+)\s+context\s+window", cleaned)
-    )
-    out = re.search(r"([\d,]+)\s+max\s+output\s+tokens", cleaned)
-    if request and out:
-        return LiveLimits(
-            max_request_tokens=_num(request.group(1)),
-            max_response_tokens=_num(out.group(1)),
-        )
-    return None
-
-
-def _num(s: str) -> int:
-    """Parse a comma- or underscore-grouped integer literal."""
-    return int(s.replace(",", "").replace("_", ""))
+def _warn(msg: str) -> None:
+    _out(f"  [warn] {msg}")
 
 
 async def _run() -> int:
@@ -354,6 +296,21 @@ async def _run() -> int:
         action="store_true",
         help="Only run the offline catalog audit; skip every network query.",
     )
+    parser.add_argument(
+        "--snapshot",
+        type=pathlib.Path,
+        help="Write what each live source reported, with the time, to this JSON file.",
+    )
+    parser.add_argument(
+        "--drift",
+        action="store_true",
+        help="Compare every hosted catalog with models.dev instead of vendor APIs.",
+    )
+    parser.add_argument(
+        "--report",
+        type=pathlib.Path,
+        help="With --drift, write what needs review as Markdown to this file.",
+    )
     args = parser.parse_args()
     target = args.provider
     _out("Catalog audit (offline):")
@@ -363,6 +320,17 @@ async def _run() -> int:
             _out(f"\n{total_errors} problem(s) found.")
         return 1 if total_errors else 0
 
+    if args.drift:
+        _out("models.dev drift:")
+        total_errors += await check_drift(args.report)
+        _out(
+            f"\n{total_errors} problem(s) found."
+            if total_errors
+            else "\nNo untriaged drift.",
+        )
+        return 1 if total_errors else 0
+
+    fetched: dict[str, dict[str, LiveLimits]] = {}
     if target in ("all", "google"):
         _out("Google (API query):")
         key = os.environ.get("GOOGLE_API_KEY", "")
@@ -370,13 +338,13 @@ async def _run() -> int:
             _out("  [error] GOOGLE_API_KEY not set")
             total_errors += 1
         else:
-            live = await fetch_google(key)
+            live = fetched["Google"] = await google_source.fetch(key, warn=_warn)
             total_errors += compare("Google", _canonical_models(Google.catalog), live)
 
     if target in ("all", "openai"):
         _out("OpenAI (doc scrape):")
         known = _canonical_models(OpenAI.catalog)
-        live = await fetch_openai(list(known))
+        live = fetched["OpenAI"] = await openai_source.fetch(list(known), warn=_warn)
         total_errors += compare("OpenAI", known, live)
 
     if target in ("all", "anthropic"):
@@ -387,8 +355,16 @@ async def _run() -> int:
             total_errors += 1
         else:
             known = _canonical_models(Anthropic.catalog)
-            live = await fetch_anthropic(key, list(known))
+            live = fetched["Anthropic"] = await anthropic_source.fetch(
+                key,
+                list(known),
+                warn=_warn,
+            )
             total_errors += compare("Anthropic", known, live)
+
+    if args.snapshot is not None:
+        args.snapshot.write_text(snapshot_json(fetched, at=datetime.now(UTC)))
+        _out(f"\nSnapshot written to {args.snapshot}")
 
     if total_errors:
         _out(f"\n{total_errors} problem(s) found.")
@@ -400,7 +376,7 @@ async def _run() -> int:
 def _canonical_models(catalog: ModelCatalog) -> dict[str, ModelCapability]:
     """Return one resolved row per model, keyed by the id its vendor serves it as."""
     rows = (catalog.resolve(model_id)[0] for model_id in catalog.models)
-    return {row.wire_model_id or row.model_id: row for row in rows}
+    return {row.model_id: row for row in rows}
 
 
 if __name__ == "__main__":
