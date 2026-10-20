@@ -11,7 +11,7 @@ Both entry points share provider, model, tool, compaction, budget, and prompt fl
 
 ```bash
 export GOOGLE_API_KEY=...
-sagent --provider Google --model gemini-pro-3.1
+sagent --provider Google --model gemini-3.1-pro-preview
 ```
 
 The public package defaults to API-key auth with `--auth env`. Provider API keys are read from the provider's environment variable.
@@ -20,7 +20,7 @@ For non-interactive use, pipe a prompt on stdin:
 
 ```bash
 printf 'Summarize this repository in five bullets.' | \
-  sagent --provider Google --model gemini-pro-3.1 --output-format json
+  sagent --provider Google --model gemini-3.1-pro-preview --output-format json
 ```
 
 `sagent` starts the REPL only when both `--input-format` and `--output-format` are `text`. Any machine-readable format runs one headless request and exits.
@@ -28,24 +28,24 @@ printf 'Summarize this repository in five bullets.' | \
 ## Provider and model flags
 
 ```bash
-sagent --provider Anthropic --model sonnet-4.6
-sagent --provider OpenAI --model sol-6
-sagent --provider Google --model gemini-pro-3.1
-sagent --provider Moonshot --model kimi-2.6
-sagent --provider DashScope --model qwen-plus-3.7
-sagent --provider MiniMax --model minimax-2.7
+sagent --provider Anthropic --model claude-sonnet-4-6
+sagent --provider OpenAI --model gpt-6-sol
+sagent --provider Google --model gemini-3.1-pro-preview
+sagent --provider Moonshot --model kimi-k2.6
+sagent --provider DashScope --model qwen3.7-plus
+sagent --provider MiniMax --model MiniMax-M2.7
 sagent --provider SelfHosted
 sagent --provider SelfHosted --model /opt/models/qwen3.6-27b+bfloat16+cuda
 ```
 
 | Flag | Meaning |
 | --- | --- |
-| `--provider NAME` | Provider class from `sagent.providers`, such as `Anthropic` or `Google`. |
+| `--provider NAME` | Provider class from `sagent.providers`, such as `Anthropic` or `Google`. Case-insensitive; short aliases: `oai` (`OpenAI`), `oaisub` (`OpenAISubscription`), `ant` (`Anthropic`), `antsub` (`AnthropicCLI`). |
 | `--auth METHOD` | Calls `Provider.from_<METHOD>()`; an explicit API-key provider defaults to `env`, while subscription providers default to `credentials`. |
 | `--account NAME` | Optional named credential slot for providers that support one. |
-| `--model ID` | Catalog model ID. Bare IDs select the largest context window. Models with smaller profiles accept `+200k` or `+272k`; an explicit `+1m` remains valid when the bare profile is already at least one million tokens. SelfHosted IDs may include `+cuda`, `+bfloat16`, or `+compile`. |
+| `--model ID` | The provider's own model ID (`claude-sonnet-4-6`, `gpt-6.1-sol`), a role (`default`, `utility`), or a catalog alias such as `sol`. Sessions save the resolved exact ID, never the role or alias. Bare IDs select the largest context window. Models with smaller profiles accept `+200k` or `+272k`; an explicit `+1m` remains valid when the bare profile is already at least one million tokens. SelfHosted IDs may include `+cuda`, `+bfloat16`, or `+compile`. In the REPL, `/model` announcements show the resolution, for example `gpt-6-sol -> gpt-6.1-sol (as sol)`. |
 | `--system TEXT` | Extra system prompt instructions appended to Sagent's default prompt. |
-| `--effort LEVEL` | Reasoning effort: `none`, `min`, `low`, `medium`, `high`, `xhigh`, or `max`. Each model accepts a subset (GPT-5.6 takes all seven; GPT-6 Astra has no `none`), and an unsupported value raises. |
+| `--effort LEVEL` | Reasoning effort: `none`, `min`, `low`, `medium`, `high`, `xhigh`, or `max`. Each model accepts a subset (GPT-5.6 takes all seven; GPT-6 Astra has no `none`), and an unsupported value raises. The selection persists in the session and is restored on `--resume`/`--continue`, where the flag wins over the recorded value. |
 | `--max-response-tokens N` | Limit response tokens for each model call. |
 | `--log-level LEVEL` | Enable stderr diagnostics. Same values as Python logging levels. |
 
@@ -144,7 +144,7 @@ Compaction keeps long sessions within the model context window and writes pre-co
 
 ```bash
 printf '{"prompt":"Say hi"}\n' | \
-  sagent --provider Google --model gemini-pro-3.1 \
+  sagent --provider Google --model gemini-3.1-pro-preview \
   --input-format stream-json --output-format stream-json
 ```
 
@@ -236,7 +236,7 @@ model, retry timestamps, and a sanitized error snapshot.
 export SLACK_APP_TOKEN=xapp-...
 export SLACK_BOT_TOKEN=xoxb-...
 export GOOGLE_API_KEY=...
-sagent-slack --provider Google --model gemini-pro-3.1
+sagent-slack --provider Google --model gemini-3.1-pro-preview
 ```
 
 Slack app setup:

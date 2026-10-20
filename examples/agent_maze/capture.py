@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 
 
 _CWD: Final = Path(__file__).resolve().parent
-MODEL = "sonnet-4.6"  # house-ignore[globals] -- Model choice, user retunes.
+MODEL = "claude-sonnet-4-6"  # house-ignore[globals] -- Model choice, user retunes.
 
 
 def metrics(eng: Engine) -> dict[str, Any]:

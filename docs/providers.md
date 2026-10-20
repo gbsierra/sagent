@@ -6,12 +6,12 @@ Sagent separates providers from models. A provider owns authentication and creat
 
 | Provider class | Environment variable | Default model | Utility model | Notes |
 | --- | --- | --- | --- | --- |
-| `Anthropic` | `ANTHROPIC_API_KEY` | `opus-5.5` | `sonnet-5.5` | Anthropic API-key provider; `best` resolves to `fable-5.1`. |
-| `OpenAI` | `OPENAI_API_KEY` | `sol-6.1` | `luna-6.0` | OpenAI API provider. |
-| `Google` | `GOOGLE_API_KEY` | `gemini-pro-3.1` | `gemini-flash-lite-3.5` | Google Gemini provider. |
-| `Moonshot` | `MOONSHOT_API_KEY` | `kimi-3.0` | `kimi-2.6` | OpenAI-compatible Kimi provider. |
-| `DashScope` | `DASHSCOPE_API_KEY` | `qwen-plus-3.7` | `qwen-flash-3.8` | Alibaba DashScope provider. |
-| `MiniMax` | `MINIMAX_API_KEY` | `minimax-3.0` | `minimax-3.0` | MiniMax provider. |
+| `Anthropic` | `ANTHROPIC_API_KEY` | `claude-opus-5-5` | `claude-sonnet-5-5` | Anthropic API-key provider; `best` resolves to `claude-fable-5-1`. |
+| `OpenAI` | `OPENAI_API_KEY` | `gpt-6.1-sol` | `gpt-6-luna` | OpenAI API provider. |
+| `Google` | `GOOGLE_API_KEY` | `gemini-3.1-pro-preview` | `gemini-3.5-flash-lite` | Google Gemini provider. |
+| `Moonshot` | `MOONSHOT_API_KEY` | `kimi-k3` | `kimi-k2.6` | OpenAI-compatible Kimi provider. |
+| `DashScope` | `DASHSCOPE_API_KEY` | `qwen3.7-plus` | `qwen3.8-flash` | Alibaba DashScope provider. |
+| `MiniMax` | `MINIMAX_API_KEY` | `MiniMax-M3` | `MiniMax-M3` | MiniMax provider. |
 | `SelfHosted` | none | `Qwen/Qwen3.6-27B` | configured snapshot | Local HF transformers provider. |
 | `OpenAICompat` | subclass-defined | subclass-defined | subclass-defined | Base class for chat-completions-compatible APIs. |
 
@@ -23,7 +23,7 @@ The public package is designed around API-key providers.
 from sagent.providers import Google
 
 provider = Google.from_env()
-model = provider.model("gemini-pro-3.1")
+model = provider.model("gemini-3.1-pro-preview")
 utility = provider.model("utility")
 ```
 
@@ -36,18 +36,28 @@ ProviderClass.from_env().model("model-id")
 ProviderClass.from_env().model("utility")
 ```
 
-`model(None)` uses the provider's default model. Unknown model IDs raise with the provider's known model list.
+`model(None)` uses the provider's default model. Unknown model IDs raise with the provider's known models and the concrete row each role names.
 
-Catalog keys are exact names of the form `family-major.minor`, such as
-`sol-6.1`, `luna-6.0`, and `opus-5.5`. A prefix names the newest model it
-starts: `sol` and `sol-6` both mean `sol-6.1`, and `opus-4` means `opus-4.8`.
-The roles `default`, `utility`, and `best` resolve the same way. Vendor wire
-IDs remain accepted as compatibility aliases. A bare model ID selects its
-largest context window. Append `+272k` for a smaller
+Catalog keys are the provider's own model IDs, exactly as its API takes and
+reports them: `gpt-6.1-sol`, `claude-opus-5-5`, `gemini-3.1-pro-preview`,
+`MiniMax-M3`. Sagent infers nothing from how an ID is spelled, so a family word
+such as `opus` or `sol` is not a model. The roles `default`, `utility`, and
+`best` each name one ID explicitly. When a provider publishes both a moving
+alias and the dated snapshot it points at, both are rows with the same facts.
+The names Sagent used before (`opus-5.5`, `sol-6.1`) still load from saved
+sessions and settings and resolve to the provider ID; sessions save the
+provider ID from then on. A swap announcement (`/model`, `AgentSelf`) shows
+the resolved ID. A bare model ID selects its largest context window. Append `+272k` for a smaller
 OpenAI window or `+200k` for a smaller Anthropic window when the model offers
 one. An explicit `+1m` is also accepted when the bare model already provides
 that window. Both OpenAI providers use the Responses API. Supported reasoning
-efforts vary by model.
+efforts vary by model. When a saved effort moves to a model that does not
+offer it -- a `/model` swap, a spawned agent, or a resumed session --
+Sagent picks the closest effort the new model does offer that still does
+some reasoning: `max` on a model whose highest effort is `high` becomes
+`high`, not `none`. When two are equally close, it picks the lower one.
+Only when the new model offers no reasoning efforts at all does the
+selection fall back to `none`.
 
 API-key requests send output-token limits and temperature for non-reasoning
 models. The subscription backend omits those unsupported fields. Both paths
@@ -57,29 +67,31 @@ reasoning and image-bearing tool results. Existing sessions need no conversion.
 ## CLI dispatch
 
 ```bash
-sagent --provider Google --auth env --model gemini-pro-3.1
+sagent --provider Google --auth env --model gemini-3.1-pro-preview
 ```
 
-`--provider` is the provider class name from `sagent.providers`. `--auth env` calls `Google.from_env()`.
+`--provider` is the provider class name from `sagent.providers` (case-insensitive). `--auth env` calls `Google.from_env()`.
+
+Short aliases work everywhere a provider name is accepted (`--provider`, `--allow-providers`, `/model provider=...`, agent-tool arguments):
+
+| Alias | Provider |
+| --- | --- |
+| `oai` | `OpenAI` |
+| `oaisub` | `OpenAISubscription` |
+| `ant` | `Anthropic` |
+| `antsub` | `AnthropicCLI` |
+
+Aliases resolve to the canonical class name, which is what sessions persist and the UI displays.
 
 If the named factory does not exist, Sagent reports an error. Use `--auth env`
 for API keys so secrets do not land in shell history.
 
 ## Provider inference
 
-Agent tools first infer a provider from catalog membership, so short IDs such
-as `opus-4.8` and `luna-6.0` can switch providers without a separate provider
-argument. Vendor prefixes remain as compatibility fallbacks:
-
-| Prefix | Provider |
-| --- | --- |
-| `claude` | `Anthropic` |
-| `gemini` | `Google` |
-| `gpt`, `chatgpt`, `o1`, `o3`, `o4`, `codex` | `OpenAI` |
-| `kimi`, `moonshot` | `Moonshot` |
-| `qwen` | `DashScope` |
-| `minimax` | `MiniMax` |
-| `/`, `./`, `../`, `~/` | `SelfHosted` |
+Agent tools infer a provider from catalog membership, so IDs such as
+`claude-opus-4-8` and `gpt-6-luna` can switch providers without a separate
+provider argument. Inference succeeds only when exactly one API provider's
+catalog has the ID; a path (`/`, `./`, `../`, `~/`) selects `SelfHosted`.
 
 This is used by model-switching tools so callers can usually pass just `model_id`.
 
@@ -88,8 +100,8 @@ This is used by model-switching tools so callers can usually pass just `model_id
 Anthropic model IDs may include window tags such as:
 
 ```bash
-sagent --provider Anthropic --model sonnet-4.6+200k
-sagent --provider Anthropic --model opus-4.7+1m
+sagent --provider Anthropic --model claude-sonnet-4-6+200k
+sagent --provider Anthropic --model claude-opus-4-7+1m
 ```
 
 The provider strips the tag for API calls and uses it to select the request-token budget.

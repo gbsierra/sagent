@@ -155,10 +155,10 @@ Paper tools use Semantic Scholar, OpenAlex, arXiv, and open-access PDF metadata.
 - `diagnostics`: set `true` to include token/cost/model/provider state in the result.
 - `context`: `"compact"`, `"recompact"`, or `"clear"`.
 - `context_prompt`: guidance for compact/recompact, or reason for clear.
-- `model_id`, `provider`, `auth`, `account`: switch model/provider.
+- `model_id`, `provider`, `auth`, `account`: switch model/provider. `model_id` accepts exact IDs, roles, and catalog aliases such as `sol`; `provider` accepts `oai`, `oaisub`, `ant`, and `antsub`.
 - `max_request_tokens`, `max_response_tokens`: adjust token limits.
 - `model_options`: provider-specific settings (`thinking`, `effort`, `cache_ttl`).
-- `catalog`: `"providers"` or `"models"` for read-only discovery.
+- `catalog`: `"providers"` or `"models"` for read-only discovery; the models listing shows exact IDs plus the target of every role and alias.
 
 `AgentSpawn` creates child agents. Children can inherit the parent model/tools or override provider, auth, model ID, account, tools, max tool-call rounds, and max depth. With `persistent=true`, a child stays alive and can receive messages through `AgentSend`.
 

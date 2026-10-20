@@ -71,6 +71,7 @@ Sagent writes session metadata and conversation state, including:
 - tool-call round counts;
 - compaction count and summary pointers;
 - status string;
+- thinking effort, budget, and output selection;
 - Bash current working directory;
 - tool-result replacement state.
 
@@ -84,7 +85,7 @@ Large tool outputs are stored under:
 
 ## Loading sessions
 
-On load, Sagent restores messages, status, cost and token counters, compaction state, tool-result replacement state, and Bash cwd. It also repairs dangling tool calls so the next provider request is well-formed.
+On load, Sagent restores the messages, status, cost and token counts, compaction state, tool-result replacement state, Bash working directory, and the saved thinking settings: effort, budget, and output. If the model no longer offers the saved effort, Sagent picks the closest one the model does offer that still does some reasoning instead of failing the resume; when two are equally close, it picks the lower one. Sessions saved before thinking settings were recorded keep the model's own default. An explicit `--effort` or `--thinking` flag on the resume command overrides the saved settings. Sagent also repairs dangling tool calls so the next provider request is well-formed.
 
 If saved provider metadata is available, Sagent can restore the provider/model recipe rather than only replaying text history.
 
