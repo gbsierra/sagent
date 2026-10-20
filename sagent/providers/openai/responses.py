@@ -11,11 +11,7 @@ import inspect
 import json
 import logging
 
-from sagent.catalog.openai import (
-    keeps_reasoning_across_turns,
-    reasoning_effort,
-    served_tier,
-)
+from sagent.catalog.openai import keeps_reasoning_across_turns
 from sagent.catalog.table import base_model_id
 from sagent.lib import debug_log
 from sagent.lib.codec import from_plain, loads, mutable
@@ -32,6 +28,7 @@ from sagent.providers.lib.model_base import ModelDefaults
 from sagent.providers.lib.stop_reason import normalize_stop_reason
 from sagent.providers.lib.usage import openai_usage
 from sagent.providers.openai import token_count
+from sagent.providers.openai.wire import reasoning_effort, served_tier
 from sagent.types.cost import ServiceTier, TokenCost, TokenCount
 from sagent.types.exceptions import UserFacingError
 from sagent.types.model import (
@@ -66,6 +63,7 @@ if TYPE_CHECKING:
 
     import openai
 
+    from sagent.catalog.table import ModelCatalog
     from sagent.lib.image import resize
     from sagent.types.capability import ModelCapability, ModelSettings
     from sagent.types.tools import Tool
@@ -81,6 +79,11 @@ _STREAM_IDLE_TIMEOUT = 600.0  # house-ignore[globals] -- Stream idle timeout.
 
 class ResponsesProvider(Protocol):
     """SDK ownership shared by API-key and OAuth providers."""
+
+    @property
+    def catalog(self) -> ModelCatalog:
+        """The provider's rows met with its transport."""
+        ...
 
     async def get_sdk(self) -> openai.AsyncOpenAI:
         """Return the provider-owned SDK for the current event loop.
@@ -183,7 +186,7 @@ class _OpenAIResponsesModel(ModelDefaults):
 
     @property
     def _wire_model_id(self) -> str:
-        return self.capability.wire_model_id or base_model_id(self.capability.model_id)
+        return base_model_id(self.capability.model_id)
 
     def _effective_service_tier(self) -> ServiceTier | None:
         tier = self.settings.service_tier
@@ -213,7 +216,7 @@ class _OpenAIResponsesModel(ModelDefaults):
         return "you can retry" in str(error).lower()
 
     def _reasoning_effort(self) -> ReasoningEffort | None:
-        if self.settings.thinking_effort == "none":
+        if self.settings.thinking_effort == "default":
             return None
         return reasoning_effort(self.settings.thinking_effort)
 
@@ -242,7 +245,7 @@ class _OpenAIResponsesModel(ModelDefaults):
                 body["reasoning"]["context"] = "all_turns"
         if request.max_response_tokens is not None:
             body["max_output_tokens"] = request.max_response_tokens
-        if self.capability.thinking.effort == frozenset({"none"}):
+        if self.capability.thinking.effort <= {"default", "none"}:
             body["temperature"] = request.temperature
         tier = self._effective_service_tier()
         if tier is not None:
@@ -285,7 +288,12 @@ class _OpenAIResponsesModel(ModelDefaults):
             )
             self._last_usage = openai_usage(raw.headers)
             events = raw.parse(to=openai.AsyncStream[responses.ResponseStreamEvent])
-            return await _consume_stream(events, model=self, publish=publish)
+            return await _consume_stream(
+                events,
+                model=self,
+                catalog=self._provider.catalog,
+                publish=publish,
+            )
         except Exception as exc:
             if find_response_not_read(exc) is not None:
                 raise StreamingResponseNotReadError(provider_name="OpenAI") from exc
@@ -542,6 +550,7 @@ async def _consume_stream(
     stream: AsyncIterable[object],
     *,
     model: _OpenAIResponsesModel,
+    catalog: ModelCatalog,
     publish: Callable[[RuntimeEvent], None] | None,
 ) -> ModelResponse:
     """Parse a Responses API event stream into an assembled ModelResponse."""
@@ -556,6 +565,7 @@ async def _consume_stream(
     cache_read = 0
     cache_write = 0
     reported_tier: str | None = None
+    served_model_id = ""
     message_id = ""
     finish_reason: str | None = None
     completed = False
@@ -665,6 +675,15 @@ async def _consume_stream(
                         str,
                         default=None,
                     )
+                    # Source: OpenAI Response object, field ``model`` -- the
+                    # model id used to generate the response.
+                    # https://developers.openai.com/api/reference/resources/responses
+                    # (read 2026-10-17).
+                    served_model_id = from_plain(
+                        getattr(resp, "model", None),
+                        str,
+                        default="",
+                    )
                     # Set last: if a usage/attr read above raises on an SDK shape
                     # change, ``completed`` stays False so the ``finally`` still
                     # closes the stream instead of leaking the connection.
@@ -685,9 +704,11 @@ async def _consume_stream(
         cache_write=cache_write,
         cache_read=cache_read,
         reported_tier=reported_tier,
+        served_model_id=served_model_id,
         finish_reason=finish_reason,
         message_id=message_id,
         model=model,
+        catalog=catalog,
     )
     if not completed:
         raise StreamInterruptedError(response)
@@ -747,9 +768,11 @@ def _build_stream_response(
     cache_write: int,
     cache_read: int,
     reported_tier: str | None,
+    served_model_id: str,
     finish_reason: str | None,
     message_id: str,
     model: _OpenAIResponsesModel,
+    catalog: ModelCatalog,
 ) -> ModelResponse:
     raw_reason = _FINISH_MAP.get(finish_reason or "", finish_reason)
 
@@ -779,7 +802,13 @@ def _build_stream_response(
         ),
         message_id=message_id,
         request_id=message_id,
-        spend=_spend_at_served_tier(model, tokens, reported_tier=reported_tier),
+        spend=_spend_at_served_tier(
+            model,
+            tokens,
+            reported_tier=reported_tier,
+            row=catalog.served(model.capability, served_model_id),
+        ),
+        served_model_id=served_model_id,
     )
 
 
@@ -790,8 +819,9 @@ def _spend_at_served_tier(
     tokens: TokenCount,
     *,
     reported_tier: str | None,
+    row: ModelCapability,
 ) -> TokenCost:
-    """Price ``tokens`` at the tier the server reports, else the requested tier."""
+    """Price ``tokens`` at the served row and tier, else the requested ones."""
     served = served_tier(reported_tier)
     debug_log.trace("api_response", kind="openai_responses", service_tier=served)
     if served is None:
@@ -800,9 +830,9 @@ def _spend_at_served_tier(
             reported_tier,
             model.settings.service_tier,
         )
-        return model.spend(tokens)
+        return model.spend(tokens, served=row)
     try:
-        return model.capability.prices.cost(
+        return row.prices.cost(
             tokens,
             service_tier=served,
             at=datetime.now(UTC).date(),
@@ -811,11 +841,11 @@ def _spend_at_served_tier(
         logger.warning(
             "%s has no price for served service_tier %r; billing the requested "
             "tier %r.",
-            model.capability.model_id,
+            row.model_id,
             served,
             model.settings.service_tier,
         )
-        return model.spend(tokens)
+        return model.spend(tokens, served=row)
 
 
 # Runs in a ``finally`` / cleanup context, so a failure HERE must never replace the

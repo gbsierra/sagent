@@ -5,7 +5,7 @@ Usage::
     from sagent.providers import Moonshot
 
     provider = Moonshot.from_env()          # MOONSHOT_API_KEY
-    model = provider.model()            # kimi-3.0
+    model = provider.model()            # kimi-k3
     response = await model.buffer(request)
 
 Self-hosted::
@@ -53,7 +53,10 @@ class _MoonshotModel(OpenAICompatModel):
         body.pop("temperature", None)
         # The base folds ``max`` onto OpenAI's ``high``; K3 takes the level
         # verbatim, and its row offers only levels the wire spells.
-        if self.capability.effort_as_level and self.settings.thinking_effort != "none":
+        if (
+            self.capability.effort_as_level
+            and self.settings.thinking_effort != "default"
+        ):
             body["reasoning_effort"] = self.settings.thinking_effort
         # Only K2.6 offers a switch; K3 and K2.7 Code "should not" be sent
         # the ``thinking`` parameter at all.

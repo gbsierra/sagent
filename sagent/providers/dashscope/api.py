@@ -5,7 +5,7 @@ Usage::
     from sagent.providers import DashScope
 
     provider = DashScope.from_env()          # DASHSCOPE_API_KEY
-    model = provider.model()            # qwen-plus-3.7
+    model = provider.model()            # qwen3.7-plus
     response = await model.buffer(request)
 
 Self-hosted (vLLM/SGLang on localhost)::
@@ -22,9 +22,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, ClassVar, Final, override
 
-from sagent.catalog.dashscope import models, thinking_budget
+from sagent.catalog.dashscope import models
 from sagent.catalog.openai import compatible
 from sagent.catalog.table import ModelCatalog
+from sagent.providers.lib.thinking_budget import EFFORT_BUDGET_TOKENS
 from sagent.providers.openai.compat import (
     OpenAICompat,
     OpenAICompatModel,
@@ -68,30 +69,30 @@ class _DashScopeModel(OpenAICompatModel):
         offered = self.capability.thinking.budget
         # A row offering only ``none`` claims the model REJECTS the toggle
         # (the ``-instruct`` / ``-coder`` ids); never send one.
-        if offered == frozenset({"none"}):
+        if offered <= {"default", "none"}:
             return body
         settings = self.settings
         body["enable_thinking"] = settings.thinking_budget != "none"
-        if settings.thinking_budget == "none" or settings.thinking_effort == "none":
+        if settings.thinking_budget == "none" or settings.thinking_effort == "default":
             return body
         # Qwen 3.8 errors when ``reasoning_effort`` and ``thinking_budget``
         # arrive together, so a level row never sends the cap.
         if self.capability.effort_as_level:
             body["reasoning_effort"] = settings.thinking_effort
         elif settings.thinking_budget == "fixed":
-            body["thinking_budget"] = int(thinking_budget(settings.thinking_effort))
+            body["thinking_budget"] = EFFORT_BUDGET_TOKENS[settings.thinking_effort]
         return body
 
 
 _COMPLETION_CAP: Final = frozenset(
     {
-        "qwen-max-3.8",
-        "qwen-flash-3.8",
-        "qwen-max-3.7",
-        "qwen-plus-3.7",
-        "qwen-flash-3.7",
-        "qwen-plus-3.6",
-        "qwen-flash-3.6",
+        "qwen3.8-max",
+        "qwen3.8-flash",
+        "qwen3.7-max",
+        "qwen3.7-plus",
+        "qwen3.7-flash",
+        "qwen3.6-plus",
+        "qwen3.6-flash",
     },
 )
 """Rows the API page lists for ``max_completion_tokens`` (Max 3.7+, Plus/Flash 3.5+).

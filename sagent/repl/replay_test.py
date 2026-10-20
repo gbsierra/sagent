@@ -118,7 +118,7 @@ def _agent(
     total_cost_usd: float = 0.0,
     model_recipe: _StubModelRecipe | None = None,
     thinking_budget: ThinkingBudget = "none",
-    effort: ThinkingEffort = "none",
+    effort: ThinkingEffort = "default",
     cache_ttl_sec: float = 0.0,
     service_tier: ServiceTier = "auto",
 ) -> Agent:

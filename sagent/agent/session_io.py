@@ -49,6 +49,7 @@ from sagent.agent.state import (
     ReadCacheEntry,
     ToolState,
 )
+from sagent.catalog.table import UnknownModelError, UnsupportedTagError
 from sagent.lib.atomic_file import write_all
 from sagent.lib.codec import ReadError, from_plain
 from sagent.providers.providers import (
@@ -128,7 +129,7 @@ class PersistentAgentRecord:
     thinking_budget: str = "none"
     thinking_output: str = "none"
     show_thinking: bool = True
-    effort: str = "none"
+    effort: str = "default"
     # 300s, not 0: the wire spells this as a label, and a model that caches
     # at all has no "off" -- 0.0 still shipped a ``5m`` breakpoint while the
     # record claimed no caching. Matches ``_cache_ttl_sec``'s read default.
@@ -282,7 +283,7 @@ class SessionMeta:
     """Stable identifier for the session."""
 
     model_id: str = ""
-    """Concrete model identifier (e.g. ``opus-4.7``)."""
+    """Concrete model identifier (e.g. ``claude-opus-4-7``)."""
 
     provider: str = ""
     """Provider key (e.g. ``anthropic``, ``google``)."""
@@ -320,6 +321,17 @@ class SessionMeta:
     total_active_elapsed_seconds: float = 0.0
     """Cumulative wall-clock the session was active."""
 
+    # Raw strings, not the Literal axes: a record may name a rung a later
+    # catalog dropped, and ``ModelSettings.take`` is what lowers it on resume.
+    thinking_effort: str = ""
+    """Selected ``ModelSettings.thinking_effort``; blank means not recorded."""
+
+    thinking_budget: str = ""
+    """Selected ``ModelSettings.thinking_budget``; blank means not recorded."""
+
+    thinking_output: str = ""
+    """Selected ``ModelSettings.thinking_output``; blank means not recorded."""
+
     runtime_events: tuple[RuntimeEvent, ...] = ()
     """Durable runtime metadata events loaded from the session log."""
 
@@ -351,6 +363,9 @@ class SessionMeta:
             "compact_count": self.compact_count,
             "bash_cwd": self.bash_cwd,
             "total_active_elapsed_seconds": self.total_active_elapsed_seconds,
+            "thinking_effort": self.thinking_effort,
+            "thinking_budget": self.thinking_budget,
+            "thinking_output": self.thinking_output,
         }
 
     @classmethod
@@ -397,6 +412,9 @@ class SessionMeta:
                 float,
                 0.0,
             ),
+            thinking_effort=_read(d.get("thinking_effort"), str, ""),
+            thinking_budget=_read(d.get("thinking_budget"), str, ""),
+            thinking_output=_read(d.get("thinking_output"), str, ""),
         )
 
 
@@ -644,10 +662,11 @@ def install_session_persistence(
     persisted_refs = _persisted_refs(session_dir / "session.jsonl")
     meta_written = False
     last_status = agent.status
+    last_thinking: tuple[str, str, str] | None = None
     last_tool_state: dict[str, object] | None = None
 
     def _on_event(event: RuntimeEvent) -> None:
-        nonlocal meta_written, last_status, last_tool_state
+        nonlocal meta_written, last_status, last_thinking, last_tool_state
         if not isinstance(
             event,
             (SaveSession, StatusChanged, ModelServiceSuspended, NoticeMessage),
@@ -657,7 +676,20 @@ def install_session_persistence(
             record for record in agent.runtime.tape if record.ref not in persisted_refs
         ]
         status_changed = agent.status != last_status
-        write_meta = tape_delta or status_changed or not meta_written
+        settings = agent.model.settings
+        thinking = (
+            settings.thinking_effort,
+            settings.thinking_budget,
+            settings.thinking_output,
+        )
+        # A ``/effort`` or ``/thinking`` change appends no tape record and
+        # changes no status, so it forces the meta write itself.
+        write_meta = (
+            tape_delta
+            or status_changed
+            or thinking != last_thinking
+            or not meta_written
+        )
         tool_state = serialize_tool_state(agent.tool_state)
         write_tool_state = tool_state != last_tool_state
         spec = agent.model_recipe
@@ -676,6 +708,9 @@ def install_session_persistence(
             compact_count=agent.compaction_state.compact_count,
             bash_cwd=agent.tool_state.bash_cwd,
             total_active_elapsed_seconds=agent.activity.elapsed_seconds,
+            thinking_effort=thinking[0],
+            thinking_budget=thinking[1],
+            thinking_output=thinking[2],
         )
         append_session(
             session_dir / "session.jsonl",
@@ -689,6 +724,7 @@ def install_session_persistence(
         persisted_refs.update(record.ref for record in tape_delta)
         meta_written = True
         last_status = agent.status
+        last_thinking = thinking
         last_tool_state = tool_state
 
     def _rebaseline() -> None:
@@ -953,8 +989,15 @@ def restore_model(
 
     Returns:
       result: ``(model, spec, provider)`` on success, where ``provider`` is the
-          built provider the caller now owns, or ``None`` if construction fails
-          for any reason (the caller keeps its default model).
+          built provider the caller now owns, or ``None`` if the provider
+          cannot be built (the caller keeps its default model).
+
+    Raises:
+      UnknownModelError: The catalog no longer lists the saved model. The
+          CLI and persistent-child resumes refuse it too; silently resuming
+          on another model would bill and answer as a model the session
+          never chose.
+      UnsupportedTagError: The saved context tag is no longer offered.
 
     """
     if not meta.provider or not meta.model_id:
@@ -974,6 +1017,14 @@ def restore_model(
             account=account,
         )
         return model, spec, provider
+    except UnknownModelError as error:
+        raise UnknownModelError(
+            f"session was saved on {meta.provider}/{meta.model_id}: {error}",
+        ) from error
+    except UnsupportedTagError as error:
+        raise UnsupportedTagError(
+            f"session was saved on {meta.provider}/{meta.model_id}: {error}",
+        ) from error
     except Exception:
         logger.exception(
             "Failed to restore model %s/%s; keeping default",
@@ -1665,7 +1716,7 @@ def _persistent_agent_from_json(
         thinking_budget=budget,
         thinking_output=output,
         show_thinking=show,
-        effort=str(record.get("effort") or "none"),
+        effort=str(record.get("effort") or "default"),
         cache_ttl_sec=_cache_ttl_sec(record),
         service_tier=str(record.get("service_tier") or "auto"),
         max_budget_usd=_optional_float(record.get("max_budget_usd")),

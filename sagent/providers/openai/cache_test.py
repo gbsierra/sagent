@@ -57,7 +57,7 @@ async def test_compacting_agent_preserves_prefix_past_half_window(
     capture: _Capture,
 ) -> None:
     provider = OpenAI.from_key("offline")
-    model = provider.model("sol-6.0")
+    model = provider.model("gpt-6-sol")
     agent = Agent(
         model=model,
         system="Stable instructions",

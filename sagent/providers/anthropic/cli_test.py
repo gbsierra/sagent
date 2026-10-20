@@ -508,14 +508,14 @@ def test_model_unknown_raises() -> None:
 def test_model_rejects_unknown_provider_options() -> None:
     provider = AnthropicCLI()
     with pytest.raises(TypeError, match="typoo"):
-        _ = operator.methodcaller("model", "opus-4.8", typoo=True)(provider)
+        _ = operator.methodcaller("model", "claude-opus-4-8", typoo=True)(provider)
 
 
 def test_model_resolves_context_tag_to_profile() -> None:
     """The explicit smaller-window tag resolves against the same profile."""
     provider = AnthropicCLI()
-    model = provider.model("sonnet-4.6+200k")
-    assert model.tagged_model_id == "sonnet-4.6+200k"
+    model = provider.model("claude-sonnet-4-6+200k")
+    assert model.tagged_model_id == "claude-sonnet-4-6+200k"
     assert model.limits.max_request_tokens == 200_000
 
 
@@ -533,7 +533,7 @@ def test_catalog_inherits_from_anthropic() -> None:
 def test_utility_model_picks_latest_sonnet() -> None:
     provider = AnthropicCLI()
     model = provider.model("utility")
-    assert model.capability.model_id == "sonnet-5.5"
+    assert model.capability.model_id == "claude-sonnet-5-5"
 
 
 def test_model_capabilities() -> None:
@@ -541,7 +541,7 @@ def test_model_capabilities() -> None:
     provider = AnthropicCLI()
     model = provider.model("claude-sonnet-4-5")
     assert model.capability.thinking.budget != frozenset({"none"})
-    assert model.capability.thinking.effort == frozenset({"none"})
+    assert model.capability.thinking.effort == frozenset({"default"})
     assert model.capability.cache_ttl_sec == frozenset({0.0})
     assert model.capability.manage_context_server_side == frozenset({True})
     assert model.capability.retries_internally is False
@@ -1040,6 +1040,48 @@ async def test_drain_captures_last_round_usage_for_context_anchor() -> None:
     assert response.tokens.cache_read == 96_000
     assert response.tokens.response == 70
     assert model._last_input_tokens == 96_003
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rounds", "served"),
+    [
+        (["claude-haiku-4-5-20251001"], "claude-haiku-4-5-20251001"),
+        (["claude-sonnet-5", "claude-haiku-4-5-20251001"], "claude-haiku-4-5-20251001"),
+        ([None], ""),
+        ([], ""),
+    ],
+)
+async def test_drain_reports_the_model_the_last_message_start_names(
+    rounds: list[str | None],
+    served: str,
+) -> None:
+    def _msg_start(model_id: str | None) -> dict[str, MutablePlainTree]:
+        message: dict[str, MutablePlainTree] = {"usage": {"input_tokens": 1}}
+        if model_id is not None:
+            message["model"] = model_id
+        return {
+            "type": "stream_event",
+            "event": {"type": "message_start", "message": message},
+        }
+
+    events: list[dict[str, MutablePlainTree]] = [
+        *(_msg_start(r) for r in rounds),
+        {"type": "result", "stop_reason": "end_turn", "is_error": False},
+    ]
+
+    class _Proc:
+        async def read_json_line(
+            self,
+            *,
+            skip_non_json: bool = False,
+        ) -> dict[str, MutablePlainTree] | None:
+            del skip_non_json
+            return events.pop(0) if events else None
+
+    model = AnthropicCLI().model("claude-haiku-4-5")
+    response = await model._drain_until_result(cast(Subproc, _Proc()), publish=None)
+    assert response.served_model_id == served
 
 
 @pytest.mark.asyncio

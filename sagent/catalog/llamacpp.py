@@ -40,8 +40,7 @@ def models() -> ModelTable:
     # The reference row: every other model states only how it differs from it.
     # A local server bills nothing, but a missing price row would raise.
     default = ModelCapability(
-        model_id="qwen-27b-12gb-3.6",
-        wire_model_id="qwen3.6-27b-12gb",
+        model_id="qwen3.6-27b-12gb",
         context=_limits(),
         prices=PriceCatalog(
             {
@@ -59,16 +58,14 @@ def models() -> ModelTable:
         default,
         replace(
             default,
-            model_id="qwen-27b-mtp-64k-3.6",
-            wire_model_id="qwen3.6-27b-mtp-64k",
+            model_id="qwen3.6-27b-mtp-64k",
             context=_limits(max_tokens=65_536, output_tokens=4_096),
         ),
         # Whatever the server happens to load; its version is unknowable, so
         # ``0.0`` marks "unversioned" and the wire id stays the server's alias.
         replace(
             default,
-            model_id="local-0.0",
-            wire_model_id="local",
+            model_id="local",
             context=_limits(max_tokens=32_768, output_tokens=4_096),
         ),
     )
@@ -77,6 +74,13 @@ def models() -> ModelTable:
     return ModelTable(
         rows=rows,
         roles={"default": default.model_id, "utility": default.model_id},
+        # Sagent's own spellings before rows were keyed by vendor id; kept so
+        # saved sessions and settings load. Never extend.
+        renamed={
+            "qwen-27b-12gb-3.6": "qwen3.6-27b-12gb",
+            "qwen-27b-mtp-64k-3.6": "qwen3.6-27b-mtp-64k",
+            "local-0.0": "local",
+        },
     )
 
 

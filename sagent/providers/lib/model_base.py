@@ -19,6 +19,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Protocol
 
+import logging
+
 from sagent.lib import token_count
 
 
@@ -40,6 +42,8 @@ if TYPE_CHECKING:
 
 
 __all__ = ["ModelDefaults"]
+
+logger = logging.getLogger(__name__)
 
 
 class _Transport(Protocol):
@@ -71,21 +75,38 @@ class ModelDefaults(_Transport, Protocol):
         """Display id carrying its context tag."""
         return f"{self.capability.model_id}{self.settings.context}"
 
-    def spend(self, tokens: TokenCount) -> TokenCost:
+    def spend(
+        self,
+        tokens: TokenCount,
+        *,
+        served: ModelCapability | None = None,
+    ) -> TokenCost:
         """Price ``tokens`` at the tier this instance's settings select.
 
         Args:
           tokens: What the server reported.
+          served: The row the server says it ran (``ModelCatalog.served``);
+            defaults to the requested row.
 
         Returns:
           spend: USD cost, per bucket.
 
         """
-        return self.capability.prices.cost(
-            tokens,
-            service_tier=self.settings.service_tier,
-            at=datetime.now(UTC).date(),
-        )
+        tier = self.settings.service_tier
+        today = datetime.now(UTC).date()
+        if served is not None and served is not self.capability:
+            # The response is already paid for: a served row with no rate for
+            # the selected tier must not lose the bill, so price at the request.
+            try:
+                return served.prices.cost(tokens, service_tier=tier, at=today)
+            except KeyError:
+                logger.warning(
+                    "served row %r prices no %r tier; pricing at the requested %r",
+                    served.model_id,
+                    tier,
+                    self.capability.model_id,
+                )
+        return self.capability.prices.cost(tokens, service_tier=tier, at=today)
 
     def approx_request_tokens(self, request: ModelRequest) -> int:
         """Walk-and-sum every wire-bearing surface of ``request``."""

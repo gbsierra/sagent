@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import fields
+from dataclasses import fields, replace
 from types import MappingProxyType
 from typing import Final
 
@@ -13,6 +13,7 @@ from sagent.types.capability import (
     ModelLimits,
     ModelSettings,
     ThinkingCapability,
+    ThinkingEffort,
 )
 from sagent.types.cost import PriceCatalog, PriceKey, TokenPrice
 
@@ -68,7 +69,7 @@ def test_a_bare_transport_keeps_the_axis_a_row_cannot_know() -> None:
     assert met.manage_context_server_side == _row().manage_context_server_side
     # The thinking and tier axes stay narrow: a row DOES know what it can
     # think and which tiers the vendor sells it at.
-    assert met.thinking.effort == frozenset({"none"})
+    assert met.thinking.effort == frozenset({"default"})
     assert met.service_tier == frozenset({"auto", "default"})
     assert met.cache_ttl_sec == frozenset({0.0})
 
@@ -86,7 +87,7 @@ def test_the_meet_only_removes() -> None:
         retries_internally=True,
     )
     met = _row() & transport
-    assert met.thinking.effort == frozenset({"none", "low", "high"})
+    assert met.thinking.effort == frozenset({"default", "none", "low", "high"})
     assert met.service_tier == frozenset({"auto", "default", "priority"})
 
 
@@ -96,7 +97,7 @@ def test_the_meet_cannot_grant() -> None:
     ) & ModelCapability(
         thinking=ThinkingCapability(effort=frozenset({"none", "max"})),
     )
-    assert met.thinking.effort == frozenset({"none"})
+    assert met.thinking.effort == frozenset({"default", "none"})
 
 
 def test_the_transport_declares_the_cache_lifetimes() -> None:
@@ -167,7 +168,7 @@ def test_assignment_rejects_what_the_model_withholds() -> None:
     settings = ModelSettings.narrowest(_row())
     with pytest.raises(ValueError, match="thinking_effort='medium'"):
         settings.thinking_effort = "medium"
-    assert settings.thinking_effort == "none"
+    assert settings.thinking_effort == "default"
 
 
 def test_construction_rejects_what_the_model_withholds() -> None:
@@ -256,9 +257,68 @@ def test_take_applies_what_is_offered() -> None:
 def test_take_drops_what_is_not_offered_instead_of_raising() -> None:
     """A swap or resume must not FAIL on a knob the new model withholds."""
     settings = ModelSettings.narrowest(_row())
-    settings.take(thinking_effort="max", thinking_budget="auto")
-    assert settings.thinking_effort == "none"
-    assert settings.thinking_budget == "auto"
+    settings.take(thinking_effort="max", service_tier="flex")
+    assert settings.thinking_effort == "high"
+    assert settings.service_tier == "auto"
+
+
+def _efforts(*offered: ThinkingEffort) -> ModelCapability:
+    return replace(_row(), thinking=ThinkingCapability(effort=frozenset(offered)))
+
+
+@pytest.mark.parametrize(
+    ("offered", "wanted", "landed"),
+    [
+        (("none", "low", "high"), "max", "high"),
+        (("low", "medium", "high", "xhigh", "max"), "min", "low"),
+        (("none", "low", "high"), "medium", "low"),
+        (("none", "low", "high", "max"), "xhigh", "high"),
+        (("medium", "high", "xhigh"), "max", "xhigh"),
+        (("none", "min", "low", "medium", "high"), "max", "high"),
+    ],
+)
+def test_take_lands_an_unoffered_effort_on_the_nearest_rung(
+    offered: tuple[ThinkingEffort, ...],
+    wanted: ThinkingEffort,
+    landed: ThinkingEffort,
+) -> None:
+    """A tie between two rungs rounds down, toward the cheaper one."""
+    settings = ModelSettings.narrowest(_efforts(*offered))
+    settings.take(thinking_effort=wanted)
+    assert settings.thinking_effort == landed
+
+
+def test_take_keeps_an_offered_effort_exactly() -> None:
+    settings = ModelSettings.narrowest(_efforts("none", "low", "high"))
+    settings.take(thinking_effort="low")
+    assert settings.thinking_effort == "low"
+
+
+def test_take_never_promotes_none_into_thinking() -> None:
+    """Unsupported explicit ``none`` falls back to provider default."""
+    settings = ModelSettings.narrowest(_efforts("medium", "high"))
+    settings.thinking_effort = "high"
+    settings.take(thinking_effort="none")
+    assert settings.thinking_effort == "default"
+
+
+def test_take_falls_to_default_when_the_row_has_no_effort_knob() -> None:
+    settings = ModelSettings.narrowest(_OFF)
+    settings.take(thinking_effort="max")
+    assert settings.thinking_effort == "default"
+
+
+def test_take_defaults_an_effort_that_is_off_the_ladder() -> None:
+    settings = ModelSettings.narrowest(_efforts("low", "high"))
+    settings.take(thinking_effort="extreme")
+    assert settings.thinking_effort == "default"
+
+
+def test_capability_swap_carries_effort_to_the_nearest_rung() -> None:
+    settings = ModelSettings.narrowest(_efforts("none", "low", "medium", "max"))
+    settings.thinking_effort = "max"
+    settings.capability = _efforts("none", "low", "high")
+    assert settings.thinking_effort == "high"
 
 
 def test_take_rejects_a_name_that_is_not_an_axis() -> None:
@@ -291,7 +351,7 @@ def test_adopt_drops_a_knob_the_new_model_rejects() -> None:
     old = ModelSettings(capability=_row(), cache_ttl_sec=300.0, thinking_effort="high")
     new = ModelSettings.narrowest(_OFF)
     new.adopt(old)
-    assert new.thinking_effort == "none"
+    assert new.thinking_effort == "default"
 
 
 # ---- narrowest -------------------------------------------------------------
@@ -321,18 +381,13 @@ def test_narrowest_carries_the_capability_it_narrowed() -> None:
     assert ModelSettings.narrowest(_row()).capability == _row()
 
 
-def test_narrowest_climbs_an_axis_that_withholds_its_unset_value() -> None:
-    """A default-constructed settings was unbuildable against these rows.
-
-    Model Studio's ``-thinking`` ids reject "do not think"; a CLI transport
-    requires server-side history. Both make the field default unselectable.
-    """
+def test_narrowest_keeps_provider_default_and_climbs_other_axes() -> None:
     row = ModelCapability(
         thinking=ThinkingCapability(effort=frozenset({"low", "high"})),
         manage_context_server_side=frozenset({True}),
     )
     settings = ModelSettings.narrowest(row)
-    assert settings.thinking_effort == "low"
+    assert settings.thinking_effort == "default"
     assert settings.manage_context_server_side is True
 
 
@@ -350,12 +405,10 @@ def test_narrowest_builds_against_what_it_narrowed(
     assert ModelSettings.narrowest(capability).capability == capability
 
 
-def test_narrowest_rejects_an_empty_axis() -> None:
-    """An empty meet is a model nothing can be requested from -- say so."""
-    with pytest.raises(ValueError, match="thinking_effort offers nothing"):
-        ModelSettings.narrowest(
-            ModelCapability(thinking=ThinkingCapability(effort=frozenset())),
-        )
+def test_thinking_capability_always_offers_provider_default() -> None:
+    capability = ModelCapability(thinking=ThinkingCapability(effort=frozenset()))
+    assert capability.thinking.effort == frozenset({"default"})
+    assert ModelSettings.narrowest(capability).thinking_effort == "default"
 
 
 # ---- limits ----------------------------------------------------------------
@@ -388,7 +441,7 @@ def test_capability_assignment_renarrows_context_and_all_axes() -> None:
     settings.capability = _OFF
     assert settings.context == ""
     assert settings.limits == ModelLimits()
-    assert settings.thinking_effort == "none"
+    assert settings.thinking_effort == "default"
     assert settings.cache_ttl_sec == 0.0
 
 

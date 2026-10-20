@@ -1,9 +1,7 @@
 """DashScope/Qwen model catalog, expressed as ``ModelCapability`` rows.
 
-Sources (international / Singapore deployment, list prices, 2026-10-03):
-  https://www.alibabacloud.com/help/en/model-studio/model-pricing
-  https://www.alibabacloud.com/help/en/model-studio/text-generation-model
-  https://www.alibabacloud.com/help/en/model-studio/deep-thinking
+Sources (international / Singapore deployment, list prices): limits, prices,
+and thinking per ``_SOURCES``; also
   https://www.alibabacloud.com/help/en/model-studio/context-cache
   https://www.alibabacloud.com/help/en/model-studio/vision
 
@@ -22,16 +20,17 @@ alongside it. Effort ``none`` sends no depth knob at all.
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import date
 from types import MappingProxyType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
+from sagent.catalog.provenance import Source
 from sagent.catalog.table import ModelTable
 from sagent.types.capability import (
     ContextTag,
     ModelCapability,
     ModelLimits,
     ThinkingCapability,
-    ThinkingEffort,
 )
 from sagent.types.cost import (
     PriceCatalog,
@@ -43,38 +42,10 @@ from sagent.types.cost import (
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
+    from sagent.catalog.provenance import Fact
 
-__all__ = ["models", "thinking_budget"]
 
-
-def thinking_budget(effort: ThinkingEffort) -> str:
-    """Return the ``thinking_budget`` token cap an effort sends.
-
-    Only rows without ``effort_as_level`` send it, and only under a
-    ``fixed`` budget; ``0`` is the off value an effort of ``none`` maps to.
-
-    Args:
-      effort: Selected effort level.
-
-    Returns:
-      budget: Wire value, as the string the request body carries.
-
-    """
-    match effort:
-        case "none":
-            return "0"
-        case "min":
-            return "1024"
-        case "low":
-            return "4096"
-        case "medium":
-            return "8192"
-        case "high":
-            return "16384"
-        case "xhigh":
-            return "20480"
-        case "max":
-            return "24576"
+__all__ = ["models"]
 
 
 def models() -> ModelTable:
@@ -101,8 +72,7 @@ def models() -> ModelTable:
     vision = _limits(image_bytes=14_000_000)
     rows = (
         ModelCapability(
-            model_id="qwen-max-3.8",
-            wire_model_id="qwen3.8-max",
+            model_id="qwen3.8-max",
             context=vision,
             # Cache-hit rate unpublished (console only).
             prices=_prices((0, 2.0, 6.0), cache_hit=1.0),
@@ -110,8 +80,7 @@ def models() -> ModelTable:
             effort_as_level=True,
         ),
         ModelCapability(
-            model_id="qwen-flash-3.8",
-            wire_model_id="qwen3.8-flash",
+            model_id="qwen3.8-flash",
             context=vision,
             # Cache-hit rate unpublished (console only).
             prices=_prices((0, 0.15, 0.47), cache_hit=1.0),
@@ -119,16 +88,14 @@ def models() -> ModelTable:
             effort_as_level=True,
         ),
         ModelCapability(
-            model_id="qwen-27b-3.8",
-            wire_model_id="qwen3.8-27b",
+            model_id="qwen3.8-27b",
             context=_limits(),
             prices=_prices((0, 0.5, 3.0), cache_hit=0.2),
             thinking=levels,
             effort_as_level=True,
         ),
         ModelCapability(
-            model_id="qwen-2400b-a95b-3.8",
-            wire_model_id="qwen3.8-2.4t-a95b",
+            model_id="qwen3.8-2.4t-a95b",
             context=_limits(),
             # Cache-hit rate unpublished (console only).
             prices=_prices((0, 2.0, 6.0), cache_hit=1.0),
@@ -137,22 +104,19 @@ def models() -> ModelTable:
             effort_as_level=True,
         ),
         ModelCapability(
-            model_id="qwen-max-3.7",
-            wire_model_id="qwen3.7-max",
+            model_id="qwen3.7-max",
             context=vision,
             prices=_prices((0, 2.5, 7.5), cache_hit=0.2),
             thinking=hybrid,
         ),
         ModelCapability(
-            model_id="qwen-plus-3.7",
-            wire_model_id="qwen3.7-plus",
+            model_id="qwen3.7-plus",
             context=vision,
             prices=_prices((0, 0.4, 1.6), (256_000, 1.2, 4.8), cache_hit=0.2),
             thinking=hybrid,
         ),
         ModelCapability(
-            model_id="qwen-flash-3.7",
-            wire_model_id="qwen3.7-flash",
+            model_id="qwen3.7-flash",
             context=vision,
             prices=_prices(
                 (0, 0.03, 0.13),
@@ -165,22 +129,19 @@ def models() -> ModelTable:
         # The qwen3.6 rows support only EXPLICIT cache in Singapore, which
         # needs a ``cache_control`` marker this transport never writes.
         ModelCapability(
-            model_id="qwen-max-3.6",
-            wire_model_id="qwen3.6-max-preview",
+            model_id="qwen3.6-max-preview",
             context=_limits(max_tokens=262_144),
             prices=_prices((0, 1.3, 7.8), (128_000, 2.0, 12.0), cache_hit=1.0),
             thinking=hybrid,
         ),
         ModelCapability(
-            model_id="qwen-plus-3.6",
-            wire_model_id="qwen3.6-plus",
+            model_id="qwen3.6-plus",
             context=vision,
             prices=_prices((0, 0.5, 3.0), (256_000, 2.0, 6.0), cache_hit=1.0),
             thinking=hybrid,
         ),
         ModelCapability(
-            model_id="qwen-flash-3.6",
-            wire_model_id="qwen3.6-flash",
+            model_id="qwen3.6-flash",
             context=vision,
             prices=_prices((0, 0.25, 1.5), (256_000, 1.0, 4.0), cache_hit=1.0),
             thinking=hybrid,
@@ -189,14 +150,12 @@ def models() -> ModelTable:
         # axis offers only its off value; their open-source deployments carry
         # no implicit cache.
         ModelCapability(
-            model_id="qwen-235b-a22b-instruct-3.0",
-            wire_model_id="qwen3-235b-a22b-instruct-2507",
+            model_id="qwen3-235b-a22b-instruct-2507",
             context=_limits(max_tokens=262_144),
             prices=_prices((0, 0.23, 0.92), cache_hit=1.0),
         ),
         ModelCapability(
-            model_id="qwen-235b-a22b-thinking-3.0",
-            wire_model_id="qwen3-235b-a22b-thinking-2507",
+            model_id="qwen3-235b-a22b-thinking-2507",
             context=_limits(max_tokens=262_144, output_tokens=32_768),
             prices=_prices((0, 0.23, 2.3), cache_hit=1.0),
             # These ids reject ``enable_thinking=false``.
@@ -207,21 +166,18 @@ def models() -> ModelTable:
             ),
         ),
         ModelCapability(
-            model_id="qwen-30b-a3b-instruct-3.0",
-            wire_model_id="qwen3-30b-a3b-instruct-2507",
+            model_id="qwen3-30b-a3b-instruct-2507",
             context=_limits(max_tokens=262_144),
             prices=_prices((0, 0.2, 0.8), cache_hit=1.0),
         ),
         ModelCapability(
-            model_id="qwen-32b-3.0",
-            wire_model_id="qwen3-32b",
+            model_id="qwen3-32b",
             context=_limits(max_tokens=262_144),
             prices=_prices((0, 0.16, 0.64), cache_hit=1.0),
             thinking=hybrid,
         ),
         ModelCapability(
-            model_id="qwen-coder-480b-a35b-3.0",
-            wire_model_id="qwen3-coder-480b-a35b-instruct",
+            model_id="qwen3-coder-480b-a35b-instruct",
             context=_limits(max_tokens=262_144),
             prices=_prices(
                 (0, 1.5, 7.5),
@@ -234,8 +190,7 @@ def models() -> ModelTable:
         # files them under ("Qwen3 ... Commercial version"). ``qwen-max`` is
         # absent: no page states its generation.
         ModelCapability(
-            model_id="qwen-plus-3.0",
-            wire_model_id="qwen-plus",
+            model_id="qwen-plus",
             context=_limits(output_tokens=32_768),
             # Non-thinking card; thinking output bills $4 / $12, which no
             # ``PriceKey`` axis can select.
@@ -243,8 +198,7 @@ def models() -> ModelTable:
             thinking=hybrid,
         ),
         ModelCapability(
-            model_id="qwen-turbo-3.0",
-            wire_model_id="qwen-turbo",
+            model_id="qwen-turbo",
             context=_limits(output_tokens=32_768),
             # Non-thinking card; thinking output bills $0.5, which no
             # ``PriceKey`` axis can select.
@@ -252,14 +206,62 @@ def models() -> ModelTable:
             thinking=hybrid,
         ),
     )
+    # Qwen 3.8 publishes xhigh when reasoning_effort is omitted. Older rows
+    # publish a dynamic/default token budget rather than a named effort.
+    # https://help.aliyun.com/en/model-studio/qwen-api-via-openai-responses
+    rows = tuple(
+        replace(row, default_effort="xhigh")
+        if row.model_id
+        in {
+            "qwen3.8-max",
+            "qwen3.8-flash",
+            "qwen3.8-27b",
+            "qwen3.8-2.4t-a95b",
+        }
+        else row
+        for row in rows
+    )
     # A tier is offered exactly when it is priced.
     rows = tuple(replace(row, service_tier=row.prices.service_tiers) for row in rows)
     return ModelTable(
         rows=rows,
         # text-generation-model: "Start with qwen3.7-plus ... To cut costs,
         # switch to qwen3.8-flash".
-        roles={"default": "qwen-plus-3.7", "utility": "qwen-flash-3.8"},
+        roles={"default": "qwen3.7-plus", "utility": "qwen3.8-flash"},
+        # Sagent's own spellings before rows were keyed by vendor id; kept so
+        # saved sessions and settings load. Never extend.
+        renamed={
+            "qwen-max-3.8": "qwen3.8-max",
+            "qwen-flash-3.8": "qwen3.8-flash",
+            "qwen-27b-3.8": "qwen3.8-27b",
+            "qwen-2400b-a95b-3.8": "qwen3.8-2.4t-a95b",
+            "qwen-max-3.7": "qwen3.7-max",
+            "qwen-plus-3.7": "qwen3.7-plus",
+            "qwen-flash-3.7": "qwen3.7-flash",
+            "qwen-max-3.6": "qwen3.6-max-preview",
+            "qwen-plus-3.6": "qwen3.6-plus",
+            "qwen-flash-3.6": "qwen3.6-flash",
+            "qwen-235b-a22b-instruct-3.0": "qwen3-235b-a22b-instruct-2507",
+            "qwen-235b-a22b-thinking-3.0": "qwen3-235b-a22b-thinking-2507",
+            "qwen-30b-a3b-instruct-3.0": "qwen3-30b-a3b-instruct-2507",
+            "qwen-32b-3.0": "qwen3-32b",
+            "qwen-coder-480b-a35b-3.0": "qwen3-coder-480b-a35b-instruct",
+            "qwen-plus-3.0": "qwen-plus",
+            "qwen-turbo-3.0": "qwen-turbo",
+        },
+        sources=_SOURCES,
     )
+
+
+_DOCS: Final = "https://www.alibabacloud.com/help/en/model-studio"
+
+_SOURCES: Final[Mapping[Fact, Source]] = MappingProxyType(
+    {
+        "limits": Source(f"{_DOCS}/text-generation-model", date(2026, 10, 3)),
+        "prices": Source(f"{_DOCS}/model-pricing", date(2026, 10, 3)),
+        "thinking": Source(f"{_DOCS}/deep-thinking", date(2026, 10, 3)),
+    },
+)
 
 
 # Implicit cache creation bills as plain input, and this transport never writes the

@@ -137,6 +137,13 @@ class ModelResponse:
     spend: TokenCost = field(default_factory=TokenCost)
     """USD cost of this request, per token bucket."""
 
+    served_model_id: str = ""
+    """Vendor id the server reports it ran; blank when the transport reports none.
+
+    Can differ from the requested id: an alias resolves to a snapshot, a
+    vendor falls back to another model, or a CLI picks its own default.
+    """
+
     @property
     def total_cost(self) -> float:
         """Total USD cost of the request."""

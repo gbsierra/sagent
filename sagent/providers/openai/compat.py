@@ -188,9 +188,7 @@ class OpenAICompatModel(ModelDefaults):
     @property
     def _wire_model_id(self) -> str:
         """Return the untagged vendor model id sent on the wire."""
-        return base_model_id(
-            self.capability.wire_model_id or self.capability.model_id,
-        )
+        return base_model_id(self.capability.model_id)
 
     def _effective_service_tier(self) -> ServiceTier | None:
         tier = self.settings.service_tier
@@ -269,14 +267,14 @@ class OpenAICompatModel(ModelDefaults):
             # whose ids differ rewrites the field in ``_transform_body``.
             field = (
                 "max_completion_tokens"
-                if self.capability.thinking.effort != frozenset({"none"})
+                if self.capability.thinking.effort - {"default", "none"}
                 else "max_tokens"
             )
             body[field] = request.max_response_tokens
         if stream:
             body["stream"] = True
             body["stream_options"] = {"include_usage": True}
-        if self.settings.thinking_effort != "none":
+        if self.settings.thinking_effort != "default":
             effort = self.settings.thinking_effort
             body["reasoning_effort"] = (
                 "minimal"
@@ -354,6 +352,7 @@ class OpenAICompatModel(ModelDefaults):
                 r,
                 publish=publish,
                 model=self,
+                catalog=self._provider.catalog,
                 reasoning_field=self._reasoning_field,
             )
 
@@ -614,6 +613,7 @@ async def consume_stream(
     *,
     publish: Callable[[RuntimeEvent], None] | None,
     model: OpenAICompatModel,
+    catalog: ModelCatalog,
     reasoning_field: str,
 ) -> ModelResponse:
     """Parse an SSE stream into an assembled ``ModelResponse``.
@@ -627,6 +627,7 @@ async def consume_stream(
       publish: Called per streamed ``RuntimeEvent``; ``None`` disables
           live streaming.
       model: Active model, used to price the reported usage.
+      catalog: The provider's catalog; the row the chunks report prices the turn.
       reasoning_field: Provider-specific reasoning-text field name,
           or empty when the provider does not surface reasoning.
 
@@ -646,6 +647,12 @@ async def consume_stream(
     finish_reason: str | None = None
     saw_refusal = False
     message_id = ""
+    # Every chunk names the model that produced it. Source: OpenAI chat
+    # completion chunk object, field ``model`` -- "The model to generate the
+    # completion." https://developers.openai.com/api/reference/resources/chat/
+    # subresources/completions/streaming-events (read 2026-10-17); the
+    # compatible vendors this transport serves send the same chunk shape.
+    served_model_id = ""
     usage: dict[str, MutablePlainTree] = {}
 
     loop = asyncio.get_running_loop()
@@ -669,6 +676,8 @@ async def consume_stream(
                 raise _stream_error(event)
             if not message_id:
                 message_id = str(event.get("id") or "")
+            if not served_model_id:
+                served_model_id = from_plain(event.get("model"), str, default="")
             event_usage = event.get("usage")
             if isinstance(event_usage, dict):
                 usage = cast(dict[str, MutablePlainTree], event_usage)
@@ -765,7 +774,11 @@ async def consume_stream(
         ),
         message_id=message_id,
         request_id=message_id,
-        spend=model.spend(tokens),
+        spend=model.spend(
+            tokens,
+            served=catalog.served(model.capability, served_model_id),
+        ),
+        served_model_id=served_model_id,
     )
     if not saw_done:
         raise StreamInterruptedError(response)

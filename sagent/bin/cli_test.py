@@ -41,6 +41,7 @@ from sagent.bin.cli import (
     _credential_fallback_providers,
     _default_allow_providers,
     _do_login,
+    _drop_flagged_thinking,
     _event_to_json_record,
     _install_repl_logging,
     _last_assistant_text,
@@ -80,7 +81,7 @@ from sagent.types.runtime import (
 
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Sequence
+    from collections.abc import AsyncIterator, Callable, Sequence
 
 
 _CWD: Final = Path(__file__).resolve().parent
@@ -986,6 +987,38 @@ def test_resume_model_defaults_explicit_provider_keeps_context_tagged_model() ->
     assert ns.model == "claude-opus-4-8+200k"
 
 
+def _thinking_meta() -> SessionMeta:
+    return SessionMeta(
+        thinking_effort="high",
+        thinking_budget="fixed",
+        thinking_output="text",
+    )
+
+
+def test_flagged_effort_beats_the_recorded_effort() -> None:
+    """An explicit ``--effort`` must not be undone by the resume restore."""
+    meta = _drop_flagged_thinking(_parse(["--effort", "low"]), _thinking_meta())
+    assert meta.thinking_effort == ""
+    assert (meta.thinking_budget, meta.thinking_output) == ("fixed", "text")
+
+
+def test_flagged_thinking_beats_the_recorded_budget_and_output() -> None:
+    meta = _drop_flagged_thinking(_parse(["--thinking", "on"]), _thinking_meta())
+    assert meta.thinking_effort == "high"
+    assert (meta.thinking_budget, meta.thinking_output) == ("", "")
+
+
+@pytest.mark.parametrize("word", ["default", "show", "hide"])
+def test_a_display_only_thinking_word_keeps_the_recorded_axes(word: str) -> None:
+    ns = _parse([] if word == "default" else ["--thinking", word])
+    meta = _drop_flagged_thinking(ns, _thinking_meta())
+    assert (meta.thinking_effort, meta.thinking_budget, meta.thinking_output) == (
+        "high",
+        "fixed",
+        "text",
+    )
+
+
 def test_parse_agent_args_known_unknown_split() -> None:
     parser = argparse.ArgumentParser()
     ns, unknown = parse_agent_args(parser, ["--model", "x", "extra-token"])
@@ -1433,6 +1466,71 @@ def test_parse_allow_providers_unknown_exits() -> None:
     assert exc.value.code == 1
 
 
+def test_parse_allow_providers_canonicalizes_aliases() -> None:
+    assert _parse_allow_providers("oai, antsub,OAISUB,ant") == (
+        "OpenAI",
+        "AnthropicCLI",
+        "OpenAISubscription",
+        "Anthropic",
+    )
+
+
+def test_parse_allow_providers_unknown_alias_lists_aliases(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as exc:
+        _parse_allow_providers("oai,oaii")
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "'oaii'" in err
+    assert "oaisub" in err
+
+
+@pytest.mark.parametrize(
+    ("alias", "canonical"),
+    [
+        ("oai", "OpenAI"),
+        ("oaisub", "OpenAISubscription"),
+        ("ant", "Anthropic"),
+        ("antsub", "AnthropicCLI"),
+        ("openai", "OpenAI"),
+    ],
+)
+def test_parse_agent_args_canonicalizes_provider_alias(
+    alias: str,
+    canonical: str,
+) -> None:
+    ns, _ = parse_agent_args(argparse.ArgumentParser(), ["--provider", alias])
+    assert ns.provider == canonical
+    assert ns.provider_explicit is True
+
+
+def test_parse_agent_args_unknown_provider_exits_with_choices(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as exc:
+        _ = parse_agent_args(argparse.ArgumentParser(), ["--provider", "oaii"])
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "'oaii'" in err
+    assert "OpenAISubscription" in err
+    assert "antsub" in err
+
+
+def test_resolve_provider_and_allow_alias_primary_is_unioned_canonically() -> None:
+    provider, out = _resolve_provider_and_allow("oai", primary="AnthropicCLI")
+    assert provider == "AnthropicCLI"
+    assert out == ("OpenAI", "AnthropicCLI")
+
+
+def test_provider_help_mentions_aliases() -> None:
+    parser = argparse.ArgumentParser()
+    _ = parse_agent_args(parser, [])
+    help_text = parser.format_help()
+    assert "oaisub" in help_text
+    assert "antsub" in help_text
+
+
 def test_resolve_provider_and_allow_default_picks_first_allowed() -> None:
     """Default (``primary=None``) provider is the first allowed entry."""
     provider, out = _resolve_provider_and_allow("OpenAI,Anthropic", primary=None)
@@ -1643,6 +1741,20 @@ def test_resumed_auth_is_not_replaced_by_provider_default(
         _CustomAuthProvider,
         raising=False,
     )
+    # ``provider_class`` only resolves ``PROVIDER_NAMES``; the fake needs a
+    # patched lookup, not just a facade attribute.
+    dispatch = sys.modules["sagent.providers.providers"]
+    real_provider_class = cast(
+        "Callable[[str], type | None]",
+        dispatch.provider_class,
+    )
+
+    def _fake_lookup(name: str) -> type | None:
+        if name == "CustomAuthFake":
+            return _CustomAuthProvider
+        return real_provider_class(name)
+
+    monkeypatch.setattr(dispatch, "provider_class", _fake_lookup)
     _CustomAuthProvider.calls.clear()
     ns = _parse(["--resume", "abc123"])
     _apply_resume_model_defaults(

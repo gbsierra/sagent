@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, cast
 from unittest.mock import Mock, patch
 
 import sys
 
 import pytest
+
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 from sagent import providers
 from sagent.providers import (
@@ -23,10 +28,31 @@ from sagent.providers import (
     infer_provider,
 )
 from sagent.providers.providers import (
+    PROVIDER_ALIASES,
+    UnknownProviderError,
     build_provider_with_account_fallback,
+    canonical_provider,
+    provider_class,
+    require_provider,
 )
 from sagent.types.cost import PriceKey, TokenCount
 from sagent.types.providers import ModelResolver
+
+
+# ``provider_class`` only resolves names in ``PROVIDER_NAMES``, so a stub class set on
+# the facade would be invisible; patch the lookup itself instead.
+def _register_stub_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    cls: type,
+) -> None:
+    module = sys.modules["sagent.providers.providers"]
+    original = cast("Callable[[str], type | None]", module.provider_class)
+
+    def _lookup(provider_name: str) -> type | None:
+        return cls if provider_name == name else original(provider_name)
+
+    monkeypatch.setattr(module, "provider_class", _lookup)
 
 
 def test_provider_names_contains_core_providers() -> None:
@@ -63,9 +89,15 @@ def test_infer_provider_returns_none_when_already_matches() -> None:
     assert infer_provider("claude-sonnet-4-6", current_provider="Anthropic") is None
 
 
+def test_infer_provider_uses_the_shared_model_alias_registry() -> None:
+    assert infer_provider("sol", current_provider="Google") == ("OpenAI", "env")
+    assert infer_provider("sol", current_provider="OpenAI") is None
+    assert infer_provider("sol", current_provider="OpenAISubscription") is None
+
+
 @pytest.mark.parametrize(
     ("model_id", "provider"),
-    [("opus-4.8", "Anthropic"), ("luna-6.0", "OpenAI")],
+    [("claude-opus-4-8", "Anthropic"), ("gpt-6-luna", "OpenAI")],
 )
 def test_infer_provider_uses_short_catalog_ids(model_id: str, provider: str) -> None:
     assert infer_provider(model_id, current_provider="Google") == (provider, "env")
@@ -184,8 +216,7 @@ def test_build_provider_account_kw_threaded_when_accepted(
             calls.append({"account": account})
             return cls()
 
-    providers_mod = sys.modules["sagent.providers"]
-    monkeypatch.setattr(providers_mod, "StubProv", StubProv, raising=False)
+    _register_stub_provider(monkeypatch, "StubProv", StubProv)
     out = build_provider("StubProv", "credentials", account="work")
     assert isinstance(out, StubProv)
     assert calls == [{"account": "work"}]
@@ -272,13 +303,7 @@ def test_build_provider_missing_auth_method_raises_even_with_from_key(
             del api_key
             return cls()
 
-    providers_mod = sys.modules["sagent.providers"]
-    monkeypatch.setattr(
-        providers_mod,
-        "StubProvKeyOnly",
-        StubProvKeyOnly,
-        raising=False,
-    )
+    _register_stub_provider(monkeypatch, "StubProvKeyOnly", StubProvKeyOnly)
     with pytest.raises(AttributeError, match="no ``from_literal-key-here``"):
         build_provider("StubProvKeyOnly", "literal-key-here")
 
@@ -289,8 +314,7 @@ def test_build_provider_no_match_no_from_key_raises(
     class BareProv:
         pass
 
-    providers_mod = sys.modules["sagent.providers"]
-    monkeypatch.setattr(providers_mod, "BareProv", BareProv, raising=False)
+    _register_stub_provider(monkeypatch, "BareProv", BareProv)
     with pytest.raises(AttributeError, match="no ``from_unsupported``"):
         build_provider("BareProv", "unsupported")
 
@@ -304,13 +328,7 @@ def test_key_only_provider_has_no_zero_argument_default_auth(
             del api_key
             return cls()
 
-    providers_mod = sys.modules["sagent.providers"]
-    monkeypatch.setattr(
-        providers_mod,
-        "StubProvKeyOnly",
-        StubProvKeyOnly,
-        raising=False,
-    )
+    _register_stub_provider(monkeypatch, "StubProvKeyOnly", StubProvKeyOnly)
     with pytest.raises(AttributeError, match="no default auth method"):
         providers.default_auth_for_provider("StubProvKeyOnly")
 
@@ -367,6 +385,88 @@ def test_a_catalog_backed_provider_names_a_cheaper_utility_model(
         f"{provider_name} utility {utility_row.model_id!r} is not cheaper than"
         f" its default {default_row.model_id!r}"
     )
+
+
+@pytest.mark.parametrize(
+    ("alias", "canonical"),
+    [
+        ("oai", "OpenAI"),
+        ("oaisub", "OpenAISubscription"),
+        ("ant", "Anthropic"),
+        ("antsub", "AnthropicCLI"),
+    ],
+)
+def test_provider_aliases_resolve_to_class_names(alias: str, canonical: str) -> None:
+    assert PROVIDER_ALIASES[alias] == canonical
+    assert canonical_provider(alias) == canonical
+    assert require_provider(alias) == canonical
+    assert require_provider(alias.upper()) == canonical
+    assert require_provider(f"  {alias} ") == canonical
+
+
+def test_provider_alias_targets_are_known_and_do_not_shadow_class_names() -> None:
+    lowered = {name.lower() for name in PROVIDER_NAMES}
+    for alias, target in PROVIDER_ALIASES.items():
+        assert target in PROVIDER_NAMES
+        assert alias.lower() not in lowered
+
+
+@pytest.mark.parametrize("name", PROVIDER_NAMES)
+def test_canonical_provider_keeps_class_names_and_ignores_case(name: str) -> None:
+    assert canonical_provider(name) == name
+    assert canonical_provider(name.lower()) == name
+    assert require_provider(name) == name
+
+
+def test_canonical_provider_passes_unknown_names_through_stripped() -> None:
+    assert canonical_provider(" NotAProvider ") == "NotAProvider"
+
+
+def test_require_provider_unknown_lists_names_and_aliases() -> None:
+    with pytest.raises(UnknownProviderError) as exc:
+        _ = require_provider("oaii")
+    message = str(exc.value)
+    assert "'oaii'" in message
+    for name in PROVIDER_NAMES:
+        assert name in message
+    for alias in PROVIDER_ALIASES:
+        assert alias in message
+    assert isinstance(exc.value, ValueError)
+
+
+def test_provider_class_resolves_aliases() -> None:
+    assert provider_class("oai") is OpenAI
+    assert provider_class("ANT") is Anthropic
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["SelfHostedModel", "build_provider", "PROVIDER_NAMES", "providers"],
+)
+def test_provider_class_rejects_non_provider_facade_attributes(name: str) -> None:
+    assert provider_class(name) is None
+
+
+def test_build_provider_unknown_lists_aliases() -> None:
+    with pytest.raises(AttributeError, match="oaisub"):
+        build_provider("DoesNotExist")
+
+
+def test_build_provider_accepts_alias(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-env-key")
+    assert isinstance(build_provider("oai", "env"), OpenAI)
+
+
+@pytest.mark.parametrize(
+    ("alias", "auth"),
+    [("ant", "env"), ("antsub", "credentials"), ("oaisub", "credentials")],
+)
+def test_default_auth_for_provider_accepts_aliases(alias: str, auth: str) -> None:
+    assert providers.default_auth_for_provider(alias) == auth
+
+
+def test_infer_provider_accepts_alias_for_current_provider() -> None:
+    assert infer_provider("claude-haiku-4-5", current_provider="antsub") is None
 
 
 if __name__ == "__main__":

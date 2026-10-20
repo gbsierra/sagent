@@ -1,9 +1,7 @@
 """MiniMax model catalog, expressed as ``ModelCapability`` rows.
 
-Sources (pay-as-you-go, 2026-10-03):
-  https://platform.minimax.io/docs/guides/pricing-paygo
+Sources (pay-as-you-go): limits, prices, and thinking per ``_SOURCES``; also
   https://platform.minimax.io/docs/guides/models-intro
-  https://platform.minimax.io/docs/api-reference/text-chat-openai
   https://platform.minimax.io/docs/api-reference/text-openai-api
 
 A row carries only what the MODEL can do; caching, retry, and auth mode
@@ -19,10 +17,12 @@ plan-only M3.1 preview, so no row offers an effort.
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import date
 from types import MappingProxyType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 from sagent.catalog.openai import compatible
+from sagent.catalog.provenance import Source
 from sagent.catalog.table import ModelTable
 from sagent.types.capability import (
     ContextTag,
@@ -39,6 +39,8 @@ from sagent.types.cost import (
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
+
+    from sagent.catalog.provenance import Fact
 
 
 __all__ = ["api", "models"]
@@ -64,8 +66,7 @@ def models() -> ModelTable:
     """
     always_thinks = ThinkingCapability(output=frozenset({"none", "text"}))
     m2 = ModelCapability(
-        model_id="minimax-2.7",
-        wire_model_id="MiniMax-M2.7",
+        model_id="MiniMax-M2.7",
         context=_limits(max_tokens=204_800, output_tokens=204_800),
         prices=_prices(_m2_card(request=0.3, response=1.2, cache_read=0.06)),
         thinking=always_thinks,
@@ -75,8 +76,7 @@ def models() -> ModelTable:
     legacy_fast = _prices(_m2_card(request=0.6, response=2.4, cache_read=0.03))
     rows = (
         ModelCapability(
-            model_id="minimax-3.0",
-            wire_model_id="MiniMax-M3",
+            model_id="MiniMax-M3",
             # Image input: "images can be up to 10 MB, and the request body
             # can be up to 64 MB".
             context=_limits(
@@ -91,33 +91,28 @@ def models() -> ModelTable:
         m2,
         replace(
             m2,
-            model_id="minimax-2.5",
-            wire_model_id="MiniMax-M2.5",
+            model_id="MiniMax-M2.5",
             prices=legacy,
         ),
         replace(
             m2,
-            model_id="minimax-2.1",
-            wire_model_id="MiniMax-M2.1",
+            model_id="MiniMax-M2.1",
             prices=legacy,
         ),
-        replace(m2, model_id="minimax-2.0", wire_model_id="MiniMax-M2", prices=legacy),
+        replace(m2, model_id="MiniMax-M2", prices=legacy),
         replace(
             m2,
-            model_id="minimax-highspeed-2.7",
-            wire_model_id="MiniMax-M2.7-highspeed",
+            model_id="MiniMax-M2.7-highspeed",
             prices=_prices(_m2_card(request=0.6, response=2.4, cache_read=0.06)),
         ),
         replace(
             m2,
-            model_id="minimax-highspeed-2.5",
-            wire_model_id="MiniMax-M2.5-highspeed",
+            model_id="MiniMax-M2.5-highspeed",
             prices=legacy_fast,
         ),
         replace(
             m2,
-            model_id="minimax-highspeed-2.1",
-            wire_model_id="MiniMax-M2.1-highspeed",
+            model_id="MiniMax-M2.1-highspeed",
             prices=legacy_fast,
         ),
     )
@@ -128,8 +123,40 @@ def models() -> ModelTable:
         # models-intro lists M3 first as the frontier model. With its permanent
         # 50% discount no live row is cheaper ($0.3 / $1.2 at best), so a
         # separate utility would cost as much or more.
-        roles={"default": "minimax-3.0", "utility": "minimax-3.0"},
+        roles={"default": "MiniMax-M3", "utility": "MiniMax-M3"},
+        # Sagent's own spellings before rows were keyed by vendor id; kept so
+        # saved sessions and settings load. Never extend.
+        renamed={
+            "minimax-3.0": "MiniMax-M3",
+            "minimax-2.7": "MiniMax-M2.7",
+            "minimax-2.5": "MiniMax-M2.5",
+            "minimax-2.1": "MiniMax-M2.1",
+            "minimax-2.0": "MiniMax-M2",
+            "minimax-highspeed-2.7": "MiniMax-M2.7-highspeed",
+            "minimax-highspeed-2.5": "MiniMax-M2.5-highspeed",
+            "minimax-highspeed-2.1": "MiniMax-M2.1-highspeed",
+        },
+        sources=_SOURCES,
     )
+
+
+_DOCS: Final = "https://platform.minimax.io/docs"
+
+_SOURCES: Final[Mapping[Fact, Source]] = MappingProxyType(
+    {
+        # The ``max_completion_tokens`` ceilings (524,288 for M3, 204,800 for
+        # the rest); models-intro's "Maximum Output: 128k" for M2 disagrees.
+        "limits": Source(
+            f"{_DOCS}/api-reference/text-chat-openai",
+            date(2026, 10, 18),
+        ),
+        "prices": Source(f"{_DOCS}/guides/pricing-paygo", date(2026, 10, 3)),
+        "thinking": Source(
+            f"{_DOCS}/api-reference/text-chat-openai",
+            date(2026, 10, 3),
+        ),
+    },
+)
 
 
 # The listed rates carry a "permanent 50% off"; the cards bill the discounted rate.

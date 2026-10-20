@@ -1,8 +1,6 @@
 """OpenAI model catalog, expressed as ``ModelCapability`` rows.
 
-Sources:
-  - ModelLimits: https://developers.openai.com/api/docs/models/<model>
-  - Pricing: https://developers.openai.com/api/docs/pricing
+Sources: limits, prices, and thinking per ``_SOURCES``; also
   - Images: https://developers.openai.com/api/docs/guides/images-vision
 
 :func:`models` is the API-key view. :func:`subscription_models` projects the
@@ -13,19 +11,20 @@ either view with ``&``, which can only remove.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from datetime import date
 from functools import cache
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Final, Literal
+from typing import TYPE_CHECKING, Final
 
 import math
 
+from sagent.catalog.provenance import Source
 from sagent.catalog.table import ModelTable
 from sagent.types.capability import (
     ContextTag,
     ModelCapability,
     ModelLimits,
     ThinkingCapability,
-    ThinkingEffort,
 )
 from sagent.types.cost import (
     PriceCatalog,
@@ -38,6 +37,8 @@ from sagent.types.cost import (
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
+    from sagent.catalog.provenance import Fact
+
 
 __all__ = [
     "api",
@@ -45,31 +46,101 @@ __all__ = [
     "image_tokens",
     "keeps_reasoning_across_turns",
     "models",
-    "reasoning_effort",
-    "served_tier",
     "subscription",
     "subscription_models",
     "tokenizer",
 ]
 
 
-_ROLES: Final = MappingProxyType({"default": "sol", "utility": "luna"})
-"""Role names both tables resolve, to the family each picks."""
+_ROLES: Final = MappingProxyType({"default": "gpt-6.1-sol", "utility": "gpt-6-luna"})
+"""Role names the API-key table resolves."""
+
+_ALIASES: Final = MappingProxyType(
+    {
+        "sol": "gpt-6.1-sol",
+        "luna": "gpt-6-luna",
+    },
+)
+"""Current Sagent convenience names for the API-key table."""
+
+_SOURCES: Final[Mapping[Fact, Source]] = MappingProxyType(
+    {
+        # One page per model; ``<id>.md`` is the rendering that states the
+        # input cap.
+        "limits": Source(
+            "https://developers.openai.com/api/docs/models",
+            date(2026, 10, 3),
+        ),
+        "prices": Source(
+            "https://developers.openai.com/api/docs/pricing",
+            date(2026, 10, 3),
+        ),
+        "thinking": Source(
+            "https://developers.openai.com/api/docs/models",
+            date(2026, 10, 3),
+        ),
+    },
+)
+
+# Codex's ``model/list`` (codex-cli 0.144.6, probed 2026-10-17) lists
+# ``gpt-5.6-sol`` (its default), ``gpt-5.6-terra``, and ``gpt-5.6-luna`` for a
+# ChatGPT login, and no GPT-6 id, so the API-key roles would name models the
+# subscription does not serve. Source: ``codex app-server`` JSON-RPC
+# ``model/list``; https://developers.openai.com/codex/app-server
+_SUBSCRIPTION_ROLES: Final = MappingProxyType(
+    {"default": "gpt-5.6-sol", "utility": "gpt-5.6-luna"},
+)
+"""Role names the subscription table resolves."""
+
+_SUBSCRIPTION_ALIASES: Final = MappingProxyType(
+    {
+        "sol": "gpt-5.6-sol",
+        "luna": "gpt-5.6-luna",
+    },
+)
+"""Current Sagent convenience names for the subscription table."""
+
+# Sagent's own spellings before rows were keyed by vendor id; kept so saved
+# sessions and settings load. Never extend: a new row has only its vendor id.
+_RENAMED: Final = MappingProxyType(
+    {
+        "astra-6.0": "gpt-6-astra",
+        "sol-6.1": "gpt-6.1-sol",
+        "sol-6.0": "gpt-6-sol",
+        "luna-6.0": "gpt-6-luna",
+        "sol-5.6": "gpt-5.6-sol",
+        "luna-5.6": "gpt-5.6-luna",
+        "terra-5.6": "gpt-5.6-terra",
+        "gpt-pro-5.5": "gpt-5.5-pro",
+        "gpt-pro-5.4": "gpt-5.4-pro",
+        "gpt-mini-5.4": "gpt-5.4-mini",
+        "gpt-nano-5.4": "gpt-5.4-nano",
+        "gpt-pro-5.2": "gpt-5.2-pro",
+        "o-1.0": "o1",
+        "o-mini-3.0": "o3-mini",
+        "gpt-mini-4.1": "gpt-4.1-mini",
+        "gpt-nano-4.1": "gpt-4.1-nano",
+        "gpt-omni-4.0": "gpt-4o",
+        "gpt-omni-mini-4.0": "gpt-4o-mini",
+        "gpt-turbo-4.0": "gpt-4-turbo",
+        "gpt-4.0": "gpt-4",
+    },
+)
 
 # "Input modalities: text" on each model page.
-_TEXT_ONLY: Final = frozenset({"o-mini-3.0", "gpt-4.0"})
+_TEXT_ONLY: Final = frozenset({"o3-mini", "gpt-4"})
 
 
 _ALL_TURNS: Final = frozenset(
     {
-        "astra-6.0",
-        "sol-6.1",
-        "sol-6.0",
-        "luna-6.0",
-        "sol-5.6",
+        "gpt-6-astra",
+        "gpt-6.1-sol",
+        "gpt-6-sol",
+        "gpt-6-luna",
+        "gpt-5.6-sol",
         "gpt-5.6",
-        "terra-5.6",
-        "luna-5.6",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
     },
 )
 
@@ -101,26 +172,26 @@ class _Tiles:
 # both tables; they take Astra's GPT-6 rule.
 _VISION: Final[Mapping[str, _Patches | _Tiles]] = MappingProxyType(
     {
-        "astra-6.0": _Patches(multiplier=1.2),
-        "sol-6.1": _Patches(multiplier=1.2),
-        "sol-6.0": _Patches(multiplier=1.2),
-        "luna-6.0": _Patches(multiplier=1.2),
-        "sol-5.6": _Patches(multiplier=1.2),
+        "gpt-6-astra": _Patches(multiplier=1.2),
+        "gpt-6.1-sol": _Patches(multiplier=1.2),
+        "gpt-6-sol": _Patches(multiplier=1.2),
+        "gpt-6-luna": _Patches(multiplier=1.2),
+        "gpt-5.6-sol": _Patches(multiplier=1.2),
         "gpt-5.6": _Patches(multiplier=1.2),
-        "terra-5.6": _Patches(multiplier=1.2),
-        "luna-5.6": _Patches(multiplier=1.2),
+        "gpt-5.6-terra": _Patches(multiplier=1.2),
+        "gpt-5.6-luna": _Patches(multiplier=1.2),
         "gpt-5.5": _Patches(multiplier=1.2, budget=10_000),
         "gpt-5.4": _Patches(multiplier=1.2, budget=2_500),
-        "gpt-mini-5.4": _Patches(multiplier=1.2, budget=2_500),
-        "gpt-nano-5.4": _Patches(multiplier=1.2, budget=2_500),
+        "gpt-5.4-mini": _Patches(multiplier=1.2, budget=2_500),
+        "gpt-5.4-nano": _Patches(multiplier=1.2, budget=2_500),
         "gpt-5.2": _Patches(multiplier=1.2, budget=6_144),
-        "gpt-mini-4.1": _Patches(multiplier=1.62, budget=6_144),
-        "gpt-nano-4.1": _Patches(multiplier=2.46, budget=6_144),
+        "gpt-4.1-mini": _Patches(multiplier=1.62, budget=6_144),
+        "gpt-4.1-nano": _Patches(multiplier=2.46, budget=6_144),
         "gpt-5.1": _Tiles(base=70, tile=140),
         "gpt-4.1": _Tiles(base=85, tile=170),
-        "gpt-omni-4.0": _Tiles(base=85, tile=170),
-        "gpt-omni-mini-4.0": _Tiles(base=2833, tile=5667),
-        "o-1.0": _Tiles(base=75, tile=150),
+        "gpt-4o": _Tiles(base=85, tile=170),
+        "gpt-4o-mini": _Tiles(base=2833, tile=5667),
+        "o1": _Tiles(base=75, tile=150),
     },
 )
 
@@ -175,8 +246,7 @@ def models() -> ModelTable:
     # Every GPT-6 rule here was measured on this id alone, so a later GPT-6
     # whose contract differs does not inherit a limit nothing verified for it.
     default = ModelCapability(
-        model_id="astra-6.0",
-        wire_model_id="gpt-6-astra",
+        model_id="gpt-6-astra",
         knowledge_cutoff="April 30, 2026",
         approx_chars_per_token=3.71,
         context=_limits(image_edge_px=65_535),
@@ -233,8 +303,7 @@ def models() -> ModelTable:
         default,
         replace(
             default,
-            model_id="sol-6.1",
-            wire_model_id="gpt-6.1-sol",
+            model_id="gpt-6.1-sol",
             # "The `none` and `minimal` reasoning efforts are not supported":
             # Astra's effort set, inherited along with its cutoff.
             prices=_prices(
@@ -265,8 +334,7 @@ def models() -> ModelTable:
         ),
         replace(
             default,
-            model_id="sol-6.0",
-            wire_model_id="gpt-6-sol",
+            model_id="gpt-6-sol",
             knowledge_cutoff="April 20, 2026",
             # Absent from the images-vision sizing table: no resize edge published.
             context=_limits(),
@@ -297,8 +365,7 @@ def models() -> ModelTable:
         ),
         replace(
             default,
-            model_id="luna-6.0",
-            wire_model_id="gpt-6-luna",
+            model_id="gpt-6-luna",
             knowledge_cutoff="May 18, 2026",
             # Absent from the images-vision sizing table: no resize edge published.
             context=_limits(),
@@ -329,8 +396,7 @@ def models() -> ModelTable:
         ),
         replace(
             default,
-            model_id="sol-5.6",
-            wire_model_id="gpt-5.6-sol",
+            model_id="gpt-5.6-sol",
             knowledge_cutoff="February 16, 2026",
             prices=_prices(
                 {
@@ -363,7 +429,6 @@ def models() -> ModelTable:
         replace(
             default,
             model_id="gpt-5.6",
-            wire_model_id="gpt-5.6",
             knowledge_cutoff="February 16, 2026",
             prices=_prices(
                 {
@@ -392,8 +457,7 @@ def models() -> ModelTable:
         ),
         replace(
             default,
-            model_id="luna-5.6",
-            wire_model_id="gpt-5.6-luna",
+            model_id="gpt-5.6-luna",
             knowledge_cutoff="February 16, 2026",
             prices=_prices(
                 {
@@ -422,8 +486,7 @@ def models() -> ModelTable:
         ),
         replace(
             default,
-            model_id="terra-5.6",
-            wire_model_id="gpt-5.6-terra",
+            model_id="gpt-5.6-terra",
             knowledge_cutoff="February 16, 2026",
             prices=_prices(
                 {
@@ -453,7 +516,6 @@ def models() -> ModelTable:
         replace(
             default,
             model_id="gpt-5.5",
-            wire_model_id="gpt-5.5",
             knowledge_cutoff="December 1, 2025",
             context=_limits(max_tokens=1_050_000, image_edge_px=6000),
             prices=_prices(
@@ -484,8 +546,7 @@ def models() -> ModelTable:
         ),
         replace(
             default,
-            model_id="gpt-pro-5.5",
-            wire_model_id="gpt-5.5-pro",
+            model_id="gpt-5.5-pro",
             knowledge_cutoff="December 1, 2025",
             context=_limits(max_tokens=1_050_000),
             prices=_prices(
@@ -511,7 +572,6 @@ def models() -> ModelTable:
         replace(
             default,
             model_id="gpt-5.4",
-            wire_model_id="gpt-5.4",
             knowledge_cutoff="August 31, 2025",
             # "auto uses the same sizing behavior as high": 2048px.
             context=_limits(max_tokens=1_050_000, image_edge_px=2048),
@@ -553,8 +613,7 @@ def models() -> ModelTable:
         ),
         replace(
             default,
-            model_id="gpt-pro-5.4",
-            wire_model_id="gpt-5.4-pro",
+            model_id="gpt-5.4-pro",
             knowledge_cutoff="August 31, 2025",
             context=_limits(max_tokens=1_050_000),
             prices=_prices(
@@ -578,8 +637,7 @@ def models() -> ModelTable:
         ),
         replace(
             default,
-            model_id="gpt-mini-5.4",
-            wire_model_id="gpt-5.4-mini",
+            model_id="gpt-5.4-mini",
             knowledge_cutoff="August 31, 2025",
             # "400,000 context window - Maximum input tokens: 272,000".
             context=_limits(max_tokens=272_000, windowed=False, image_edge_px=2048),
@@ -609,8 +667,7 @@ def models() -> ModelTable:
         ),
         replace(
             default,
-            model_id="gpt-nano-5.4",
-            wire_model_id="gpt-5.4-nano",
+            model_id="gpt-5.4-nano",
             knowledge_cutoff="August 31, 2025",
             context=_limits(max_tokens=272_000, windowed=False, image_edge_px=2048),
             prices=_prices(
@@ -639,7 +696,6 @@ def models() -> ModelTable:
         replace(
             default,
             model_id="gpt-5.2",
-            wire_model_id="gpt-5.2",
             knowledge_cutoff="August 31, 2025",
             context=_limits(max_tokens=400_000, windowed=False, image_edge_px=2048),
             prices=_prices(
@@ -668,8 +724,7 @@ def models() -> ModelTable:
         ),
         replace(
             default,
-            model_id="gpt-pro-5.2",
-            wire_model_id="gpt-5.2-pro",
+            model_id="gpt-5.2-pro",
             knowledge_cutoff="August 31, 2025",
             context=_limits(max_tokens=400_000, windowed=False),
             prices=_prices(
@@ -687,7 +742,6 @@ def models() -> ModelTable:
         replace(
             default,
             model_id="gpt-5.1",
-            wire_model_id="gpt-5.1",
             knowledge_cutoff="September 30, 2024",
             context=_limits(max_tokens=400_000, windowed=False, image_edge_px=2048),
             prices=_prices(
@@ -722,8 +776,7 @@ def models() -> ModelTable:
         # 23, 2026 (https://developers.openai.com/api/docs/deprecations).
         replace(
             default,
-            model_id="o-1.0",
-            wire_model_id="o1",
+            model_id="o1",
             knowledge_cutoff="October 1, 2023",
             context=_limits(
                 max_tokens=200_000,
@@ -748,8 +801,7 @@ def models() -> ModelTable:
         ),
         replace(
             default,
-            model_id="o-mini-3.0",
-            wire_model_id="o3-mini",
+            model_id="o3-mini",
             knowledge_cutoff="October 1, 2023",
             # "Input modalities: text" -- no image input, so no image limits.
             context=_limits(
@@ -777,7 +829,6 @@ def models() -> ModelTable:
         replace(
             default,
             model_id="gpt-4.1",
-            wire_model_id="gpt-4.1",
             knowledge_cutoff="June 1, 2024",
             context=_limits(
                 max_tokens=1_047_576,
@@ -805,8 +856,7 @@ def models() -> ModelTable:
         ),
         replace(
             default,
-            model_id="gpt-mini-4.1",
-            wire_model_id="gpt-4.1-mini",
+            model_id="gpt-4.1-mini",
             knowledge_cutoff="June 1, 2024",
             context=_limits(
                 max_tokens=1_047_576,
@@ -834,8 +884,7 @@ def models() -> ModelTable:
         ),
         replace(
             default,
-            model_id="gpt-nano-4.1",
-            wire_model_id="gpt-4.1-nano",
+            model_id="gpt-4.1-nano",
             knowledge_cutoff="June 1, 2024",
             context=_limits(
                 max_tokens=1_047_576,
@@ -863,8 +912,7 @@ def models() -> ModelTable:
         ),
         replace(
             default,
-            model_id="gpt-omni-4.0",
-            wire_model_id="gpt-4o",
+            model_id="gpt-4o",
             knowledge_cutoff="October 1, 2023",
             context=_limits(
                 max_tokens=128_000,
@@ -892,8 +940,7 @@ def models() -> ModelTable:
         ),
         replace(
             default,
-            model_id="gpt-omni-mini-4.0",
-            wire_model_id="gpt-4o-mini",
+            model_id="gpt-4o-mini",
             knowledge_cutoff="October 1, 2023",
             context=_limits(
                 max_tokens=128_000,
@@ -921,8 +968,7 @@ def models() -> ModelTable:
         ),
         replace(
             default,
-            model_id="gpt-turbo-4.0",
-            wire_model_id="gpt-4-turbo",
+            model_id="gpt-4-turbo",
             knowledge_cutoff="December 1, 2023",
             context=_limits(
                 max_tokens=128_000,
@@ -944,8 +990,7 @@ def models() -> ModelTable:
         ),
         replace(
             default,
-            model_id="gpt-4.0",
-            wire_model_id="gpt-4",
+            model_id="gpt-4",
             knowledge_cutoff="December 1, 2023",
             # Text-only, like o3-mini.
             context=_limits(
@@ -966,42 +1011,49 @@ def models() -> ModelTable:
             thinking=ThinkingCapability(),
         ),
     )
+    # Published Responses defaults. Keeping this exact-id table beside the
+    # rows makes a newly added reasoning model fail the catalog invariant
+    # until its model page has been checked rather than inheriting by prefix.
+    default_efforts = {
+        "gpt-6-astra": "medium",
+        "gpt-6.1-sol": "medium",
+        "gpt-6-sol": "medium",
+        "gpt-6-luna": "medium",
+        "gpt-5.6-sol": "medium",
+        "gpt-5.6": "medium",
+        "gpt-5.6-luna": "medium",
+        "gpt-5.6-terra": "medium",
+        "gpt-5.5": "medium",
+        "gpt-5.5-pro": "medium",
+        "gpt-5.4": "none",
+        "gpt-5.4-pro": "medium",
+        "gpt-5.4-mini": "none",
+        "gpt-5.4-nano": "none",
+        "gpt-5.2": "none",
+        "gpt-5.2-pro": "medium",
+        "gpt-5.1": "none",
+        "o1": "medium",
+        "o3-mini": "medium",
+    }
+    rows = tuple(
+        replace(row, default_effort=default_efforts.get(row.model_id)) for row in rows
+    )
     # A tier is offered exactly when it is priced.
     rows = tuple(replace(row, service_tier=row.prices.service_tiers) for row in rows)
-    return ModelTable(rows=rows, roles=_ROLES)
-
-
-def reasoning_effort(
-    effort: ThinkingEffort,
-) -> Literal["low", "medium", "high", "xhigh", "max"]:
-    """Return the Responses ``reasoning.effort`` a selected level sends.
-
-    Every level a row offers is spelled as the API spells it; the row has
-    already rejected any level the model does not take.
-
-    Args:
-      effort: Selected catalog effort.
-
-    Returns:
-      wire: Responses reasoning effort.
-
-    Raises:
-      ValueError: ``effort`` is ``none``, which omits ``reasoning`` instead,
-        or ``min``, which no model page lists.
-
-    """
-    match effort:
-        case "none" | "min":
-            raise ValueError(f"effort {effort!r} is not sent as reasoning.effort")
-        case "low" | "medium" | "high" | "xhigh" | "max":
-            return effort
+    return ModelTable(
+        rows=rows,
+        roles=_ROLES,
+        aliases=_ALIASES,
+        renamed=_RENAMED,
+        sources=_SOURCES,
+    )
 
 
 def image_tokens(model_id: str, width: int, height: int) -> int:
     """Estimate the input tokens one image bills under ``detail: auto``.
 
     Args:
-      model_id: Catalog name or wire id; an id no row carries is estimated too.
+      model_id: Vendor id; an id no row carries is estimated too.
       width: Image width after the transport's own resize, in pixels.
       height: Image height after the transport's own resize, in pixels.
 
@@ -1014,11 +1066,9 @@ def image_tokens(model_id: str, width: int, height: int) -> int:
       https://developers.openai.com/api/docs/guides/images-vision
 
     """
-    row = models().exact(model_id)
-    name = row.model_id if row is not None else ""
-    if name in _TEXT_ONLY:
+    if model_id in _TEXT_ONLY:
         return 0
-    match _VISION.get(name, _Tiles(base=85, tile=170)):
+    match _VISION.get(model_id, _Tiles(base=85, tile=170)):
         case _Patches(multiplier=multiplier, budget=budget):
             width, height = _fit_patch_budget(width, height, budget)
             return math.ceil(_patch_count(width, height) * multiplier)
@@ -1031,34 +1081,30 @@ def tokenizer(model_id: str) -> str | None:
     """Return the ``tiktoken`` encoding a model's text tokenizes with.
 
     Args:
-      model_id: Catalog name or wire id.
+      model_id: Vendor id.
 
     Returns:
       encoding: ``o200k_base`` for GPT-4o and later, ``cl100k_base`` for the
         GPT-4 generation, ``None`` for an id no row carries.
 
     """
-    row = models().exact(model_id)
-    if row is None:
+    if models().exact(model_id) is None:
         return None
-    return (
-        "cl100k_base" if row.model_id in {"gpt-4.0", "gpt-turbo-4.0"} else "o200k_base"
-    )
+    return "cl100k_base" if model_id in {"gpt-4", "gpt-4-turbo"} else "o200k_base"
 
 
 def keeps_reasoning_across_turns(model_id: str) -> bool:
     """Whether a request asks the model to reason over every prior turn.
 
     Args:
-      model_id: Catalog name or wire id.
+      model_id: Vendor id.
 
     Returns:
       all_turns: True for GPT-5.6 and GPT-6, which take
         ``reasoning.context = "all_turns"``.
 
     """
-    row = models().exact(model_id)
-    return row is not None and row.model_id in _ALL_TURNS
+    return model_id in _ALL_TURNS
 
 
 def api() -> ModelCapability:
@@ -1134,33 +1180,14 @@ def subscription_models() -> ModelTable:
                 ),
             ),
         )
-    return ModelTable(rows=tuple(rows), roles=_ROLES)
-
-
-def served_tier(reported: str | None) -> ServiceTier | None:
-    """Map the ``service_tier`` a response reports to the tier it bills at.
-
-    Args:
-      reported: The response's ``service_tier``; absent means standard.
-
-    Returns:
-      tier: Catalog tier whose card priced the request; ``None`` for a tier
-        this catalog does not know. Not an error: the response is already paid
-        for, so the caller decides which rate to fall back to.
-
-    """
-    match reported:
-        # Scale Tier is prepaid capacity, metered at the standard card.
-        case None | "auto" | "default" | "scale":
-            return "auto"
-        case "flex":
-            return "flex"
-        case "priority" | "fast":
-            return "priority"
-        case "ultrafast":
-            return "ultrafast"
-        case _:
-            return None
+    # No page states the clamp, so the limits keep no source.
+    return ModelTable(
+        rows=tuple(rows),
+        roles=_SUBSCRIPTION_ROLES,
+        aliases=_SUBSCRIPTION_ALIASES,
+        renamed=_RENAMED,
+        sources={k: v for k, v in _SOURCES.items() if k != "limits"},
+    )
 
 
 def _card(

@@ -44,13 +44,14 @@ from sagent.bin.slack import (
     _new_session_dir,
     _render_event,
     _resolve_tokens,
+    _run,
     _save_manifest,
     _strip_mention,
     load_persona,
     log_tap,
     parse_slack_args,
 )
-from sagent.testing import FakeAgent
+from sagent.testing import FakeAgent, _NullRichModel
 from sagent.tools.slack import Slack
 from sagent.types.model import Model, ModelRecipe
 from sagent.types.runtime import (
@@ -69,6 +70,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
     from sagent.lib.codec import MutablePlainTree
+    from sagent.types.capability import ModelSettings, ThinkingEffort
 
 
 @pytest.fixture(autouse=True)
@@ -1426,6 +1428,63 @@ class TestResolveTokens:
         ns = argparse.Namespace(app_token="", bot_token="")
         with pytest.raises(SystemExit):
             _ = _resolve_tokens(ns)
+
+
+class _ThinkingModel(_NullRichModel):
+    valid_efforts: tuple[ThinkingEffort, ...] = ("low", "high")
+
+
+class _AdapterBuiltError(Exception):
+    """Stops ``_run`` once the adapter would connect to Slack."""
+
+
+class TestRunEffort:
+    """``_run`` applies ``--effort`` only when the flag was given."""
+
+    async def _settings_reaching_adapter(
+        self,
+        tmp_path: Path,
+        argv: list[str],
+    ) -> ModelSettings:
+        model = _ThinkingModel()
+        model.settings.thinking_effort = "high"
+        provider = MagicMock()
+        provider.model.return_value = model
+        built: list[Model] = []
+
+        def _adapter(**kwargs: object) -> None:
+            built.append(cast(Model, kwargs["model"]))
+            raise _AdapterBuiltError
+
+        args, _ = parse_slack_args(
+            argparse.ArgumentParser(),
+            [
+                "--app-token",
+                "A",
+                "--bot-token",
+                "B",
+                "--session-dir",
+                str(tmp_path),
+                *argv,
+            ],
+        )
+        with (
+            patch("sagent.bin.slack.build_provider", return_value=provider),
+            patch("sagent.bin.slack.SlackAdapter", side_effect=_adapter),
+            pytest.raises(_AdapterBuiltError),
+        ):
+            await _run(args)
+        return built[0].settings
+
+    @pytest.mark.anyio
+    async def test_omitted_effort_keeps_the_model_default(self, tmp_path: Path) -> None:
+        settings = await self._settings_reaching_adapter(tmp_path, [])
+        assert settings.thinking_effort == "high"
+
+    @pytest.mark.anyio
+    async def test_given_effort_lands_on_the_shared_model(self, tmp_path: Path) -> None:
+        settings = await self._settings_reaching_adapter(tmp_path, ["--effort", "low"])
+        assert settings.thinking_effort == "low"
 
 
 class TestStopAgent:

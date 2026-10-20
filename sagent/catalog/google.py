@@ -1,9 +1,6 @@
 """Google (Gemini) model catalog, expressed as ``ModelCapability`` rows.
 
-Sources:
-  - Limits: https://ai.google.dev/gemini-api/docs/models
-  - Pricing: https://ai.google.dev/gemini-api/docs/pricing
-  - Thinking: https://ai.google.dev/gemini-api/docs/generate-content/thinking
+Sources: limits, prices, and thinking per ``_SOURCES``.
 
 :func:`models` is the API-key view. Other transports narrow it with ``&``
 (see :func:`cli`), which can only remove.
@@ -14,15 +11,15 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import date
 from types import MappingProxyType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
+from sagent.catalog.provenance import Source
 from sagent.catalog.table import ModelTable
 from sagent.types.capability import (
     ContextTag,
     ModelCapability,
     ModelLimits,
     ThinkingCapability,
-    ThinkingEffort,
 )
 from sagent.types.cost import (
     PriceCatalog,
@@ -34,8 +31,7 @@ from sagent.types.cost import (
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-    from sagent.lib.codec import MutablePlainTree
-    from sagent.types.capability import ModelSettings
+    from sagent.catalog.provenance import Fact
 
 
 __all__ = [
@@ -43,77 +39,7 @@ __all__ = [
     "cli",
     "models",
     "subscription",
-    "thinking_budget",
-    "thinking_config",
 ]
-
-
-def thinking_budget(effort: ThinkingEffort) -> str:
-    """Return the ``thinkingConfig.thinkingBudget`` an effort sends.
-
-    Args:
-      effort: Selected effort level.
-
-    Returns:
-      budget: Wire value, as the string the request body carries.
-
-    Raises:
-      ValueError: ``effort`` is ``none``; a disabled request omits
-          ``thinkingConfig`` rather than sending a budget of zero.
-
-    """
-    match effort:
-        case "none":
-            raise ValueError(f"effort {effort!r} sends no budget; omit thinkingConfig")
-        case "min":
-            return "1024"
-        case "low":
-            return "4096"
-        case "medium":
-            return "8192"
-        case "high":
-            return "16384"
-        case "xhigh":
-            return "20480"
-        case "max":
-            return "24576"
-
-
-def thinking_config(
-    capability: ModelCapability,
-    settings: ModelSettings,
-) -> dict[str, MutablePlainTree] | None:
-    """Return the ``generationConfig.thinkingConfig`` a selection sends.
-
-    Budget ``none`` omits the config and effort ``none`` omits the level or
-    cap, so the model's own default applies in both cases. Gemini 3 rows take
-    a ``thinkingLevel`` under either budget mode, its levels being dynamic
-    already; 2.5 rows take a ``thinkingBudget`` token cap, ``-1`` under
-    ``auto``.
-
-    Args:
-      capability: The row the request is built against.
-      settings: The selection in effect.
-
-    Returns:
-      config: The wire object, or ``None`` when the request sends none.
-
-    """
-    if settings.thinking_budget == "none":
-        return None
-    config: dict[str, MutablePlainTree] = {
-        "includeThoughts": settings.thinking_output == "text",
-    }
-    effort = settings.thinking_effort
-    if capability.effort_as_level:
-        # Gemini 3 accepts ``thinkingBudget`` only for backwards compatibility.
-        if effort != "none":
-            config["thinkingLevel"] = _thinking_level(effort)
-    elif settings.thinking_budget == "auto":
-        config["thinkingBudget"] = -1
-    elif effort != "none":
-        config["thinkingBudget"] = int(thinking_budget(effort))
-    return config
 
 
 # Gemini surfaces readable thought parts and offers no server-side redaction.
@@ -127,23 +53,22 @@ def models() -> ModelTable:
       models: Capability per base model id.
 
     """
-    # Every row keeps effort ``none``, meaning "send no level": the model's
-    # default then applies, even on rows that cannot disable thinking.
+    # Every row gets ``default`` from ``ThinkingCapability``: it means "send
+    # no level", so the model's provider-owned default applies.
     levels = ThinkingCapability(
-        effort=frozenset({"none", "min", "low", "medium", "high"}),
+        effort=frozenset({"min", "low", "medium", "high"}),
         budget=frozenset({"none", "auto", "fixed"}),
         output=frozenset({"none", "text"}),
     )
     # "minimal is not supported and returns an error" on these.
-    no_minimal = replace(levels, effort=frozenset({"none", "low", "medium", "high"}))
+    no_minimal = replace(levels, effort=frozenset({"low", "medium", "high"}))
     budgets = replace(
         levels,
-        effort=frozenset({"none", "min", "low", "medium", "high", "xhigh", "max"}),
+        effort=frozenset({"min", "low", "medium", "high", "xhigh", "max"}),
     )
     # The reference row: every other model states only how it differs from it.
     pro = ModelCapability(
-        model_id="gemini-pro-3.1",
-        wire_model_id="gemini-3.1-pro-preview",
+        model_id="gemini-3.1-pro-preview",
         knowledge_cutoff="January 2025",
         context=_limits(),
         prices=_prices(
@@ -168,46 +93,40 @@ def models() -> ModelTable:
         pro,
         replace(
             legacy,
-            model_id="gemini-pro-2.5",
-            wire_model_id="gemini-2.5-pro",
+            model_id="gemini-2.5-pro",
             prices=_prices(
                 _card(request=1.25, response=10.0, cache_read=0.125),
                 over_200k=_card(request=2.5, response=15.0, cache_read=0.25),
             ),
         ),
-        replace(flash, model_id="gemini-flash-3.8", wire_model_id="gemini-3.8-flash"),
-        replace(flash, model_id="gemini-flash-3.7", wire_model_id="gemini-3.7-flash"),
+        replace(flash, model_id="gemini-3.8-flash"),
+        replace(flash, model_id="gemini-3.7-flash"),
         replace(
             flash,
-            model_id="gemini-flash-3.6",
-            wire_model_id="gemini-3.6-flash",
+            model_id="gemini-3.6-flash",
             thinking=levels,
         ),
         replace(
             flash,
-            model_id="gemini-flash-3.5",
-            wire_model_id="gemini-3.5-flash",
+            model_id="gemini-3.5-flash",
             prices=_prices(_card(request=1.5, response=9.0, cache_read=0.15)),
             thinking=levels,
         ),
-        # Legacy (/pricing): replaced by gemini-flash-3.6; no shutdown date yet.
+        # Legacy (/pricing): replaced by gemini-3.6-flash; no shutdown date yet.
         replace(
             pro,
-            model_id="gemini-flash-3.0",
-            wire_model_id="gemini-3-flash-preview",
+            model_id="gemini-3-flash-preview",
             prices=_prices(_card(request=0.5, response=3.0, cache_read=0.05)),
             thinking=levels,
         ),
         replace(
             legacy,
-            model_id="gemini-flash-2.5",
-            wire_model_id="gemini-2.5-flash",
+            model_id="gemini-2.5-flash",
             prices=_prices(_card(request=0.3, response=2.5, cache_read=0.03)),
         ),
         replace(
             pro,
-            model_id="gemini-flash-lite-3.5",
-            wire_model_id="gemini-3.5-flash-lite",
+            model_id="gemini-3.5-flash-lite",
             knowledge_cutoff=None,
             prices=_prices(_card(request=0.3, response=2.5, cache_read=0.03)),
             thinking=levels,
@@ -215,25 +134,67 @@ def models() -> ModelTable:
         # Shuts down 2027-05-07. Audio input bills $0.50, not the text rate.
         replace(
             pro,
-            model_id="gemini-flash-lite-3.1",
-            wire_model_id="gemini-3.1-flash-lite",
+            model_id="gemini-3.1-flash-lite",
             prices=_prices(_card(request=0.25, response=1.5, cache_read=0.025)),
             thinking=levels,
         ),
         replace(
             legacy,
-            model_id="gemini-flash-lite-2.5",
-            wire_model_id="gemini-2.5-flash-lite",
+            model_id="gemini-2.5-flash-lite",
             prices=_prices(_card(request=0.1, response=0.4, cache_read=0.01)),
         ),
+    )
+    # Gemini publishes the effective level used when thinkingLevel is absent.
+    # The 2.5 Pro/Flash rows publish only dynamic "On", not a named level, so
+    # their effective label intentionally remains unknown; Flash-Lite is Off.
+    # https://ai.google.dev/gemini-api/docs/thinking
+    default_efforts = {
+        "gemini-3.1-pro-preview": "high",
+        "gemini-3.8-flash": "medium",
+        "gemini-3.7-flash": "medium",
+        "gemini-3.6-flash": "medium",
+        "gemini-3.5-flash": "medium",
+        "gemini-3-flash-preview": "high",
+        "gemini-3.5-flash-lite": "min",
+        "gemini-3.1-flash-lite": "min",
+    }
+    rows = tuple(
+        replace(row, default_effort=default_efforts.get(row.model_id)) for row in rows
     )
     # A tier is offered exactly when it is priced.
     rows = tuple(replace(row, service_tier=row.prices.service_tiers) for row in rows)
     # /models: "For any new projects, use ... 3.5 Flash-Lite or 3.8 Flash".
     return ModelTable(
         rows=rows,
-        roles={"default": "gemini-pro", "utility": "gemini-flash-lite"},
+        roles={"default": "gemini-3.1-pro-preview", "utility": "gemini-3.5-flash-lite"},
+        # Sagent's own spellings before rows were keyed by vendor id; kept so
+        # saved sessions and settings load. Never extend.
+        renamed={
+            "gemini-pro-3.1": "gemini-3.1-pro-preview",
+            "gemini-pro-2.5": "gemini-2.5-pro",
+            "gemini-flash-3.8": "gemini-3.8-flash",
+            "gemini-flash-3.7": "gemini-3.7-flash",
+            "gemini-flash-3.6": "gemini-3.6-flash",
+            "gemini-flash-3.5": "gemini-3.5-flash",
+            "gemini-flash-3.0": "gemini-3-flash-preview",
+            "gemini-flash-2.5": "gemini-2.5-flash",
+            "gemini-flash-lite-3.5": "gemini-3.5-flash-lite",
+            "gemini-flash-lite-3.1": "gemini-3.1-flash-lite",
+            "gemini-flash-lite-2.5": "gemini-2.5-flash-lite",
+        },
+        sources=_SOURCES,
     )
+
+
+_SOURCES: Final[Mapping[Fact, Source]] = MappingProxyType(
+    {
+        "limits": Source("https://ai.google.dev/gemini-api/docs/models"),
+        "prices": Source("https://ai.google.dev/gemini-api/docs/pricing"),
+        "thinking": Source(
+            "https://ai.google.dev/gemini-api/docs/generate-content/thinking",
+        ),
+    },
+)
 
 
 def api() -> ModelCapability:
@@ -243,9 +204,9 @@ def api() -> ModelCapability:
 
     One model, three ways in::
 
-        models()["gemini-pro-3.1"] & api()          # REST, key auth
-        models()["gemini-pro-3.1"] & subscription() # same wire, OAuth
-        models()["gemini-pro-3.1"] & cli()          # ACP: no effort knob
+        models()["gemini-3.1-pro-preview"] & api()          # REST, key auth
+        models()["gemini-3.1-pro-preview"] & subscription() # same wire, OAuth
+        models()["gemini-3.1-pro-preview"] & cli()          # ACP: no effort knob
 
     Returns:
       capability: The API transport's restrictions.
@@ -267,9 +228,9 @@ def cli() -> ModelCapability:
 
     One model, three ways in::
 
-        models()["gemini-pro-3.1"] & api()          # REST, key auth
-        models()["gemini-pro-3.1"] & subscription() # same wire, OAuth
-        models()["gemini-pro-3.1"] & cli()          # ACP: no effort knob
+        models()["gemini-3.1-pro-preview"] & api()          # REST, key auth
+        models()["gemini-3.1-pro-preview"] & subscription() # same wire, OAuth
+        models()["gemini-3.1-pro-preview"] & cli()          # ACP: no effort knob
 
     Returns:
       capability: The CLI transport's restrictions.
@@ -291,9 +252,9 @@ def subscription() -> ModelCapability:
 
     One model, three ways in::
 
-        models()["gemini-pro-3.1"] & api()          # REST, key auth
-        models()["gemini-pro-3.1"] & subscription() # same wire, OAuth
-        models()["gemini-pro-3.1"] & cli()          # ACP: no effort knob
+        models()["gemini-3.1-pro-preview"] & api()          # REST, key auth
+        models()["gemini-3.1-pro-preview"] & subscription() # same wire, OAuth
+        models()["gemini-3.1-pro-preview"] & cli()          # ACP: no effort knob
 
     Returns:
       capability: The subscription transport's restrictions.
@@ -307,17 +268,6 @@ def subscription() -> ModelCapability:
         ),
         account_auth=True,
     )
-
-
-def _thinking_level(effort: ThinkingEffort) -> str:
-    """Return the Gemini 3 ``thinkingLevel`` an effort sends."""
-    match effort:
-        case "min":
-            return "minimal"
-        case "low" | "medium" | "high":
-            return effort
-        case "none" | "xhigh" | "max":
-            raise ValueError(f"effort {effort!r} has no Gemini thinkingLevel")
 
 
 def _card(*, request: float, response: float, cache_read: float) -> TokenPrice:

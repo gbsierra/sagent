@@ -19,28 +19,28 @@ Usage::
     ./cli.py --provider AnthropicCLI
 
     # OpenAI
-    ./cli.py --provider OpenAI --model sol-6
+    ./cli.py --provider OpenAI --model gpt-6.1-sol
 
     # ChatGPT subscription (reuses `codex login`)
-    ./cli.py --provider OpenAISubscription --model sol-6
+    ./cli.py --provider OpenAISubscription --model gpt-5.6-sol
 
     # Google
-    ./cli.py --provider Google --auth env --model gemini-pro-3.1
+    ./cli.py --provider Google --auth env --model gemini-3.1-pro-preview
 
     # Moonshot / DashScope / MiniMax (OpenAI chat-completions compatible)
-    ./cli.py --provider Moonshot --model kimi-2.6
-    ./cli.py --provider DashScope --model qwen-plus-3.7
-    ./cli.py --provider MiniMax --model minimax-2.7
+    ./cli.py --provider Moonshot --model kimi-k2.6
+    ./cli.py --provider DashScope --model qwen3.7-plus
+    ./cli.py --provider MiniMax --model MiniMax-M2.7
 
     # Models default to their largest window; append +200k for the smaller one.
-    ./cli.py --model sonnet-4.6+200k
+    ./cli.py --model claude-sonnet-4-6+200k
     ./cli.py --session ~/.sessions/my
     ./cli.py --resume       # pick from past sessions for this cwd
     ./cli.py --continue     # resume the most recent for this cwd
 
     # Advisor strategy: Sonnet as executor, Opus as advisor.
     # See https://claude.com/blog/the-advisor-strategy
-    ./cli.py --model sonnet-4.6 --advisor opus-4.7
+    ./cli.py --model claude-sonnet-4-6 --advisor claude-opus-4-7
 '''
 # fmt: on
 
@@ -85,7 +85,10 @@ from sagent.providers import (
     default_auth_for_provider,
 )
 from sagent.providers.providers import (
+    PROVIDER_ALIASES,
+    UnknownProviderError,
     build_provider_with_account_fallback,
+    require_provider,
 )
 from sagent.repl.render import error_text
 from sagent.repl.run_repl import run_repl
@@ -251,8 +254,10 @@ def parse_agent_args(
         "--provider",
         default=None,
         help=(
-            "Provider class name from ``sagent.providers``. Default: the"
-            " first entry of ``--allow-providers``"
+            "Provider class name from ``sagent.providers`` (case-insensitive;"
+            " aliases: "
+            + ", ".join(f"{a}={t}" for a, t in PROVIDER_ALIASES.items())
+            + "). Default: the first entry of ``--allow-providers``"
             f" (``{_DEFAULT_PROVIDER}`` unless narrowed)."
         ),
     )
@@ -281,8 +286,9 @@ def parse_agent_args(
         ),
         metavar="LIST",
         help=(
-            "Comma-separated provider names this agent and its spawned"
-            " children may use. Reads ``SAGENT_ALLOW_PROVIDERS`` env var"
+            "Comma-separated provider names (aliases accepted) this agent"
+            " and its spawned children may use. Reads"
+            " ``SAGENT_ALLOW_PROVIDERS`` env var"
             " as fallback; default if neither is set is every provider"
             " in ``sagent.providers``. Default: %(default)s."
         ),
@@ -299,10 +305,10 @@ def parse_agent_args(
         "--model",
         default=None,
         help=(
-            "Model ID, or a symbolic tier resolved per provider: 'default'"
-            " (the provider's default model) or 'utility' (its cheapest/fastest"
-            " model for summarizers and other internal tasks). Append +1m / +200k"
-            " to set window."
+            "Exact model ID, catalog alias (for example 'sol'), or symbolic"
+            " role resolved per provider: 'default' (the provider's default"
+            " model) or 'utility' (its cheapest/fastest model for summarizers"
+            " and other internal tasks). Append +1m / +200k to set window."
         ),
     )
     parser.add_argument(
@@ -352,7 +358,7 @@ def parse_agent_args(
         default=None,
         help=(
             "Provider-specific reasoning effort"
-            " (none|min|low|medium|high|xhigh|max)."
+            " (default|none|min|low|medium|high|xhigh|max)."
             " Unset = provider default; unsupported values raise."
         ),
     )
@@ -417,6 +423,11 @@ def parse_agent_args(
     args.auth_explicit = args.auth is not None
     args.account_explicit = args.account is not None
     args.model_explicit = args.model is not None
+    if args.provider is not None:
+        try:
+            args.provider = require_provider(args.provider)
+        except UnknownProviderError as exc:
+            parser.error(str(exc))
     if args.provider is None:
         args.provider = _DEFAULT_PROVIDER
     if args.auth is None:
@@ -500,7 +511,7 @@ def main() -> int:
         meta, history, tool_state = loaded_session
         loaded_session = (
             dataclasses.replace(
-                meta,
+                _drop_flagged_thinking(args, meta),
                 provider=model_recipe.provider,
                 auth=model_recipe.auth,
                 model_id=model_recipe.model_id,
@@ -958,14 +969,14 @@ def _parse_allow_providers(spec: str) -> tuple[str, ...]:
             f" valid: {list(PROVIDER_NAMES)}\n",
         )
         sys.exit(1)
-    unknown = [p for p in parsed if p not in PROVIDER_NAMES]
-    if unknown:
-        sys.stderr.write(
-            f"Error: --allow-providers contains unknown: {unknown};"
-            f" valid: {list(PROVIDER_NAMES)}\n",
-        )
-        sys.exit(1)
-    return parsed
+    canonical: list[str] = []
+    for name in parsed:
+        try:
+            canonical.append(require_provider(name))
+        except UnknownProviderError as exc:
+            sys.stderr.write(f"Error: --allow-providers: {exc}\n")
+            sys.exit(1)
+    return tuple(dict.fromkeys(canonical))
 
 
 # ``primary`` is the provider when the user passed ``--provider`` or a resumed session
@@ -1193,6 +1204,23 @@ def _apply_cli_thinking(args: argparse.Namespace, model: Model) -> bool:
             f" options: {options}",
         )
     return apply_thinking_command(raw, settings, show=True)
+
+
+def _drop_flagged_thinking(args: argparse.Namespace, meta: SessionMeta) -> SessionMeta:
+    """Blank the persisted thinking axes an explicit flag already set.
+
+    The flags land on the model before ``Agent.resume`` re-applies the
+    recorded axes, so a recorded value left in place would silently undo
+    ``--effort`` / ``--thinking`` on every resumed run.
+    """
+    # ``show`` / ``hide`` move only the display; every other word sets both axes.
+    thinking_flagged = str(args.thinking) not in ("default", "show", "hide")
+    return dataclasses.replace(
+        meta,
+        thinking_effort="" if args.effort is not None else meta.thinking_effort,
+        thinking_budget="" if thinking_flagged else meta.thinking_budget,
+        thinking_output="" if thinking_flagged else meta.thinking_output,
+    )
 
 
 def _apply_resume_model_defaults(args: argparse.Namespace, meta: SessionMeta) -> None:

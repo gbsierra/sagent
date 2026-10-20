@@ -1,17 +1,14 @@
 """Moonshot/Kimi model catalog, expressed as ``ModelCapability`` rows.
 
-Sources (2026-10-03):
-  https://platform.kimi.ai/docs/pricing/chat
-  https://platform.kimi.ai/docs/models
-  https://platform.kimi.ai/docs/guide/use-thinking-models
+Sources: limits, prices, and thinking per ``_SOURCES``; also
   https://platform.kimi.ai/docs/guide/kimi-k3-quickstart
   https://platform.kimi.ai/docs/guide/kimi-k2-6-quickstart
 
 A row carries only what the MODEL can do; caching, retry, and auth mode
 are transport facts declared by ``openai.compatible()``.
 
-Thinking: ``kimi-3.0`` always reasons and takes ``reasoning_effort`` low /
-high / max; ``kimi-code-2.7`` always reasons with no knob; ``kimi-2.6``
+Thinking: ``kimi-k3`` always reasons and takes ``reasoning_effort`` low /
+high / max; ``kimi-k2.7-code`` always reasons with no knob; ``kimi-k2.6``
 reasons by default and accepts ``thinking: {"type": "disabled"}``, so its
 budget offers ``none`` (off) and ``auto`` (on).
 """
@@ -19,9 +16,11 @@ budget offers ``none`` (off) and ``auto`` (on).
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import date
 from types import MappingProxyType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
+from sagent.catalog.provenance import Source
 from sagent.catalog.table import ModelTable
 from sagent.types.capability import (
     ContextTag,
@@ -39,6 +38,8 @@ from sagent.types.cost import (
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
+    from sagent.catalog.provenance import Fact
+
 
 __all__ = ["models"]
 
@@ -52,16 +53,14 @@ def models() -> ModelTable:
     """
     always_thinks = ThinkingCapability(output=frozenset({"none", "text"}))
     code = ModelCapability(
-        model_id="kimi-code-2.7",
-        wire_model_id="kimi-k2.7-code",
+        model_id="kimi-k2.7-code",
         context=_limits(),
         prices=_prices(_card(request=0.95, response=4.0, cache_read=0.19)),
         thinking=always_thinks,
     )
     rows = (
         ModelCapability(
-            model_id="kimi-3.0",
-            wire_model_id="kimi-k3",
+            model_id="kimi-k3",
             # "max_completion_tokens defaults to 131072 and can be set up to
             # 1048576".
             context=_limits(max_tokens=1_048_576, output_tokens=1_048_576),
@@ -74,16 +73,15 @@ def models() -> ModelTable:
                     cache_write_1h=6.0,
                 ),
             ),
-            # ``none`` is "send no knob": the server default, ``max``.
+            # ``default`` sends no knob; the effective server default is max.
             thinking=replace(
                 always_thinks,
-                effort=frozenset({"none", "low", "high", "max"}),
+                effort=frozenset({"low", "high", "max"}),
             ),
             effort_as_level=True,
         ),
         ModelCapability(
-            model_id="kimi-2.6",
-            wire_model_id="kimi-k2.6",
+            model_id="kimi-k2.6",
             context=_limits(),
             prices=_prices(_card(request=0.95, response=4.0, cache_read=0.16)),
             thinking=replace(always_thinks, budget=frozenset({"none", "auto"})),
@@ -91,10 +89,14 @@ def models() -> ModelTable:
         code,
         replace(
             code,
-            model_id="kimi-code-highspeed-2.7",
-            wire_model_id="kimi-k2.7-code-highspeed",
+            model_id="kimi-k2.7-code-highspeed",
             prices=_prices(_card(request=1.9, response=8.0, cache_read=0.38)),
         ),
+    )
+    # Kimi K3 publishes max as its omitted reasoning_effort default.
+    rows = tuple(
+        replace(row, default_effort="max") if row.model_id == "kimi-k3" else row
+        for row in rows
     )
     # A tier is offered exactly when it is priced.
     rows = tuple(replace(row, service_tier=row.prices.service_tiers) for row in rows)
@@ -102,8 +104,32 @@ def models() -> ModelTable:
         rows=rows,
         # docs/models: "Please use the latest Kimi model kimi-k3"; K2.6 is
         # the general-purpose model at a fifth of K3's input price.
-        roles={"default": "kimi-3.0", "utility": "kimi-2.6"},
+        roles={"default": "kimi-k3", "utility": "kimi-k2.6"},
+        # Sagent's own spellings before rows were keyed by vendor id; kept so
+        # saved sessions and settings load. Never extend.
+        renamed={
+            "kimi-3.0": "kimi-k3",
+            "kimi-2.6": "kimi-k2.6",
+            "kimi-code-2.7": "kimi-k2.7-code",
+            "kimi-code-highspeed-2.7": "kimi-k2.7-code-highspeed",
+        },
+        sources=_SOURCES,
     )
+
+
+_SOURCES: Final[Mapping[Fact, Source]] = MappingProxyType(
+    {
+        "limits": Source("https://platform.kimi.ai/docs/models", date(2026, 10, 3)),
+        "prices": Source(
+            "https://platform.kimi.ai/docs/pricing/chat",
+            date(2026, 10, 3),
+        ),
+        "thinking": Source(
+            "https://platform.kimi.ai/docs/guide/use-thinking-models",
+            date(2026, 10, 3),
+        ),
+    },
+)
 
 
 def _card(

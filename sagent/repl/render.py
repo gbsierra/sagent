@@ -24,6 +24,7 @@ import re
 import time
 
 from sagent.lib.durations import humanize_duration
+from sagent.providers import PROVIDER_ALIASES
 from sagent.providers.lib.errors import PolicyBlockedError
 from sagent.repl.render_diff import find_stable_boundary
 from sagent.tools.display import (
@@ -840,7 +841,9 @@ _CHILD_ITEM_TYPES = (
 )
 
 
-HELP_TEXT: Final = """\
+_PROVIDER_ALIAS_NAMES: Final = ", ".join(PROVIDER_ALIASES)
+
+HELP_TEXT: Final = f"""\
 sagent commands
 
   /help                       this list
@@ -851,14 +854,14 @@ sagent commands
   /recompact [hints]          alias for /compact
 
   /model    [args]            switch model; ids may select context (+200k, +272k)
-  /provider <name>            switch provider
+  /provider <name>            switch provider (aliases: {_PROVIDER_ALIAS_NAMES})
   /thinking <state|partial>   adaptive/on/off/redact/show/hide
   /effort [level]             show or set effort; bare lists options
   /tool     NAME.key=value    reconfigure a tool, e.g. Bash.output=off
   /login                      re-auth current provider
 
   /tasks                      list running work (agents + fg + bg)
-  /send     <target> <text>   send to subagent target: label, glob, {a,b}, /re/
+  /send     <target> <text>   send to subagent target: label, glob, {{a,b}}, /re/
   /halt     [<target>]        halt self or matching subagents (Ctrl+C)
   /kill     <qid|all|target>  cancel tool task(s) or matching subagents
   /defer    <text>            send as deferred (non-preempting); drains at AgentIdle\

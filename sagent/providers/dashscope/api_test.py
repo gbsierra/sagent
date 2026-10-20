@@ -74,7 +74,7 @@ def _body(
 
 
 def test_a_fixed_budget_caps_reasoning_with_thinking_budget() -> None:
-    m = _model("qwen-plus-3.7", budget="fixed", effort="low")
+    m = _model("qwen3.7-plus", budget="fixed", effort="low")
     out = _body(m, {"model": "qwen3.7-plus", "reasoning_effort": "low"})
     assert "reasoning_effort" not in out
     assert out["enable_thinking"] is True
@@ -82,43 +82,43 @@ def test_a_fixed_budget_caps_reasoning_with_thinking_budget() -> None:
 
 
 def test_effort_levels_map_to_distinct_budgets() -> None:
-    high = _body(_model("qwen-32b-3.0", budget="fixed", effort="high"))
-    maxi = _body(_model("qwen-32b-3.0", budget="fixed", effort="max"))
+    high = _body(_model("qwen3-32b", budget="fixed", effort="high"))
+    maxi = _body(_model("qwen3-32b", budget="fixed", effort="max"))
     assert high["thinking_budget"] == 16_384
     assert maxi["thinking_budget"] == 24_576
 
 
 def test_an_auto_budget_thinks_at_the_model_default() -> None:
-    out = _body(_model("qwen-plus-3.7", budget="auto", effort="high"))
+    out = _body(_model("qwen3.7-plus", budget="auto", effort="high"))
     assert out == {"enable_thinking": True}
 
 
 def test_a_none_budget_disables_thinking() -> None:
-    out = _body(_model("qwen-plus-3.7"), {"reasoning_effort": "minimal"})
+    out = _body(_model("qwen3.7-plus"), {"reasoning_effort": "minimal"})
     assert out == {"enable_thinking": False}
 
 
 def test_a_level_row_sends_reasoning_effort_and_never_a_budget() -> None:
     """Qwen 3.8 errors when ``reasoning_effort`` and ``thinking_budget`` co-occur."""
-    out = _body(_model("qwen-max-3.8", budget="auto", effort="xhigh"))
+    out = _body(_model("qwen3.8-max", budget="auto", effort="xhigh"))
     assert out == {"enable_thinking": True, "reasoning_effort": "xhigh"}
 
 
 def test_a_level_row_with_no_effort_leaves_the_server_default() -> None:
-    out = _body(_model("qwen-flash-3.8", budget="auto"))
+    out = _body(_model("qwen3.8-flash", budget="auto"))
     assert out == {"enable_thinking": True}
 
 
 def test_an_instruct_row_shares_the_qwen3_prefix_yet_gets_no_knob() -> None:
     """An id-prefix rule once sent ``enable_thinking`` to every ``qwen3*`` id."""
-    m = _model("qwen-235b-a22b-instruct-3.0")
+    m = _model("qwen3-235b-a22b-instruct-2507")
     assert m.capability.thinking.budget == frozenset({"none"})
     assert _body(m) == {}
 
 
 def test_a_thinking_only_row_never_disables_thinking() -> None:
     """Model Studio rejects ``enable_thinking=false`` on ``*-thinking-2507``."""
-    m = _model("qwen-235b-a22b-thinking-3.0", effort="low")
+    m = _model("qwen3-235b-a22b-thinking-2507", effort="low")
     assert "none" not in m.capability.thinking.budget
     assert _body(m)["enable_thinking"] is True
     with pytest.raises(ValueError, match="thinking_budget"):
@@ -127,11 +127,11 @@ def test_a_thinking_only_row_never_disables_thinking() -> None:
 
 @pytest.mark.parametrize(
     "model_id",
-    ["qwen-235b-a22b-instruct-3.0", "qwen-coder-480b-a35b-3.0"],
+    ["qwen3-235b-a22b-instruct-2507", "qwen3-coder-480b-a35b-instruct"],
 )
 def test_a_non_reasoning_row_gets_no_thinking_knobs(model_id: str) -> None:
     m = _model(model_id)
-    assert m.capability.thinking.effort == frozenset({"none"})
+    assert m.capability.thinking.effort == frozenset({"default"})
     out = _body(m)
     assert "enable_thinking" not in out
     assert "thinking_budget" not in out
@@ -148,15 +148,15 @@ def test_the_wire_follows_the_row_not_the_id(model_id: str) -> None:
 @pytest.mark.parametrize(
     ("model_id", "field"),
     [
-        ("qwen-max-3.8", "max_completion_tokens"),
-        ("qwen-flash-3.8", "max_completion_tokens"),
-        ("qwen-plus-3.7", "max_completion_tokens"),
-        ("qwen-flash-3.6", "max_completion_tokens"),
-        ("qwen-27b-3.8", "max_tokens"),
-        ("qwen-max-3.6", "max_tokens"),
-        ("qwen-turbo-3.0", "max_tokens"),
-        ("qwen-32b-3.0", "max_tokens"),
-        ("qwen-235b-a22b-instruct-3.0", "max_tokens"),
+        ("qwen3.8-max", "max_completion_tokens"),
+        ("qwen3.8-flash", "max_completion_tokens"),
+        ("qwen3.7-plus", "max_completion_tokens"),
+        ("qwen3.6-flash", "max_completion_tokens"),
+        ("qwen3.8-27b", "max_tokens"),
+        ("qwen3.6-max-preview", "max_tokens"),
+        ("qwen-turbo", "max_tokens"),
+        ("qwen3-32b", "max_tokens"),
+        ("qwen3-235b-a22b-instruct-2507", "max_tokens"),
     ],
 )
 def test_the_output_cap_uses_the_field_the_model_supports(

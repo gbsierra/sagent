@@ -20,7 +20,6 @@ import pytest
 
 from sagent.agent.retry import is_rate_limited, is_retryable
 from sagent.agent.session_io import _entry_from_json, _entry_to_json
-from sagent.catalog.openai import reasoning_effort
 from sagent.lib.codec import from_plain, loads
 from sagent.providers.lib.id_remap import IdRemapper
 from sagent.providers.openai.api import OpenAI
@@ -34,6 +33,7 @@ from sagent.providers.openai.responses import (
     _OpenAIResponsesModel,
     _parse_tool_arguments,
 )
+from sagent.providers.openai.wire import reasoning_effort
 from sagent.types.capability import (
     ModelCapability,
     ModelSettings,
@@ -266,14 +266,18 @@ def test_responses_preserves_image_bearing_tool_results() -> None:
 def test_o_series_catalog_has_only_supported_efforts(model_id: str) -> None:
     assert OpenAI.from_key("test-key").model(
         model_id,
-    ).capability.thinking.effort == frozenset({"low", "medium", "high"})
+    ).capability.thinking.effort == frozenset(
+        {"default", "low", "medium", "high"},
+    )
 
 
 @pytest.mark.parametrize("model_id", ["gpt-5.4-pro", "gpt-5.5-pro"])
 def test_pro_catalog_has_only_supported_efforts(model_id: str) -> None:
     assert OpenAI.from_key("test-key").model(
         model_id,
-    ).capability.thinking.effort == frozenset({"medium", "high", "xhigh"})
+    ).capability.thinking.effort == frozenset(
+        {"default", "medium", "high", "xhigh"},
+    )
 
 
 @pytest.mark.parametrize(
@@ -283,7 +287,7 @@ def test_pro_catalog_has_only_supported_efforts(model_id: str) -> None:
 def test_earlier_gpt5_catalog_keeps_native_efforts(model_id: str) -> None:
     model = OpenAI.from_key("test-key").model(model_id)
     assert model.capability.thinking.effort == frozenset(
-        {"none", "low", "medium", "high", "xhigh"},
+        {"default", "none", "low", "medium", "high", "xhigh"},
     )
     assert reasoning_effort("xhigh") == "xhigh"
 
@@ -428,11 +432,13 @@ class _CompletedResponse:
         usage: object | None = None,
         *,
         service_tier: str | None = None,
+        model: str | None = None,
     ) -> None:
         self.id = "resp_123"
         self.status = "completed"
         self.usage = usage
         self.service_tier = service_tier
+        self.model = model
 
 
 class _InputTokenDetails:
@@ -770,6 +776,7 @@ class TestStreamIdleTimeout:
                     stream,
                     model=_free_model(),
                     publish=None,
+                    catalog=OpenAI.catalog,
                 ),
                 timeout=0.2,
             )
@@ -803,6 +810,7 @@ class TestStreamIdleTimeout:
                 stream,
                 model=_free_model(),
                 publish=None,
+                catalog=OpenAI.catalog,
             ),
             timeout=0.2,
         )
@@ -826,6 +834,7 @@ class TestStreamIdleTimeout:
                 stream,
                 model=_free_model(),
                 publish=None,
+                catalog=OpenAI.catalog,
             )
 
         assert raised.value.response.message.text == "partial"
@@ -847,13 +856,14 @@ class TestStreamIdleTimeout:
                 stream,
                 model=_free_model(),
                 publish=None,
+                catalog=OpenAI.catalog,
             )
 
         msg = str(raised.value)
         assert "too many requests" in msg
         assert "code=rate_limit" in msg
         assert "param=input" in msg
-        model = OpenAI.from_key("test-key").model("sol-5.6")
+        model = OpenAI.from_key("test-key").model("gpt-5.6-sol")
         assert is_retryable(raised.value, model) is True
         assert is_rate_limited(raised.value) is True
 
@@ -893,7 +903,12 @@ class TestStreamIdleTimeout:
 
         stream = _ClosableStream([_ResponseErrorEvent()])
         with pytest.raises(UserFacingError):
-            await _consume_stream(stream, model=_free_model(), publish=None)
+            await _consume_stream(
+                stream,
+                model=_free_model(),
+                publish=None,
+                catalog=OpenAI.catalog,
+            )
         assert stream.closed, "error-event path leaked the stream (aclose never called)"
 
     @pytest.mark.anyio
@@ -912,6 +927,7 @@ class TestStreamIdleTimeout:
                 stream,
                 model=_free_model(),
                 publish=None,
+                catalog=OpenAI.catalog,
             )
 
         msg = str(raised.value)
@@ -919,7 +935,7 @@ class TestStreamIdleTimeout:
         assert "response_id=resp_failed" in msg
         assert "code=server_error" in msg
         assert "backend failed" in msg
-        model = OpenAI.from_key("test-key").model("sol-5.6")
+        model = OpenAI.from_key("test-key").model("gpt-5.6-sol")
         assert is_retryable(raised.value, model) is True
 
     @pytest.mark.anyio
@@ -944,6 +960,7 @@ class TestStreamIdleTimeout:
             stream,
             model=_free_model(),
             publish=None,
+            catalog=OpenAI.catalog,
         )
 
         assert response.message.text == "partial answer"
@@ -972,6 +989,7 @@ class TestStreamIdleTimeout:
             stream,
             model=_free_model(),
             publish=None,
+            catalog=OpenAI.catalog,
         )
 
         assert response.message.text == "partial answer"
@@ -999,6 +1017,7 @@ class TestStreamIdleTimeout:
             _DelayedStream([event], delay_sec=0.0),
             model=_priced_model(),
             publish=None,
+            catalog=OpenAI.catalog,
         )
         assert response.tokens.request == 3
         assert response.tokens.cache_write == 1306
@@ -1033,8 +1052,45 @@ class TestStreamIdleTimeout:
             _DelayedStream([event], delay_sec=0.0),
             model=model,
             publish=None,
+            catalog=OpenAI.catalog,
         )
         assert response.spend.request == pytest.approx(rate)
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("served", "billed_as"),
+        [
+            ("gpt-4.1-mini", "gpt-4.1-mini"),
+            ("gpt-4.1-2099-01-01", "gpt-4.1"),
+            (None, "gpt-4.1"),
+        ],
+    )
+    async def test_completed_response_bills_the_row_its_model_field_names(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        served: str | None,
+        billed_as: str,
+    ) -> None:
+        """``response.model`` names the served row; unlisted or absent keeps the request."""
+        monkeypatch.setattr(
+            "sagent.providers.openai.responses.responses.ResponseCompletedEvent",
+            _CompletedEvent,
+        )
+        event = _CompletedEvent(
+            _CompletedResponse(
+                _Usage(input_tokens=1_000_000, output_tokens=1_000_000),
+                model=served,
+            ),
+        )
+        provider = OpenAI.from_key("test-key")
+        response = await _consume_stream(
+            _DelayedStream([event], delay_sec=0.0),
+            model=provider.model("gpt-4.1"),
+            publish=None,
+            catalog=OpenAI.catalog,
+        )
+        assert response.served_model_id == (served or "")
+        assert response.spend == provider.model(billed_as).spend(response.tokens)
 
     @pytest.mark.anyio
     @pytest.mark.parametrize(
@@ -1070,6 +1126,7 @@ class TestStreamIdleTimeout:
                 _DelayedStream([event], delay_sec=0.0),
                 model=model,
                 publish=None,
+                catalog=OpenAI.catalog,
             )
         assert response.message_id == "resp_123"
         assert response.spend.request == pytest.approx(
@@ -1098,6 +1155,7 @@ class TestStreamIdleTimeout:
             ),
             model=_priced_model(),
             publish=None,
+            catalog=OpenAI.catalog,
         )
         encrypted = next(
             block
@@ -1138,6 +1196,7 @@ class TestStreamIdleTimeout:
             ),
             model=_priced_model(),
             publish=None,
+            catalog=OpenAI.catalog,
         )
         assert response.message.text == "I can’t help with that."
         assert response.stop_reason == "model_refusal"
@@ -1183,6 +1242,7 @@ class TestStreamIdleTimeout:
             stream,
             model=_priced_model(),
             publish=_sink,
+            catalog=OpenAI.catalog,
         )
 
         assert thinking_chunks == ["think ", "more"]
@@ -1199,6 +1259,7 @@ class TestStreamIdleTimeout:
                 stream,
                 model=_priced_model(),
                 publish=None,
+                catalog=OpenAI.catalog,
             ),
         )
         await asyncio.wait_for(stream.entered.wait(), timeout=0.2)

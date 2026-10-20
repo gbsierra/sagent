@@ -47,7 +47,7 @@ def test_minimax_unknown_model_raises() -> None:
 
 
 def test_minimax_model_supports_thinking_via_reasoning_field() -> None:
-    m = MiniMax.from_key("k").model("minimax-2.7")
+    m = MiniMax.from_key("k").model("MiniMax-M2.7")
     assert m.capability.thinking.output == frozenset({"none", "text"})
 
 
@@ -78,7 +78,7 @@ def _body(
 
 def test_every_request_splits_reasoning_out_of_content() -> None:
     """Without it, thinking arrives inside ``content`` as ``<think>`` tags."""
-    assert _body("minimax-2.7")["reasoning_split"] is True
+    assert _body("MiniMax-M2.7")["reasoning_split"] is True
 
 
 @pytest.mark.parametrize(
@@ -86,15 +86,15 @@ def test_every_request_splits_reasoning_out_of_content() -> None:
     [("none", "disabled"), ("auto", "adaptive")],
 )
 def test_m3_sends_its_thinking_switch(budget: ThinkingBudget, wire: str) -> None:
-    assert _body("minimax-3.0", budget)["thinking"] == {"type": wire}
+    assert _body("MiniMax-M3", budget)["thinking"] == {"type": wire}
 
 
 def test_m2_sends_no_thinking_switch_it_would_ignore() -> None:
-    assert "thinking" not in _body("minimax-2.7")
+    assert "thinking" not in _body("MiniMax-M2.7")
 
 
 def test_m3_priority_tier_survives_the_transport() -> None:
-    m = MiniMax.from_key("k").model("minimax-3.0")
+    m = MiniMax.from_key("k").model("MiniMax-M3")
     assert "priority" in m.capability.service_tier
     m.settings.service_tier = "priority"
 

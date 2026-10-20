@@ -46,7 +46,7 @@ Usage
     export SLACK_APP_TOKEN=xapp-...
     export SLACK_BOT_TOKEN=xoxb-...
     ./slack.py
-    ./slack.py --provider Google --auth env --model gemini-pro-3.1
+    ./slack.py --provider Google --auth env --model gemini-3.1-pro-preview
     ./slack.py --persona-dir ./personas
 '''
 # fmt: on
@@ -1078,8 +1078,10 @@ async def _run(args: argparse.Namespace) -> None:
         account=args.account,
     )
     # Every spawned agent shares this model object, so the flag lands on
-    # its settings once here rather than riding each constructor.
-    model.settings.thinking_effort = cast(ThinkingEffort, args.effort)
+    # its settings once here rather than riding each constructor. An omitted
+    # flag parses to ``None``, which no row offers: keep the model's own.
+    if args.effort is not None:
+        model.settings.thinking_effort = cast(ThinkingEffort, args.effort)
     compactor = SummaryCompactor() if args.compact else None
     persona_dir = Path(args.persona_dir)
 

@@ -12,7 +12,6 @@ from sagent.types.capability import (
     ModelCapability,
     ModelLimits,
     ThinkingCapability,
-    ThinkingEffort,
 )
 from sagent.types.cost import PriceKey, ServiceTier, TokenPrice
 
@@ -35,8 +34,21 @@ def rebuild_catalog() -> None:
 
 def test_openai_metadata_does_not_leak_from_new_models_to_legacy_rows() -> None:
     models = openai.models()
-    assert models["astra-6.0"].approx_chars_per_token == 3.71
+    assert models["gpt-6-astra"].approx_chars_per_token == 3.71
     assert models["gpt-4"].knowledge_cutoff == "December 1, 2023"
+
+
+def test_convenience_aliases_resolve_per_transport() -> None:
+    """One input name can follow each transport's supported model line."""
+    api = openai.models()
+    subscription = openai.subscription_models()
+    assert api.aliases == {"sol": "gpt-6.1-sol", "luna": "gpt-6-luna"}
+    assert subscription.aliases == {
+        "sol": "gpt-5.6-sol",
+        "luna": "gpt-5.6-luna",
+    }
+    assert api["sol"].model_id == "gpt-6.1-sol"
+    assert subscription["sol"].model_id == "gpt-5.6-sol"
 
 
 # (tier, input, cached input, cache write, output), from the standard / flex /
@@ -44,12 +56,12 @@ def test_openai_metadata_does_not_leak_from_new_models_to_legacy_rows() -> None:
 @pytest.mark.parametrize(
     ("model_id", "tier", "published"),
     [
-        ("astra-6.0", "auto", (10.0, 1.0, 12.5, 50.0)),
-        ("astra-6.0", "flex", (5.0, 0.5, 6.25, 25.0)),
-        ("astra-6.0", "priority", (20.0, 2.0, 25.0, 100.0)),
-        ("luna-6.0", "flex", (0.05, 0.005, 0.0625, 0.25)),
-        ("luna-6.0", "priority", (0.2, 0.02, 0.25, 1.0)),
-        ("terra-5.6", "flex", (1.0, 0.1, 1.25, 6.0)),
+        ("gpt-6-astra", "auto", (10.0, 1.0, 12.5, 50.0)),
+        ("gpt-6-astra", "flex", (5.0, 0.5, 6.25, 25.0)),
+        ("gpt-6-astra", "priority", (20.0, 2.0, 25.0, 100.0)),
+        ("gpt-6-luna", "flex", (0.05, 0.005, 0.0625, 0.25)),
+        ("gpt-6-luna", "priority", (0.2, 0.02, 0.25, 1.0)),
+        ("gpt-5.6-terra", "flex", (1.0, 0.1, 1.25, 6.0)),
         ("gpt-5.4", "flex", (1.25, 0.13, 0.0, 7.5)),
         ("gpt-4o", "priority", (4.25, 2.125, 0.0, 17.0)),
         ("gpt-5.2", "priority", (3.5, 0.35, 0.0, 28.0)),
@@ -69,7 +81,7 @@ def test_openai_tiers_bill_the_published_rate(
 @pytest.mark.parametrize(
     ("model_id", "offered"),
     [
-        ("astra-6.0", {"auto", "default", "flex", "priority", "ultrafast"}),
+        ("gpt-6-astra", {"auto", "default", "flex", "priority", "ultrafast"}),
         ("gpt-5.5-pro", {"auto", "default", "flex"}),
         ("gpt-4.1", {"auto", "default", "priority"}),
         ("o1", {"auto", "default"}),
@@ -85,7 +97,7 @@ def test_openai_offers_only_the_published_tiers(
 
 def test_openai_long_prompts_bill_the_published_long_context_rate() -> None:
     """GPT-6 publishes its >272K column; 2x input / 1.5x output reproduces it."""
-    prices = openai.models()["luna-6.0"].prices
+    prices = openai.models()["gpt-6-luna"].prices
     short = prices.rate(service_tier="auto", prompt_tokens=272_000, at=_TODAY)
     long = prices.rate(service_tier="auto", prompt_tokens=272_001, at=_TODAY)
     assert (short.request, short.response) == (0.1, 0.5)
@@ -102,35 +114,9 @@ def test_openai_long_prompts_bill_the_published_long_context_rate() -> None:
     )
 
 
-@pytest.mark.parametrize(
-    ("reported", "tier"),
-    [
-        (None, "auto"),
-        ("auto", "auto"),
-        ("default", "auto"),
-        ("flex", "flex"),
-        ("priority", "priority"),
-        ("fast", "priority"),
-        ("ultrafast", "ultrafast"),
-        # Scale Tier is prepaid capacity billed at the standard card.
-        ("scale", "auto"),
-    ],
-)
-def test_openai_bills_the_tier_it_reports_serving(
-    reported: str | None,
-    tier: ServiceTier,
-) -> None:
-    assert openai.served_tier(reported) == tier
-
-
-def test_an_unknown_reported_tier_is_unknown_not_an_error() -> None:
-    """The response is already paid for; the caller picks the fallback rate."""
-    assert openai.served_tier("hyperfast") is None
-
-
 def test_astra_bills_the_published_ultrafast_card() -> None:
     """Ultrafast tab, 2026-10-05: $60 / $6 / $75 / $300; long $120 / $12 / $150 / $450."""
-    prices = openai.models()["astra-6.0"].prices
+    prices = openai.models()["gpt-6-astra"].prices
     short = prices.rate(service_tier="ultrafast", prompt_tokens=1, at=_TODAY)
     long = prices.rate(service_tier="ultrafast", prompt_tokens=300_000, at=_TODAY)
     assert (short.request, short.cache_read, short.cache_write, short.response) == (
@@ -145,23 +131,7 @@ def test_astra_bills_the_published_ultrafast_card() -> None:
         150.0,
         450.0,
     )
-    assert "ultrafast" not in openai.models()["sol-6.1"].prices.service_tiers
-
-
-@pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh", "max"])
-def test_reasoning_effort_sends_the_selected_level_verbatim(
-    effort: ThinkingEffort,
-) -> None:
-    assert openai.reasoning_effort(effort) == effort
-
-
-@pytest.mark.parametrize("effort", ["none", "min"])
-def test_reasoning_effort_has_no_spelling_for_sending_no_knob(
-    effort: ThinkingEffort,
-) -> None:
-    """``none`` omits ``reasoning`` and no row offers ``min``; neither is a level."""
-    with pytest.raises(ValueError, match=rf"^effort {effort!r} is not sent"):
-        _ = openai.reasoning_effort(effort)
+    assert "ultrafast" not in openai.models()["gpt-6.1-sol"].prices.service_tiers
 
 
 def test_no_openai_row_offers_min() -> None:
@@ -187,12 +157,12 @@ def test_compatible_offers_only_the_standard_tier_without_server_context() -> No
 
 def test_only_long_context_rows_price_a_band_above_272k() -> None:
     models = openai.models()
-    assert PriceKey("auto", 272_000) in models["luna-6.0"].prices
+    assert PriceKey("auto", 272_000) in models["gpt-6-luna"].prices
     assert PriceKey("auto", 272_000) not in models["gpt-4"].prices
 
 
 def test_cards_carry_every_published_column() -> None:
-    price = openai.models()["astra-6.0"].prices[PriceKey("auto")]
+    price = openai.models()["gpt-6-astra"].prices[PriceKey("auto")]
     assert price == TokenPrice(
         request=10.0,
         response=50.0,
@@ -210,7 +180,7 @@ def test_api_offers_every_tier_over_key_auth() -> None:
 
 
 def test_subscription_models_clamp_to_the_chatgpt_backend() -> None:
-    row = openai.subscription_models()["astra-6.0"]
+    row = openai.subscription_models()["gpt-6-astra"]
     assert set(row.context) == {""}
     assert row.context[""].max_request_tokens == 272_000
     assert row.context[""].max_response_tokens == 32_000
@@ -224,7 +194,7 @@ def test_default_limits_serve_the_published_input_cap_and_a_272k_cap() -> None:
         max_request_bytes=512 * 1024 * 1024,
         max_image_edge_px=65_535,
     )
-    assert openai.models()["astra-6.0"].context == {
+    assert openai.models()["gpt-6-astra"].context == {
         "": limits,
         "+272k": replace(limits, max_request_tokens=272_000),
     }
@@ -243,8 +213,8 @@ def test_tiled_image_limits_cap_the_body_and_image_edge() -> None:
 
 def test_sol_6_1_bills_its_published_card_and_is_the_default() -> None:
     """Cached input is 5% of input on 6.1 Sol, half of every other GPT-6 card."""
-    sol = openai.models()["sol-6.1"]
-    assert sol.wire_model_id == "gpt-6.1-sol"
+    sol = openai.models()["gpt-6.1-sol"]
+    assert openai.models()["default"] is sol
     assert sol.knowledge_cutoff == "April 30, 2026"
     assert sol.prices[PriceKey("auto")] == TokenPrice(
         request=2.0,
@@ -255,7 +225,9 @@ def test_sol_6_1_bills_its_published_card_and_is_the_default() -> None:
     )
     assert sol.prices[PriceKey("flex")].cache_read == 0.05
     assert sol.prices[PriceKey("priority")].cache_read == 0.2
-    assert sol.thinking.effort == frozenset({"low", "medium", "high", "xhigh", "max"})
+    assert sol.thinking.effort == frozenset(
+        {"default", "low", "medium", "high", "xhigh", "max"},
+    )
     assert openai.models()["default"] is sol
 
 
@@ -283,7 +255,7 @@ def test_a_published_long_card_overrides_the_ratio() -> None:
         # images-vision worked examples for gpt-6-astra.
         ("gpt-6-astra", 1024, 1024, 1229),
         ("gpt-6-astra", 4096, 512, 2458),
-        ("sol-5.6", 33, 65, 8),
+        ("gpt-5.6-sol", 33, 65, 8),
         # 8000x8000 shrinks into gpt-5.5's 10,000-patch budget.
         ("gpt-5.5", 8000, 8000, 12_000),
         ("gpt-4o", 33, 65, 255),

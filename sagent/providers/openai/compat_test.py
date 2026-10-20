@@ -298,6 +298,7 @@ async def test_consume_stream_input_tokens_exclude_cache_read() -> None:
         publish=None,
         model=_free_model(),
         reasoning_field="",
+        catalog=OpenAICompat.catalog,
     )
     assert resp.tokens.request == 600
     assert resp.tokens.cache_read == 400
@@ -324,6 +325,7 @@ async def test_consume_stream_tracks_and_bills_cache_write_tokens() -> None:
         publish=None,
         model=_billed_model(),
         reasoning_field="",
+        catalog=OpenAICompat.catalog,
     )
     assert resp.tokens.request == 3
     assert resp.tokens.cache_write == 1306
@@ -331,6 +333,67 @@ async def test_consume_stream_tracks_and_bills_cache_write_tokens() -> None:
     assert (
         resp.spend.request + resp.spend.cache_write + resp.spend.cache_read
     ) == pytest.approx((3 + 1306 * 1.25) / 1_000_000)
+
+
+def _per_mtok(rate: float) -> PriceCatalog:
+    return PriceCatalog(
+        {
+            PriceKey("auto"): TokenPrice(
+                request=rate,
+                response=0.0,
+                cache_write=0.0,
+                cache_write_1h=0.0,
+                cache_read=0.0,
+            ),
+        },
+    )
+
+
+class _TwoRowCompat(OpenAICompat):
+    catalog = ModelCatalog(
+        models=ModelTable(
+            rows=(
+                ModelCapability(model_id="alias-1", prices=_per_mtok(1.0)),
+                ModelCapability(model_id="snapshot-1", prices=_per_mtok(3.0)),
+            ),
+        ),
+        transport=compatible(),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reported", "served", "rate"),
+    [
+        ("snapshot-1", "snapshot-1", 3.0),
+        ("alias-1", "alias-1", 1.0),
+        (None, "", 1.0),
+        ("unlisted-9", "unlisted-9", 1.0),
+    ],
+)
+async def test_consume_stream_bills_the_row_the_chunks_report(
+    reported: str | None,
+    served: str,
+    rate: float,
+) -> None:
+    """The served row prices the turn; an absent or unlisted id keeps the request's."""
+    model = _TwoRowCompat.from_key("k").model("alias-1")
+    chunk: dict[str, MutablePlainTree] = {
+        "id": "s",
+        "choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1_000_000, "completion_tokens": 0},
+    }
+    if reported is not None:
+        chunk["model"] = reported
+    resp = await consume_stream(
+        _sse_response([chunk]),
+        publish=None,
+        model=model,
+        reasoning_field="",
+        catalog=_TwoRowCompat.catalog,
+    )
+    assert resp.served_model_id == served
+    assert resp.spend.request == pytest.approx(rate)
 
 
 def _sse_response(events: list[dict[str, MutablePlainTree]]) -> httpx2.Response:
@@ -374,6 +437,7 @@ async def test_consume_stream_text_and_usage() -> None:
         publish=_sink,
         model=_free_model(),
         reasoning_field="",
+        catalog=OpenAICompat.catalog,
     )
     assert resp.message.text == "hello"
     assert "".join(text_acc) == "hello"
@@ -402,6 +466,7 @@ async def test_consume_stream_preserves_chat_refusal_text() -> None:
         publish=None,
         model=_free_model(),
         reasoning_field="",
+        catalog=OpenAICompat.catalog,
     )
     assert resp.message.text == "I can’t help with that."
     assert resp.stop_reason == "model_refusal"
@@ -456,6 +521,7 @@ async def test_consume_stream_tool_call_accumulates() -> None:
         publish=None,
         model=_free_model(),
         reasoning_field="",
+        catalog=OpenAICompat.catalog,
     )
     assert len(resp.message.tool_calls) == 1
     tc = resp.message.tool_calls[0]
@@ -496,6 +562,7 @@ async def test_consume_stream_reasoning_captured() -> None:
         publish=_sink,
         model=_free_model(),
         reasoning_field="reasoning_content",
+        catalog=OpenAICompat.catalog,
     )
     assert thinking_chunks == ["think ", "more"]
     assert resp.message.thinking_blocks == (
@@ -515,6 +582,7 @@ async def test_consume_stream_skips_malformed_data() -> None:
         publish=None,
         model=_free_model(),
         reasoning_field="",
+        catalog=OpenAICompat.catalog,
     )
     assert resp.message.text == "ok"
 
@@ -532,6 +600,7 @@ async def test_consume_stream_skips_well_formed_non_object_data(payload: bytes) 
         publish=None,
         model=_free_model(),
         reasoning_field="",
+        catalog=OpenAICompat.catalog,
     )
     assert resp.message.text == "ok"
 
@@ -555,6 +624,7 @@ async def test_consume_stream_raises_an_in_band_error_event(
             publish=None,
             model=_free_model(),
             reasoning_field="",
+            catalog=OpenAICompat.catalog,
         )
     assert error_status_code(raised.value) == status
 
@@ -572,6 +642,7 @@ async def test_consume_stream_eof_without_done_raises_interrupted() -> None:
             publish=None,
             model=_billed_model(),
             reasoning_field="",
+            catalog=OpenAICompat.catalog,
         )
     response = exc_info.value.response
     assert response.message.text == "partial"
@@ -670,7 +741,7 @@ def test_model_properties_defaults() -> None:
     assert m.limits.max_request_tokens == 1000
     assert m.limits.max_response_tokens == 200
     assert m.capability.thinking.budget == frozenset({"none"})
-    assert m.capability.thinking.effort == frozenset({"none"})
+    assert m.capability.thinking.effort == frozenset({"default"})
     assert m.capability.cache_ttl_sec == frozenset({0.0})
     assert m.capability.manage_context_server_side == frozenset({False})
     assert m.capability.retries_internally is False

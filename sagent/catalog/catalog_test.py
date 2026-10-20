@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from datetime import date
+from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING, cast
-
-import re
 
 import pytest
 
@@ -19,8 +17,10 @@ from sagent.catalog import (
     moonshot,
     openai,
 )
+from sagent.catalog.provenance import FACTS
+from sagent.catalog.table import ModelTable
 from sagent.types.capability import ModelCapability, ModelSettings
-from sagent.types.cost import PriceKey, TokenCount, TokenPrice
+from sagent.types.cost import PriceKey, TokenCount
 
 
 if TYPE_CHECKING:
@@ -89,40 +89,26 @@ def test_every_catalog_names_its_default_and_utility_rows(module: ModuleType) ->
 
 @pytest.mark.parametrize("module", _VENDORS, ids=_module_id)
 def test_a_catalog_lists_each_model_once_under_its_own_id(module: ModuleType) -> None:
-    """Roles and families name rows; they are not rows themselves."""
+    """Roles and retired names reach rows; they are not rows themselves."""
     models = _models(module)
     assert all(models[model_id].model_id == model_id for model_id in models)
     assert "default" not in list(models)
 
 
-_EXACT_NAME = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*-\d+\.\d+")
+_HOSTED = [m for m in _VENDORS if m is not llamacpp]
 
 
-@pytest.mark.parametrize("module", _VENDORS, ids=_module_id)
-def test_every_name_is_family_major_minor(module: ModuleType) -> None:
-    """``sonnet-5`` is a prefix for the newest ``sonnet-5.x``; no row may own it.
-
-    The family carries no dots and no case, so the version is always the last
-    ``-``-separated part and a family is exactly what precedes it.
-    """
-    bad = [m for m in _models(module) if not _EXACT_NAME.fullmatch(m)]
-    assert not bad, f"names not family-major.minor: {bad}"
-
-
-# ``sol``, ``opus``, ``default`` mean a family's newest row only while each family's
-# rows run newest-first; a release appended after its predecessor would leave every
-# family name and role on the older one.
-@pytest.mark.parametrize("module", _VENDORS, ids=_module_id)
-def test_each_family_lists_its_rows_newest_first(module: ModuleType) -> None:
-    seen: dict[str, tuple[int, ...]] = {}
-    for model_id in _models(module):
-        family, _, version = model_id.rpartition("-")
-        if not family or not version.replace(".", "").isdigit():
-            continue
-        parsed = tuple(int(part) for part in version.split("."))
-        older = seen.get(family)
-        assert older is None or parsed < older, (model_id, older)
-        seen[family] = parsed
+@pytest.mark.parametrize("module", _HOSTED, ids=_module_id)
+def test_every_hosted_catalog_names_a_source_per_fact(module: ModuleType) -> None:
+    """A reviewer of a disagreement must know which page to reopen."""
+    table = cast(Callable[[], ModelTable], module.models)()
+    for model_id in table:
+        for fact in FACTS:
+            source = table.source(model_id, fact)
+            assert source is not None, (model_id, fact)
+            assert source.url.startswith("https://"), (model_id, fact)
+            today = datetime.now(UTC).date()
+            assert source.checked is None or source.checked <= today
 
 
 @pytest.mark.parametrize("row", _ROWS)
@@ -169,18 +155,18 @@ def test_no_axis_is_empty(row: ModelCapability) -> None:
 
 
 @pytest.mark.parametrize("row", _ROWS)
-def test_only_reasoning_only_models_reject_none(row: ModelCapability) -> None:
-    """Keep vendor-enforced reasoning mandatory, and optional elsewhere."""
-    reasoning_only = "-thinking-" in row.model_id or row.model_id in {
-        "astra-6.0",
-        "sol-6.1",
-        "gpt-pro-5.5",
-        "gpt-pro-5.4",
-        "gpt-pro-5.2",
-        "o-1.0",
-        "o-mini-3.0",
-    }
-    assert ("none" not in row.thinking.effort) == reasoning_only
+def test_every_model_offers_provider_default(row: ModelCapability) -> None:
+    assert "default" in row.thinking.effort
+    assert ModelSettings.narrowest(row).thinking_effort == "default"
+
+
+@pytest.mark.parametrize("row", _ROWS)
+def test_a_named_provider_default_is_an_advertised_level(
+    row: ModelCapability,
+) -> None:
+    if row.default_effort is not None:
+        assert row.default_effort != "default"
+        assert row.default_effort in row.thinking.effort
 
 
 @pytest.mark.parametrize("row", _ROWS)
@@ -231,21 +217,21 @@ def test_a_transport_preserves_windows_and_prices(
 @pytest.mark.parametrize(
     ("model_id", "cutoff"),
     [
-        ("fable-5.1", "June 2026"),
-        ("fable-5.0", "January 2026"),
-        ("mythos-5.1", "June 2026"),
-        ("mythos-5.0", "January 2026"),
-        ("opus-5.5", "June 2026"),
-        ("opus-5.0", "May 2026"),
-        ("opus-4.8", "January 2026"),
-        ("opus-4.7", "January 2026"),
-        ("opus-4.6", "May 2025"),
-        ("opus-4.5", "May 2025"),
-        ("sonnet-5.5", "June 2026"),
-        ("sonnet-5.0", "January 2026"),
-        ("sonnet-4.6", "August 2025"),
-        ("sonnet-4.5", "January 2025"),
-        ("haiku-4.5", "February 2025"),
+        ("claude-fable-5-1", "June 2026"),
+        ("claude-fable-5", "January 2026"),
+        ("claude-mythos-5-1", "June 2026"),
+        ("claude-mythos-5", "January 2026"),
+        ("claude-opus-5-5", "June 2026"),
+        ("claude-opus-5", "May 2026"),
+        ("claude-opus-4-8", "January 2026"),
+        ("claude-opus-4-7", "January 2026"),
+        ("claude-opus-4-6", "May 2025"),
+        ("claude-opus-4-5", "May 2025"),
+        ("claude-sonnet-5-5", "June 2026"),
+        ("claude-sonnet-5", "January 2026"),
+        ("claude-sonnet-4-6", "August 2025"),
+        ("claude-sonnet-4-5", "January 2025"),
+        ("claude-haiku-4-5", "February 2025"),
     ],
 )
 def test_every_anthropic_row_states_its_published_cutoff(
@@ -259,12 +245,12 @@ def test_every_anthropic_row_states_its_published_cutoff(
 def test_only_the_fast_mode_opus_models_offer_priority() -> None:
     rows = anthropic.models()
     fast = {m for m, row in rows.items() if "priority" in row.service_tier}
-    assert fast == {"opus-5.5", "opus-5.0", "opus-4.8"}
+    assert fast == {"claude-opus-5-5", "claude-opus-5", "claude-opus-4-8"}
 
 
 def test_pre_4_6_models_have_no_1m_window() -> None:
     """Sonnet 4.5 and Opus 4.5 are 200k / 64k models; a 1M row would 400."""
-    for model_id in ("opus-4.5", "sonnet-4.5", "haiku-4.5"):
+    for model_id in ("claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-4-5"):
         row = anthropic.models()[model_id]
         assert set(row.context) == {""}, model_id
         assert row.context[""].max_request_tokens == 200_000, model_id
@@ -272,16 +258,16 @@ def test_pre_4_6_models_have_no_1m_window() -> None:
 
 
 def test_published_knowledge_cutoffs_are_catalog_data() -> None:
-    assert anthropic.models()["opus-5.5"].knowledge_cutoff == "June 2026"
-    assert anthropic.models()["fable-5.1"].knowledge_cutoff == "June 2026"
-    assert openai.models()["astra-6.0"].knowledge_cutoff == "April 30, 2026"
-    assert openai.models()["sol-6.0"].knowledge_cutoff == "April 20, 2026"
-    assert openai.models()["luna-6.0"].knowledge_cutoff == "May 18, 2026"
+    assert anthropic.models()["claude-opus-5-5"].knowledge_cutoff == "June 2026"
+    assert anthropic.models()["claude-fable-5-1"].knowledge_cutoff == "June 2026"
+    assert openai.models()["gpt-6-astra"].knowledge_cutoff == "April 30, 2026"
+    assert openai.models()["gpt-6-sol"].knowledge_cutoff == "April 20, 2026"
+    assert openai.models()["gpt-6-luna"].knowledge_cutoff == "May 18, 2026"
 
 
 def test_anthropic_tokenizer_ratio_is_catalog_data() -> None:
-    assert anthropic.models()["opus-5.5"].approx_chars_per_token == 2.38
-    assert anthropic.models()["opus-4.6"].approx_chars_per_token == 3.12
+    assert anthropic.models()["claude-opus-5-5"].approx_chars_per_token == 2.38
+    assert anthropic.models()["claude-opus-4-6"].approx_chars_per_token == 3.12
 
 
 @pytest.mark.parametrize(("models", "transport"), _TRANSPORTS, ids=_TRANSPORT_IDS)
@@ -334,24 +320,24 @@ def test_a_transport_never_advertises_what_no_row_can_reach(
 #   https://docs.anthropic.com/en/docs/about-claude/pricing
 #   https://ai.google.dev/gemini-api/docs/pricing
 _PUBLISHED_PRICES = {
-    "astra-6.0": (10.0, 50.0),
-    "sol-6.0": (2.0, 10.0),
-    "luna-6.0": (0.1, 0.5),
-    "sol-5.6": (4.0, 20.0),
+    "gpt-6-astra": (10.0, 50.0),
+    "gpt-6-sol": (2.0, 10.0),
+    "gpt-6-luna": (0.1, 0.5),
+    "gpt-5.6-sol": (4.0, 20.0),
     "gpt-5.6": (4.0, 20.0),
-    "terra-5.6": (2.0, 12.0),
-    "luna-5.6": (0.2, 1.2),
+    "gpt-5.6-terra": (2.0, 12.0),
+    "gpt-5.6-luna": (0.2, 1.2),
     "gpt-5.5": (5.0, 30.0),
-    "opus-5.0": (5.0, 25.0),
-    "opus-5.5": (4.0, 20.0),
-    "fable-5.1": (10.0, 50.0),
-    "sonnet-5.5": (2.0, 10.0),
-    "sonnet-5.0": (2.0, 10.0),
-    "haiku-4.5": (1.0, 5.0),
-    "sol-6.1": (2.0, 10.0),
-    "gemini-flash-3.8": (0.75, 3.75),
-    "gemini-pro-3.1": (2.0, 12.0),
-    "gemini-pro-2.5": (1.25, 10.0),
+    "claude-opus-5": (5.0, 25.0),
+    "claude-opus-5-5": (4.0, 20.0),
+    "claude-fable-5-1": (10.0, 50.0),
+    "claude-sonnet-5-5": (2.0, 10.0),
+    "claude-sonnet-5": (2.0, 10.0),
+    "claude-haiku-4-5": (1.0, 5.0),
+    "gpt-6.1-sol": (2.0, 10.0),
+    "gemini-3.8-flash": (0.75, 3.75),
+    "gemini-3.1-pro-preview": (2.0, 12.0),
+    "gemini-2.5-pro": (1.25, 10.0),
 }
 
 
@@ -380,34 +366,35 @@ def test_a_cache_rate_is_a_multiple_of_the_rate_it_rides() -> None:
     the 0.1x every other model uses.
     """
     rows = anthropic.models()
-    opus = rows["opus-5.0"].prices
+    opus = rows["claude-opus-5"].prices
     standard = opus[PriceKey("auto")]
     fast = opus[PriceKey("priority")]
     assert (fast.request, fast.response) == (10.0, 50.0)
     assert fast.cache_write == fast.request * 1.25
     assert fast.cache_read == fast.request * 0.1
     assert fast.cache_write == standard.cache_write * 2.0
-    fable = rows["fable-5.1"].prices[PriceKey("auto")]
+    fable = rows["claude-fable-5-1"].prices[PriceKey("auto")]
     assert fable.cache_read == 0.25
 
 
 @pytest.mark.parametrize(
     ("model_id", "cache_read"),
     [
-        ("fable-5.1", 0.25),
-        ("fable-5.0", 1.0),
-        ("opus-5.5", 0.2),
-        ("opus-5.0", 0.5),
-        ("sonnet-5.0", 0.2),
-        ("sonnet-4.6", 0.3),
-        ("haiku-4.5", 0.1),
+        ("claude-fable-5-1", 0.25),
+        ("claude-fable-5", 1.0),
+        ("claude-opus-5-5", 0.2),
+        ("claude-sonnet-5-5", 0.1),
+        ("claude-opus-5", 0.5),
+        ("claude-sonnet-5", 0.2),
+        ("claude-sonnet-4-6", 0.3),
+        ("claude-haiku-4-5", 0.1),
     ],
 )
 def test_anthropic_cache_hits_bill_the_published_rate(
     model_id: str,
     cache_read: float,
 ) -> None:
-    """Fable 5.1 is 0.025x, Opus 5.5 0.05x, every other model 0.1x input."""
+    """Fable 5.1 is 0.025x, Opus and Sonnet 5.5 0.05x, every other model 0.1x."""
     price = anthropic.models()[model_id].prices[PriceKey("auto")]
     assert price.cache_read == pytest.approx(cache_read)
 
@@ -415,12 +402,12 @@ def test_anthropic_cache_hits_bill_the_published_rate(
 @pytest.mark.parametrize(
     ("model_id", "write_5m", "write_1h"),
     [
-        ("fable-5.1", 12.5, 20.0),
-        ("opus-5.5", 5.0, 8.0),
-        ("opus-5.0", 6.25, 10.0),
-        ("sonnet-5.0", 2.5, 4.0),
-        ("sonnet-4.6", 3.75, 6.0),
-        ("haiku-4.5", 1.25, 2.0),
+        ("claude-fable-5-1", 12.5, 20.0),
+        ("claude-opus-5-5", 5.0, 8.0),
+        ("claude-opus-5", 6.25, 10.0),
+        ("claude-sonnet-5", 2.5, 4.0),
+        ("claude-sonnet-4-6", 3.75, 6.0),
+        ("claude-haiku-4-5", 1.25, 2.0),
     ],
 )
 def test_anthropic_cache_writes_bill_the_published_rate_per_lifetime(
@@ -436,8 +423,8 @@ def test_anthropic_cache_writes_bill_the_published_rate_per_lifetime(
 @pytest.mark.parametrize(
     ("model_id", "short", "long"),
     [
-        ("gemini-pro-3.1", (2.0, 12.0, 0.2), (4.0, 18.0, 0.4)),
-        ("gemini-pro-2.5", (1.25, 10.0, 0.125), (2.5, 15.0, 0.25)),
+        ("gemini-3.1-pro-preview", (2.0, 12.0, 0.2), (4.0, 18.0, 0.4)),
+        ("gemini-2.5-pro", (1.25, 10.0, 0.125), (2.5, 15.0, 0.25)),
     ],
 )
 def test_gemini_prompts_over_200k_bill_the_published_rate(
@@ -460,57 +447,10 @@ def test_no_anthropic_window_needs_a_beta_header() -> None:
             assert not limits.request_betas, (row.model_id, tag)
 
 
-@pytest.mark.parametrize(
-    ("catalog_id", "wire_id"),
-    [
-        ("astra-6.0", "gpt-6-astra"),
-        ("sol-6.0", "gpt-6-sol"),
-        ("luna-6.0", "gpt-6-luna"),
-        ("terra-5.6", "gpt-5.6-terra"),
-        ("fable-5.1", "claude-fable-5-1"),
-        ("mythos-5.1", "claude-mythos-5-1"),
-        ("opus-5.5", "claude-opus-5-5"),
-        ("sonnet-5.5", "claude-sonnet-5-5"),
-        ("sol-6.1", "gpt-6.1-sol"),
-        ("sonnet-5.0", "claude-sonnet-5"),
-        ("haiku-4.5", "claude-haiku-4-5"),
-        ("opus-4.8", "claude-opus-4-8"),
-        ("opus-4.7", "claude-opus-4-7"),
-        ("opus-4.6", "claude-opus-4-6"),
-        ("opus-4.5", "claude-opus-4-5"),
-        ("sonnet-4.6", "claude-sonnet-4-6"),
-        ("sonnet-4.5", "claude-sonnet-4-5"),
-    ],
-)
-def test_simple_catalog_ids_are_distinct_from_vendor_wire_ids(
-    catalog_id: str,
-    wire_id: str,
-) -> None:
-    rows = {**openai.models(), **anthropic.models()}
-    row = rows[catalog_id]
-    assert row.model_id == catalog_id
-    assert row.wire_model_id == wire_id
-    assert wire_id not in rows
-
-
 def test_no_catalog_declares_a_latency_tag() -> None:
     for module in _VENDORS:
         for model_id in _models(module):
             assert "+fast" not in model_id
-
-
-def test_sonnet_5_5_is_the_newest_sonnet_at_its_published_rate() -> None:
-    rows = anthropic.models()
-    assert rows["sonnet-5.5"].wire_model_id == "claude-sonnet-5-5"
-    assert rows["sonnet-5.5"].prices[PriceKey("auto")] == TokenPrice(
-        request=2.0,
-        response=10.0,
-        cache_write=2.5,
-        cache_write_1h=4.0,
-        cache_read=0.2,
-    )
-    assert rows["utility"].model_id == "sonnet-5.5"
-    assert rows["sonnet"].model_id == "sonnet-5.5"
 
 
 if __name__ == "__main__":

@@ -2224,7 +2224,7 @@ def test_append_session_writes_persistent_agent_lifecycle(tmp_path: Path) -> Non
         "thinking_budget": "none",
         "thinking_output": "none",
         "show_thinking": True,
-        "effort": "none",
+        "effort": "default",
         "cache_ttl_sec": 300.0,
         "service_tier": "auto",
         "max_budget_usd": None,
@@ -2552,6 +2552,29 @@ def test_a_mistyped_splice_field_keeps_the_splice(tmp_path: Path) -> None:
 def test_meta_legacy_record_restores_own_spend_from_spend() -> None:
     meta = SessionMeta.deserialize({"spend": {"request": 0.25}})
     assert meta.own_spend.request == 0.25
+
+
+def test_session_meta_round_trips_the_thinking_selection() -> None:
+    src = SessionMeta(
+        thinking_effort="xhigh",
+        thinking_budget="auto",
+        thinking_output="redacted",
+    )
+    back = SessionMeta.deserialize(src.serialize())
+    assert (back.thinking_effort, back.thinking_budget, back.thinking_output) == (
+        "xhigh",
+        "auto",
+        "redacted",
+    )
+
+
+def test_meta_from_before_thinking_was_recorded_leaves_it_blank() -> None:
+    meta = SessionMeta.deserialize({"session_id": "s", "thinking_effort": 3})
+    assert (meta.thinking_effort, meta.thinking_budget, meta.thinking_output) == (
+        "",
+        "",
+        "",
+    )
 
 
 _NO_ARGS: Mapping[str, object] = {}

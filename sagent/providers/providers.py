@@ -32,13 +32,77 @@ PROVIDER_NAMES: Final[tuple[ProviderName, ...]] = cast(
     get_args(ProviderName.__value__),
 )
 
+# Short aliases accepted everywhere a provider name is parsed. Adding an alias
+# is one line here; every entry point canonicalizes through the same table.
+PROVIDER_ALIASES: Final[dict[str, ProviderName]] = {
+    "oai": "OpenAI",
+    "oaisub": "OpenAISubscription",
+    "ant": "Anthropic",
+    "antsub": "AnthropicCLI",
+}
+
+# Case-insensitive lookup over class names and aliases alike.
+_PROVIDER_LOOKUP: Final[dict[str, ProviderName]] = {
+    **{name.lower(): name for name in PROVIDER_NAMES},
+    **{alias.lower(): target for alias, target in PROVIDER_ALIASES.items()},
+}
+assert len(_PROVIDER_LOOKUP) == len(PROVIDER_NAMES) + len(PROVIDER_ALIASES), (
+    "a PROVIDER_ALIASES key collides with a provider class name"
+)
+
+
+class UnknownProviderError(ValueError):
+    """Provider name or alias that matches nothing in ``PROVIDER_NAMES``."""
+
+
+def _unknown_provider_message(name: str) -> str:
+    alias_hint = ", ".join(
+        f"{alias}={target}" for alias, target in PROVIDER_ALIASES.items()
+    )
+    return (
+        f"unknown provider {name.strip()!r}; valid providers:"
+        f" {', '.join(PROVIDER_NAMES)} (aliases: {alias_hint})"
+    )
+
+
+def canonical_provider(name: str) -> str:
+    """Resolve an alias or case variant to the canonical provider class name.
+
+    Unknown names pass through (stripped) so callers that accept names beyond
+    ``PROVIDER_NAMES`` -- test stubs, per-tool allow-lists -- still work;
+    use :func:`require_provider` where an unknown name must be an error.
+
+    Args:
+      name: Provider class name, alias, or case variant (e.g. ``"oai"``).
+
+    Returns:
+      canonical: The class name (e.g. ``"OpenAI"``), or ``name`` stripped.
+
+    """
+    stripped = name.strip()
+    return _PROVIDER_LOOKUP.get(stripped.lower(), stripped)
+
+
+def require_provider(name: str) -> ProviderName:
+    """Return the canonical provider class name, raising on unknown names.
+
+    Raises:
+      UnknownProviderError: Listing the valid class names and aliases.
+
+    """
+    canonical = canonical_provider(name)
+    if canonical in PROVIDER_NAMES:
+        return canonical
+    raise UnknownProviderError(_unknown_provider_message(name))
+
+
 # Maps API-key provider names to their account-auth (subscription /
 # credentials-file) variant. When ``infer_provider`` sees a model_id
-# whose catalog row maps to an API-key provider (e.g. ``opus-4.8`` →
+# whose catalog row maps to an API-key provider (e.g. ``claude-opus-4-8`` →
 # ``Anthropic``) AND the user's *current* provider is the account
 # variant (e.g. ``AnthropicCLI``), the inference resolves to the
 # account variant + ``credentials`` auth instead of the API-key path.
-# Without this, ``AgentSelf(model_id="sonnet-4.6")`` from an
+# Without this, ``AgentSelf(model_id="claude-sonnet-4-6")`` from an
 # AnthropicCLI-backed agent would silently try to build a fresh
 # Anthropic API provider, requiring ``ANTHROPIC_API_KEY`` to be set.
 _ACCOUNT_OVERRIDES: Final[dict[str, str]] = {
@@ -54,7 +118,7 @@ def infer_provider(
     """Infer ``(provider, auth)`` from a local path or catalog membership.
 
     Args:
-      model_id: Model identifier (e.g. ``"sonnet-4.6"``).
+      model_id: Model identifier (e.g. ``"claude-sonnet-4-6"``).
       current_provider: Name of the currently active provider.
 
     Returns:
@@ -68,6 +132,7 @@ def infer_provider(
     if model_id.startswith(("/", "./", "../", "~/")):
         return ("SelfHosted", model_id)
 
+    current_provider = canonical_provider(current_provider)
     if _provider_accepts(current_provider, model_id):
         return None
     prefer_account = current_provider in _ACCOUNT_PROVIDERS
@@ -86,21 +151,27 @@ def infer_provider(
 
 
 def provider_class(provider_name: str) -> type | None:
-    """Look a provider class up by name on the ``providers`` package facade.
+    """Look a provider class up by canonical name or alias.
 
-    The facade is the registry: every provider is re-exported there, and
-    reading it through ``sys.modules`` keeps this module -- and the agent
-    layer that calls it -- below the facade in the import graph.
+    Only names registered in ``PROVIDER_NAMES`` resolve: other facade
+    attributes such as ``SelfHostedModel`` are models or helpers, not
+    providers, and must not be dispatchable here. The facade itself stays
+    the class registry -- reading it through ``sys.modules`` keeps this
+    module below the facade in the import graph.
 
     Args:
-      provider_name: Provider class name (e.g. ``"Anthropic"``).
+      provider_name: Provider class name or alias (e.g. ``"Anthropic"``,
+          ``"ant"``); case-insensitive.
 
     Returns:
       cls: The provider class, or ``None`` when the name is unknown.
 
     """
+    canonical = canonical_provider(provider_name)
+    if canonical not in PROVIDER_NAMES:
+        return None
     providers = sys.modules["sagent.providers"]
-    cls = getattr(providers, provider_name, None)
+    cls = getattr(providers, canonical, None)
     return cls if isinstance(cls, type) else None
 
 
@@ -128,7 +199,7 @@ def build_provider(
     """
     cls = provider_class(provider_name)
     if cls is None:
-        raise AttributeError(f"unknown provider {provider_name!r}")
+        raise AttributeError(_unknown_provider_message(provider_name))
     factory = getattr(cls, f"from_{auth}", None)
     if factory is None:
         raise AttributeError(
@@ -180,17 +251,18 @@ def default_auth_for_provider(provider_name: str) -> str:
       AttributeError: If the provider class is unknown or has no defaultable auth.
 
     """
+    canonical = canonical_provider(provider_name)
     cls = provider_class(provider_name)
     if cls is None:
-        raise AttributeError(f"unknown provider {provider_name!r}")
-    if provider_name.endswith(("CLI", "Subscription")) and hasattr(
+        raise AttributeError(_unknown_provider_message(provider_name))
+    if canonical.endswith(("CLI", "Subscription")) and hasattr(
         cls,
         "from_credentials",
     ):
         return "credentials"
     if hasattr(cls, "from_env"):
         return "env"
-    raise AttributeError(f"provider {provider_name!r} has no default auth method")
+    raise AttributeError(f"provider {canonical!r} has no default auth method")
 
 
 def _catalog_provider(model_id: str) -> str | None:

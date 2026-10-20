@@ -1,30 +1,31 @@
 """Which model a name means, and what it can do over one transport.
 
-A vendor catalog is a :class:`ModelTable`: its rows, newest-first within
-each family, plus a few roles (``default``, ``utility``, ``best``). Its keys
-are the exact names, each ``family-major.minor`` (``opus-5.0``, never
-``opus-5``). One name reaches a row four ways, in this order:
+A vendor catalog is a :class:`ModelTable`: its rows, each keyed by the id the
+vendor's API takes and reports back (``claude-opus-5-5``, ``gpt-5.6-sol``,
+``MiniMax-M3``), plus three explicit name maps. One name reaches a row four
+ways, in this order:
 
-1. its exact name (``opus-5.5``);
-2. its vendor wire id (``claude-opus-5-5``);
-3. a role, which names a family or an exact name (``default`` -> ``opus``);
-4. a family, alone or with a major, which means its newest row
-   (``opus`` and ``opus-5`` -> ``opus-5.5``; ``opus-4`` -> ``opus-4.8``).
-   The family is everything before the last ``-``, so ``gemini-flash``
-   never reaches ``gemini-flash-lite-3.5``.
+1. its vendor id (``claude-opus-5-5``). A vendor alias and the snapshot it
+   points at are both vendor ids, so each is its own row carrying the same
+   facts (``claude-haiku-4-5`` and ``claude-haiku-4-5-20251001``): the
+   request sends exactly what was named, and a response reporting either
+   prices at its own row;
+2. a Sagent role (``default``, ``utility``, ``best``);
+3. a current Sagent convenience alias (``sol``);
+4. a retired Sagent spelling (``opus-5.5``), so sessions and settings saved
+   before rows were keyed by vendor id still load. Resolution returns the
+   vendor id, so a retired spelling is translated once and never saved again.
 
-The order is the precedence: a vendor id that is also a family's spelling
-(``gpt-4``, ``qwen-plus``) names its own row, since a server reporting it
-back means that model and billing it at the family's newest would misprice.
-
-Because exact names always carry a minor version, a major alone is never an
-exact name: ``sonnet-5`` is the newest ``sonnet-5.x``. Because rows are
-newest-first, adding a release moves every prefix and every role that points
-at its family, with no alias to edit.
+Nothing is inferred from how an id is spelled. Vendors share no grammar
+(``claude-opus-4-5``, ``gpt-5.4-mini``, ``qwen3.6-max-preview``,
+``MiniMax-M2.7``), and which id is "newest" or what an alias points at is a
+fact only the vendor can state: a table that guessed it from a prefix and row
+order silently moved every role when a row was added. A name that reaches no
+row is unknown, and the error lists what is known.
 
 :class:`ModelCatalog` meets a table with one transport and resolves a
-possibly context-tagged name (``opus+1m``) to a capability and the settings
-that name selected.
+possibly context-tagged name (``claude-opus-5-5+200k``) to a capability and
+the settings that name selected.
 """
 
 from __future__ import annotations
@@ -34,6 +35,9 @@ from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Final, cast, get_args, override
 
+import logging
+
+from sagent.catalog.provenance import Fact, Source
 from sagent.types.capability import (
     ContextTag,
     ModelCapability,
@@ -50,6 +54,12 @@ __all__ = [
     "base_model_id",
     "split_model_id",
 ]
+
+logger = logging.getLogger(__name__)
+
+# Every response of a session reports the same served id, so one warning per id
+# says it; one per response would bury the log.
+_unlisted_served: set[str] = set()
 
 
 # Derived from ``ContextTag``, not restated: a tag the type admits but a
@@ -104,38 +114,92 @@ def base_model_id(model_id: str) -> str:
     return split_model_id(model_id)[0]
 
 
+def _frozen() -> Mapping[str, str]:
+    return MappingProxyType(dict[str, str]())
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ModelTable(Mapping[str, ModelCapability]):
-    """A vendor's rows, keyed by exact name and reachable by wire id, role, or prefix.
+    """Vendor rows reachable by exact id, role, alias, or retired name.
 
-    Iterating yields exact names only: a role or prefix is a way to name a
-    row, not another model.
+    Iterating yields vendor ids only: name maps are ways to select a row, not
+    additional models.
     """
 
     rows: tuple[ModelCapability, ...]
-    """Every row, newest-first within each family."""
+    """Every row; order carries no meaning."""
 
-    roles: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
-    """Role name to the family or id it means (``{"default": "opus"}``)."""
+    roles: Mapping[str, str] = field(default_factory=_frozen)
+    """Sagent role to the vendor id it means (``{"default": "claude-opus-5-5"}``)."""
+
+    aliases: Mapping[str, str] = field(default_factory=_frozen)
+    """Current convenience name to an exact vendor id (``{"sol": "gpt-6.1-sol"}``)."""
+
+    renamed: Mapping[str, str] = field(default_factory=_frozen)
+    """Retired Sagent spelling to its vendor id; accepted, never produced."""
+
+    sources: Mapping[Fact, Source] = field(
+        default_factory=lambda: MappingProxyType(dict[Fact, Source]()),
+    )
+    """Where every row's facts were read, per fact group."""
+
+    row_sources: Mapping[str, Mapping[Fact, Source]] = field(
+        default_factory=lambda: MappingProxyType(dict[str, Mapping[Fact, Source]]()),
+    )
+    """Vendor id to the groups its row read from a page other than ``sources``."""
 
     _by_id: Mapping[str, ModelCapability] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        """Index rows and check every role names a row."""
+        """Index rows; check each name points at a row and shadows nothing."""
         by_id: dict[str, ModelCapability] = {}
         for row in self.rows:
             if row.model_id in by_id:
                 raise ValueError(f"duplicate model id {row.model_id!r}")
             by_id[row.model_id] = row
         object.__setattr__(self, "_by_id", MappingProxyType(by_id))
-        object.__setattr__(self, "roles", MappingProxyType(dict(self.roles)))
-        for role, target in self.roles.items():
-            if self._named(target) is None:
-                raise ValueError(f"role {role!r} names no model: {target!r}")
+        object.__setattr__(self, "sources", MappingProxyType(dict(self.sources)))
+        stray = sorted(self.row_sources.keys() - by_id.keys())
+        if stray:
+            raise ValueError(f"sources for no model: {', '.join(stray)}")
+        object.__setattr__(
+            self,
+            "row_sources",
+            MappingProxyType(
+                {mid: MappingProxyType(dict(s)) for mid, s in self.row_sources.items()},
+            ),
+        )
+        roles = MappingProxyType(dict(self.roles))
+        aliases = MappingProxyType(dict(self.aliases))
+        renamed = MappingProxyType(dict(self.renamed))
+        object.__setattr__(self, "roles", roles)
+        object.__setattr__(self, "aliases", aliases)
+        object.__setattr__(self, "renamed", renamed)
+        name_maps = (
+            ("role", roles),
+            ("alias", aliases),
+            ("retired name", renamed),
+        )
+        for kind, names in name_maps:
+            for name, target in names.items():
+                if target not in by_id:
+                    raise ValueError(f"{kind} {name!r} names no model: {target!r}")
+                if name in by_id:
+                    raise ValueError(f"{kind} {name!r} shadows a model id")
+        for i, (left_kind, left) in enumerate(name_maps):
+            for right_kind, right in name_maps[i + 1 :]:
+                clash = sorted(left.keys() & right.keys())
+                if clash:
+                    left_article = "an" if left_kind == "alias" else "a"
+                    right_article = "an" if right_kind == "alias" else "a"
+                    raise ValueError(
+                        f"both {left_article} {left_kind} and"
+                        f" {right_article} {right_kind}: {', '.join(clash)}",
+                    )
 
     @override
     def __getitem__(self, key: str) -> ModelCapability:
-        row = self._resolved(key)
+        row = self._named(key)
         if row is None:
             raise KeyError(key)
         return row
@@ -150,49 +214,48 @@ class ModelTable(Mapping[str, ModelCapability]):
 
     @override
     def __contains__(self, key: object) -> bool:
-        return isinstance(key, str) and self._resolved(key) is not None
+        return isinstance(key, str) and self._named(key) is not None
 
-    def exact(self, name: str) -> ModelCapability | None:
-        """Return the row whose exact name or wire id is ``name``, never a guess.
+    def exact(self, model_id: str) -> ModelCapability | None:
+        """Return the row whose vendor id is ``model_id``, never via a name map.
 
-        For ids a server reports back: billing ``gpt-5`` at the newest
-        ``gpt-5.x`` because the prefix matched would misprice it silently.
+        For ids a server reports back: a role or retired name is Sagent's
+        spelling, and no server reports it.
 
         Args:
-          name: Exact catalog name or vendor wire id.
+          model_id: Vendor id.
 
         Returns:
           row: The row, or ``None`` when no row carries that id.
 
         """
-        row = self._by_id.get(name)
-        if row is not None:
-            return row
-        return next((row for row in self.rows if row.wire_model_id == name), None)
+        return self._by_id.get(model_id)
 
-    def _resolved(self, key: str) -> ModelCapability | None:
-        """Return the row ``key`` names, in the module's precedence order."""
-        row = self.exact(key)
-        return row if row is not None else self._named(self.roles.get(key, key))
+    def source(self, model_id: str, fact: Fact) -> Source | None:
+        """Return where the row with vendor id ``model_id`` read ``fact``.
 
-    # A prefix names a whole family, optionally with a major: ``opus`` and
-    # ``opus-5`` name ``opus-*``; ``opu`` names nothing, and ``gemini-flash``
-    # never reaches ``gemini-flash-lite-*``, a different family.
-    def _named(self, name: str) -> ModelCapability | None:
-        """Return the row ``name`` means by exact name, wire id, or prefix."""
-        row = self.exact(name)
-        if row is not None:
-            return row
-        return next((row for row in self.rows if _in_family(row.model_id, name)), None)
+        Args:
+          model_id: Vendor id.
+          fact: The fact group asked about.
 
+        Returns:
+          source: The row's own source for ``fact``, else the table's; ``None``
+            when neither names one.
 
-def _in_family(model_id: str, name: str) -> bool:
-    """Whether ``name`` is ``model_id``'s family, or its family plus a version prefix."""
-    family, _, version = model_id.rpartition("-")
-    if name == family:
-        return True
-    head, _, major = name.rpartition("-")
-    return head == family and (version == major or version.startswith(f"{major}."))
+        """
+        own = self.row_sources.get(model_id)
+        if own is not None and fact in own:
+            return own[fact]
+        return self.sources.get(fact)
+
+    def _named(self, key: str) -> ModelCapability | None:
+        """Return the row ``key`` names in the documented precedence order."""
+        target = (
+            key
+            if key in self._by_id
+            else self.roles.get(key, self.aliases.get(key, self.renamed.get(key)))
+        )
+        return self._by_id.get(target) if target is not None else None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -200,19 +263,60 @@ class ModelCatalog:
     """A vendor table met with one transport."""
 
     models: ModelTable
-    """The rows, roles, and families the transport serves."""
+    """The rows and names the transport serves."""
 
     transport: ModelCapability
     """What the transport allows; met with every row it resolves."""
+
+    def served(
+        self,
+        requested: ModelCapability,
+        served_model_id: str,
+    ) -> ModelCapability:
+        """Return the row a response bills at: the one the server says it ran.
+
+        A response names the snapshot an alias resolved to, or another model
+        the vendor fell back to, and that row's prices are the ones charged.
+        Only an exact vendor id of THIS catalog counts: a server never reports
+        a Sagent role, and two transports of one vendor may list different
+        rows for the same id.
+
+        Args:
+          requested: The capability the request was built from.
+          served_model_id: The id the response reports; blank when it reports
+            none.
+
+        Returns:
+          capability: The served row met with this transport, or ``requested``
+            when the response named none, named the requested row, or named
+            an id no row lists (logged, since the bill then rests on a row
+            the server did not run).
+
+        """
+        if not served_model_id or served_model_id == requested.model_id:
+            return requested
+        row = self.models.exact(served_model_id)
+        if row is None:
+            if served_model_id not in _unlisted_served:
+                _unlisted_served.add(served_model_id)
+                logger.warning(
+                    "server ran %r, which no catalog row lists; "
+                    "pricing at the requested %r",
+                    served_model_id,
+                    requested.model_id,
+                )
+            return requested
+        return row & self.transport
 
     def resolve(self, model_id: str) -> tuple[ModelCapability, ModelSettings]:
         """Resolve a possibly context-tagged name against this transport.
 
         Args:
-          model_id: Catalog id, wire id, role, or family, optionally tagged.
+          model_id: Vendor id, role, alias, or retired name, optionally tagged.
 
         Returns:
-          capability: The row narrowed by the transport.
+          capability: The row narrowed by the transport; its ``model_id`` is
+            the vendor id, whichever name reached it.
           settings: Settings selecting the requested context.
 
         Raises:
@@ -229,10 +333,22 @@ class ModelCatalog:
         context: ContextTag = tags[0] if tags else ""
         row = self.models.get(base)
         if row is None:
-            known = ", ".join([*self.models, *self.models.roles])
-            raise UnknownModelError(
-                f"Unknown model {model_id!r}. Known models: {known}",
-            )
+            lines = [f"Unknown model {model_id!r}."]
+            for heading, names in (
+                ("Aliases", self.models.aliases),
+                ("Roles", self.models.roles),
+            ):
+                if names:
+                    lines.extend(
+                        [
+                            "",
+                            f"{heading}:",
+                            *[f"  {k} -> {v}" for k, v in names.items()],
+                        ],
+                    )
+            known = ", ".join(self.models) or "none"
+            lines.extend(["", "Known models:", f"  {known}"])
+            raise UnknownModelError("\n".join(lines))
         capability = row & self.transport
         # A window the default context already spans needs no row of its own.
         if (

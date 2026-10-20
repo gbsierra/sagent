@@ -744,7 +744,7 @@ class _GoogleCLIModel(CLISubprocessModel, ModelDefaults):
         )
         system_hash = hash_system(system)
         workdir = tmpdir / "workdir"
-        model_id = self.capability.wire_model_id or self.capability.model_id
+        model_id = self.capability.model_id
         proc = Subproc(
             ["gemini", "--experimental-acp", "--model", model_id],
             env=_google_subprocess_env(tmpdir),

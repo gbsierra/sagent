@@ -1,39 +1,21 @@
-"""Tests for the Gemini catalog: published facts and the thinking wire."""
+"""Tests for the Gemini catalog's published facts."""
 
 from __future__ import annotations
 
 from datetime import date
+from typing import TYPE_CHECKING
 
 import pytest
 
 from sagent.catalog import google
-from sagent.types.capability import (
-    ModelCapability,
-    ModelSettings,
-    ThinkingBudget,
-    ThinkingEffort,
-)
 
 
-def _wire(
-    model_id: str,
-    *,
-    effort: ThinkingEffort = "none",
-    budget: ThinkingBudget = "fixed",
-) -> object:
-    """Return the ``thinkingConfig`` one selection sends on ``model_id``."""
-    row = google.models()[model_id]
-    settings = ModelSettings(
-        capability=row,
-        thinking_effort=effort,
-        thinking_budget=budget,
-        thinking_output="text",
-    )
-    return google.thinking_config(row, settings)
+if TYPE_CHECKING:
+    from sagent.types.capability import ModelCapability
 
 
 @pytest.mark.parametrize(
-    ("model_id", "wire_id"),
+    ("retired", "vendor_id"),
     [
         ("gemini-pro-3.1", "gemini-3.1-pro-preview"),
         ("gemini-pro-2.5", "gemini-2.5-pro"),
@@ -48,15 +30,14 @@ def _wire(
         ("gemini-flash-lite-2.5", "gemini-2.5-flash-lite"),
     ],
 )
-def test_a_catalog_id_names_the_vendor_wire_id(model_id: str, wire_id: str) -> None:
-    """The vendor id keeps resolving, to the same row."""
+def test_a_retired_sagent_name_reaches_its_vendor_row(
+    retired: str,
+    vendor_id: str,
+) -> None:
+    """A session saved under the old spelling loads as the vendor id."""
     rows = google.models()
-    assert rows[model_id].wire_model_id == wire_id
-    assert rows[wire_id].model_id == model_id
-
-
-def test_every_row_carries_its_wire_id() -> None:
-    assert all(row.wire_model_id for row in google.models().values())
+    assert rows[retired].model_id == vendor_id
+    assert rows.exact(retired) is None
 
 
 @pytest.mark.parametrize(
@@ -69,22 +50,22 @@ def test_shut_down_models_are_gone(model_id: str) -> None:
 
 def test_roles_follow_googles_guidance_for_new_projects() -> None:
     rows = google.models()
-    assert rows["default"].model_id == "gemini-pro-3.1"
-    assert rows["utility"].model_id == "gemini-flash-lite-3.5"
+    assert rows["default"].model_id == "gemini-3.1-pro-preview"
+    assert rows["utility"].model_id == "gemini-3.5-flash-lite"
 
 
 @pytest.mark.parametrize(
     ("model_id", "standard"),
     [
-        ("gemini-flash-3.8", (0.75, 3.75, 0.075)),
-        ("gemini-flash-3.7", (0.75, 3.75, 0.075)),
-        ("gemini-flash-3.6", (0.75, 3.75, 0.075)),
-        ("gemini-flash-3.5", (1.5, 9.0, 0.15)),
-        ("gemini-flash-lite-3.5", (0.3, 2.5, 0.03)),
-        ("gemini-flash-lite-3.1", (0.25, 1.5, 0.025)),
-        ("gemini-flash-3.0", (0.5, 3.0, 0.05)),
-        ("gemini-flash-2.5", (0.3, 2.5, 0.03)),
-        ("gemini-flash-lite-2.5", (0.1, 0.4, 0.01)),
+        ("gemini-3.8-flash", (0.75, 3.75, 0.075)),
+        ("gemini-3.7-flash", (0.75, 3.75, 0.075)),
+        ("gemini-3.6-flash", (0.75, 3.75, 0.075)),
+        ("gemini-3.5-flash", (1.5, 9.0, 0.15)),
+        ("gemini-3.5-flash-lite", (0.3, 2.5, 0.03)),
+        ("gemini-3.1-flash-lite", (0.25, 1.5, 0.025)),
+        ("gemini-3-flash-preview", (0.5, 3.0, 0.05)),
+        ("gemini-2.5-flash", (0.3, 2.5, 0.03)),
+        ("gemini-2.5-flash-lite", (0.1, 0.4, 0.01)),
     ],
 )
 def test_a_row_bills_the_published_2026_rate(
@@ -101,7 +82,7 @@ def test_a_row_bills_the_published_2026_rate(
 
 @pytest.mark.parametrize(
     "model_id",
-    ["gemini-flash-3.8", "gemini-flash-3.7", "gemini-flash-3.6"],
+    ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash"],
 )
 def test_the_introductory_flash_rate_doubles_on_2027_01_01(model_id: str) -> None:
     prices = google.models()[model_id].prices
@@ -122,17 +103,17 @@ def test_every_row_has_the_published_windows(model_id: str) -> None:
 @pytest.mark.parametrize(
     ("model_id", "cutoff"),
     [
-        ("gemini-pro-3.1", "January 2025"),
-        ("gemini-flash-lite-3.1", "January 2025"),
-        ("gemini-flash-3.0", "January 2025"),
-        ("gemini-pro-2.5", "January 2025"),
-        ("gemini-flash-2.5", "January 2025"),
-        ("gemini-flash-lite-2.5", "January 2025"),
-        ("gemini-flash-3.8", None),
-        ("gemini-flash-3.7", None),
-        ("gemini-flash-3.6", None),
-        ("gemini-flash-3.5", None),
-        ("gemini-flash-lite-3.5", None),
+        ("gemini-3.1-pro-preview", "January 2025"),
+        ("gemini-3.1-flash-lite", "January 2025"),
+        ("gemini-3-flash-preview", "January 2025"),
+        ("gemini-2.5-pro", "January 2025"),
+        ("gemini-2.5-flash", "January 2025"),
+        ("gemini-2.5-flash-lite", "January 2025"),
+        ("gemini-3.8-flash", None),
+        ("gemini-3.7-flash", None),
+        ("gemini-3.6-flash", None),
+        ("gemini-3.5-flash", None),
+        ("gemini-3.5-flash-lite", None),
     ],
 )
 def test_knowledge_cutoff_is_stated_only_where_published(
@@ -145,14 +126,14 @@ def test_knowledge_cutoff_is_stated_only_where_published(
 @pytest.mark.parametrize(
     ("model_id", "efforts"),
     [
-        ("gemini-flash-3.8", {"none", "low", "medium", "high"}),
-        ("gemini-flash-3.7", {"none", "low", "medium", "high"}),
-        ("gemini-pro-3.1", {"none", "low", "medium", "high"}),
-        ("gemini-flash-3.6", {"none", "min", "low", "medium", "high"}),
-        ("gemini-flash-3.5", {"none", "min", "low", "medium", "high"}),
-        ("gemini-flash-lite-3.5", {"none", "min", "low", "medium", "high"}),
-        ("gemini-flash-lite-3.1", {"none", "min", "low", "medium", "high"}),
-        ("gemini-flash-3.0", {"none", "min", "low", "medium", "high"}),
+        ("gemini-3.8-flash", {"default", "low", "medium", "high"}),
+        ("gemini-3.7-flash", {"default", "low", "medium", "high"}),
+        ("gemini-3.1-pro-preview", {"default", "low", "medium", "high"}),
+        ("gemini-3.6-flash", {"default", "min", "low", "medium", "high"}),
+        ("gemini-3.5-flash", {"default", "min", "low", "medium", "high"}),
+        ("gemini-3.5-flash-lite", {"default", "min", "low", "medium", "high"}),
+        ("gemini-3.1-flash-lite", {"default", "min", "low", "medium", "high"}),
+        ("gemini-3-flash-preview", {"default", "min", "low", "medium", "high"}),
     ],
 )
 def test_a_gemini_3_row_offers_only_the_levels_it_accepts(
@@ -163,53 +144,6 @@ def test_a_gemini_3_row_offers_only_the_levels_it_accepts(
     row = google.models()[model_id]
     assert row.thinking.effort == efforts
     assert row.effort_as_level
-
-
-@pytest.mark.parametrize(
-    "model_id",
-    ["gemini-pro-2.5", "gemini-flash-2.5", "gemini-flash-lite-2.5"],
-)
-def test_gemini_2_5_takes_a_budget_not_a_level(model_id: str) -> None:
-    assert not google.models()[model_id].effort_as_level
-    assert _wire(model_id, effort="max") == {
-        "includeThoughts": True,
-        "thinkingBudget": 24_576,
-    }
-    assert _wire(model_id, budget="auto") == {
-        "includeThoughts": True,
-        "thinkingBudget": -1,
-    }
-
-
-@pytest.mark.parametrize(
-    ("effort", "level"),
-    [("min", "minimal"), ("low", "low"), ("medium", "medium"), ("high", "high")],
-)
-def test_gemini_3_sends_the_effort_as_a_level(
-    effort: ThinkingEffort,
-    level: str,
-) -> None:
-    assert _wire("gemini-flash-3.6", effort=effort) == {
-        "includeThoughts": True,
-        "thinkingLevel": level,
-    }
-
-
-@pytest.mark.parametrize("budget", ["auto", "fixed"])
-def test_gemini_3_never_sends_a_token_budget(budget: ThinkingBudget) -> None:
-    """``thinkingBudget`` is backward-compat only on Gemini 3."""
-    sent = _wire("gemini-pro-3.1", effort="high", budget=budget)
-    assert sent == {"includeThoughts": True, "thinkingLevel": "high"}
-
-
-@pytest.mark.parametrize("model_id", ["gemini-flash-3.8", "gemini-pro-2.5"])
-def test_effort_none_leaves_the_models_default_in_place(model_id: str) -> None:
-    """No level and no cap: never an explicit "off" a model may reject."""
-    assert _wire(model_id) == {"includeThoughts": True}
-
-
-def test_budget_none_sends_no_thinking_config() -> None:
-    assert _wire("gemini-flash-2.5", budget="none") is None
 
 
 @pytest.mark.parametrize(

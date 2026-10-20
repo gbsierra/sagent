@@ -9,7 +9,7 @@ Usage::
 
     provider = Anthropic.from_key("sk-ant-...")
     # or: Anthropic.from_env()  (reads ANTHROPIC_API_KEY)
-    sonnet = provider.model("sonnet-4.6")
+    sonnet = provider.model("claude-sonnet-4-6")
     response = await sonnet.buffer(request)
 """
 
@@ -56,7 +56,7 @@ else:
     image = lazy_import("sagent.lib.image")
 
 
-from sagent.catalog.anthropic import api, models, usage_tokens
+from sagent.catalog.anthropic import api, models
 from sagent.catalog.table import ModelCatalog
 from sagent.lib import debug_log
 from sagent.lib.codec import MutablePlainTree, from_plain, mutable
@@ -74,6 +74,7 @@ from sagent.providers.lib.model_base import ModelDefaults
 from sagent.providers.lib.perloop import PerLoop
 from sagent.providers.lib.stop_reason import normalize_stop_reason
 from sagent.providers.lib.usage import anthropic_usage
+from sagent.types.cost import TokenCount
 from sagent.types.model import (
     ModelRequest,
     ModelResponse,
@@ -749,7 +750,7 @@ class _AnthropicModel(ModelDefaults):
         has_thinking = budget != "none"
         max_tok = request.max_response_tokens or self.limits.max_response_tokens
         kwargs: dict[str, object] = {
-            "model": self.capability.wire_model_id or self.capability.model_id,
+            "model": self.capability.model_id,
             "messages": messages,
             "max_tokens": max_tok,
             "temperature": request.temperature,
@@ -794,7 +795,7 @@ class _AnthropicModel(ModelDefaults):
             ]
         # A row advertising only ``none`` claims the model rejects
         # ``output_config`` (the 4-5 generation); sending one earns a 400.
-        if self.settings.thinking_effort != "none":
+        if self.settings.thinking_effort != "default":
             kwargs["output_config"] = {"effort": self.settings.thinking_effort}
         # The API's ``service_tier`` takes only ``auto`` / ``standard_only``; the
         # catalog spells the latter ``default``. ``priority`` is fast mode, which
@@ -936,7 +937,7 @@ class _AnthropicModel(ModelDefaults):
                     ) from e
                 raise
             break
-        resp = _parse_response(raw, self)
+        resp = _parse_response(raw, self, self._provider.catalog)
         self._last_response_time = time.time()
         # Clear stale usage when a path yields no headers, so ``usage_snapshot``
         # never reports a prior request's windows for the current one.
@@ -1344,9 +1345,45 @@ class _RawMessage(Protocol):
     def stop_sequence(self) -> str | None: ...
     @property
     def id(self) -> str: ...
+    @property
+    def model(self) -> str: ...
 
 
-def _parse_response(raw: _RawMessage, model: _AnthropicModel) -> ModelResponse:
+def _usage_tokens(usage: Mapping[str, object], *, cache_ttl_sec: float) -> TokenCount:
+    """Read one Messages-API ``usage`` block into disjoint meters.
+
+    ``cache_creation`` splits the write by lifetime. A block without it (an
+    older transcript) is attributed wholly to ``cache_ttl_sec``, the lifetime
+    the request asked for.
+
+    Args:
+      usage: The response's ``usage`` object, as a mapping.
+      cache_ttl_sec: Lifetime the request's cache breakpoints asked for.
+
+    Returns:
+      tokens: The request's usage.
+
+    """
+    written = from_plain(usage.get("cache_creation_input_tokens"), int, default=0)
+    split = from_plain(usage.get("cache_creation"), dict[str, object], default={})
+    if split:
+        written_1h = from_plain(split.get("ephemeral_1h_input_tokens"), int, default=0)
+    else:
+        written_1h = written if cache_ttl_sec >= 3600.0 else 0
+    return TokenCount(
+        request=from_plain(usage.get("input_tokens"), int, default=0),
+        response=from_plain(usage.get("output_tokens"), int, default=0),
+        cache_write=written - written_1h,
+        cache_write_1h=written_1h,
+        cache_read=from_plain(usage.get("cache_read_input_tokens"), int, default=0),
+    )
+
+
+def _parse_response(
+    raw: _RawMessage,
+    model: _AnthropicModel,
+    catalog: ModelCatalog,
+) -> ModelResponse:
     """Convert Anthropic Message to ModelResponse with AssistantMessage."""
     text_parts: list[str] = []
     tool_calls: list[ToolCall] = []
@@ -1393,12 +1430,18 @@ def _parse_response(raw: _RawMessage, model: _AnthropicModel) -> ModelResponse:
     )
 
     usage = raw.usage.model_dump()
-    tokens = usage_tokens(usage, cache_ttl_sec=model.settings.cache_ttl_sec)
+    tokens = _usage_tokens(usage, cache_ttl_sec=model.settings.cache_ttl_sec)
     # Server-authoritative: a request that opted into fast mode but fell
     # back to standard speed reports ``usage.speed == "standard"`` and is
     # billed at standard rates.
     served_fast = usage.get("speed") == "fast"
-    spend = model.capability.prices.cost(
+    # Source: Messages API response field ``model``, the model that handled
+    # the request; an alias (``claude-haiku-4-5``) and its snapshot are each a
+    # row, so the reported one prices the turn.
+    # https://platform.claude.com/docs/en/api/http/messages/create (read 2026-10-17).
+    served_model_id = raw.model or ""
+    row = catalog.served(model.capability, served_model_id)
+    spend = row.prices.cost(
         tokens,
         service_tier="priority" if served_fast else "auto",
         at=datetime.now(UTC).date(),
@@ -1426,6 +1469,7 @@ def _parse_response(raw: _RawMessage, model: _AnthropicModel) -> ModelResponse:
         message_id=raw.id or "",
         request_id=getattr(raw, "_request_id", "") or "",
         spend=spend,
+        served_model_id=served_model_id,
     )
 
 

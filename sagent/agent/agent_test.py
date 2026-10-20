@@ -36,6 +36,7 @@ from sagent.agent.agent import (
     SystemPromptArg,
     _AgentCompactor,
     _AgentTool,
+    _pinned,
     _provider_knows_model,
     _repair_compact_payload,
     _resolve_target_spec,
@@ -158,6 +159,31 @@ from sagent.types.tools import (
     Tool,
     ToolResultPolicy,
 )
+
+
+def test_pinned_recipe_saves_the_exact_id_behind_an_alias() -> None:
+    requested = ModelRecipe(provider="OpenAI", auth="env", model_id="sol")
+    assert _pinned(requested) == ModelRecipe(
+        provider="OpenAI",
+        auth="env",
+        model_id="gpt-6.1-sol",
+    )
+
+
+@pytest.mark.parametrize(
+    ("alias", "canonical"),
+    providers.PROVIDER_ALIASES.items(),
+)
+def test_pinned_recipe_saves_canonical_provider_name(
+    alias: str,
+    canonical: str,
+) -> None:
+    requested = ModelRecipe(provider=alias, auth="stub", model_id="not-catalogued")
+    assert _pinned(requested) == ModelRecipe(
+        provider=canonical,
+        auth="stub",
+        model_id="not-catalogued",
+    )
 
 
 # Delegates to the real ``SummaryCompactor`` so a stub that stubs only the PREDICATE
@@ -2253,10 +2279,10 @@ def test_effort_rejects_a_value_outside_valid_efforts() -> None:
         a.model.settings.thinking_effort = "medium"
 
 
-def test_effort_accepts_none_unconditionally() -> None:
+def test_effort_accepts_default_unconditionally() -> None:
     a = _build_agent()
-    a.model.settings.thinking_effort = "none"
-    assert a.model.settings.thinking_effort == "none"
+    a.model.settings.thinking_effort = "default"
+    assert a.model.settings.thinking_effort == "default"
 
 
 def test_cache_ttl_rejects_more_than_the_model_caches() -> None:
@@ -2905,6 +2931,33 @@ def test_change_model_context_tag_rides_the_model_id(
     assert len(switches) == 1
 
 
+@pytest.mark.parametrize("name", ["utility", "sonnet-5.5", "utility+1m"])
+def test_change_model_pins_a_role_or_retired_name_to_its_vendor_id(
+    patched_build_provider: Mapping[str, object],
+    name: str,
+) -> None:
+    """The recipe saves the vendor id; the label notes the name typed once."""
+    del patched_build_provider
+    a = _build_agent_with_spec()
+    tag = "+1m" if name.endswith("+1m") else ""
+    resolved = providers.Anthropic.catalog.models[name.removesuffix(tag)].model_id + tag
+    assert resolved != name
+    target = a.change_model(model_id=name)
+    assert target.model_id == resolved
+    (switch,) = _drain_model_switches(a)
+    assert switch.label == f"claude-opus-4-7 -> {resolved} (as {name})"
+
+
+def test_change_model_label_is_the_vendor_id_alone_when_typed_exactly(
+    patched_build_provider: Mapping[str, object],
+) -> None:
+    del patched_build_provider
+    a = _build_agent_with_spec()
+    _ = a.change_model(model_id="claude-sonnet-4-6")
+    (switch,) = _drain_model_switches(a)
+    assert switch.label == "claude-opus-4-7 -> claude-sonnet-4-6"
+
+
 def test_change_model_cross_provider_no_model_preserves_current(
     patched_build_provider: Mapping[str, object],
 ) -> None:
@@ -3035,11 +3088,11 @@ def test_change_model_cross_provider_falls_back_to_default(
     monkeypatch: pytest.MonkeyPatch,
     patched_build_provider: Mapping[str, object],
 ) -> None:
-    """When current model isn't in new provider's catalog, use DEFAULT_MODEL.
+    """When current model isn't in new provider's catalog, use its default role.
 
     ``claude-opus-4-7`` is not in Google's catalog; with no
-    ``last_models`` entry recorded, resolution falls through to
-    ``Google.DEFAULT_MODEL``.
+    ``last_models`` entry recorded, resolution falls through to Google's
+    ``default`` role, saved as the vendor id that role names.
     """
     del patched_build_provider
 
@@ -3050,7 +3103,23 @@ def test_change_model_cross_provider_falls_back_to_default(
     a = _build_agent_with_spec(model_id="claude-opus-4-7")
     target = a.change_model(provider="Google", auth="env")
     assert target.provider == "Google"
-    assert target.model_id == "default"
+    assert target.model_id == providers.Google.catalog.models.roles["default"]
+
+
+def test_change_model_cross_provider_skips_a_last_model_the_catalog_dropped(
+    monkeypatch: pytest.MonkeyPatch,
+    patched_build_provider: Mapping[str, object],
+) -> None:
+    """A remembered id no row answers to falls back to the default role."""
+    del patched_build_provider
+
+    def _stale() -> dict[str, str]:
+        return {"Google": "gemini-0.1-retired"}
+
+    monkeypatch.setattr(last_models, "load", _stale)
+    a = _build_agent_with_spec(model_id="claude-opus-4-7")
+    target = a.change_model(provider="Google", auth="env")
+    assert target.model_id == providers.Google.catalog.models.roles["default"]
 
 
 def test_change_model_cross_provider_falls_back_to_last_models(
@@ -3148,7 +3217,7 @@ async def test_relogin_forwards_named_account() -> None:
     a.model_recipe = ModelRecipe(
         provider="OpenAISubscription",
         auth="credentials",
-        model_id="sol-5.6",
+        model_id="gpt-5.6-sol",
         account="work",
     )
     calls: list[str | None] = []
@@ -8821,12 +8890,19 @@ def test_swap_model_carries_a_selection_the_new_model_still_offers() -> None:
     assert a.model.settings.thinking_budget == "fixed"
 
 
-def test_swap_model_resets_effort_invalid_for_new_model() -> None:
-    """Effort outside the new model's ``valid_efforts`` resets to unset."""
+def test_swap_model_lowers_effort_to_the_nearest_rung_the_new_model_offers() -> None:
+    """Effort outside the new model's ``valid_efforts`` keeps thinking, not ``none``."""
     a = _build_agent(model=StubModel(valid_efforts=("low", "high")))
     a.model.settings.thinking_effort = "high"
     a.swap_model(StubModel(valid_efforts=("low", "medium")))
-    assert a.model.settings.thinking_effort == "none"
+    assert a.model.settings.thinking_effort == "medium"
+
+
+def test_swap_model_resets_effort_when_the_new_model_cannot_think() -> None:
+    a = _build_agent(model=StubModel(valid_efforts=("low", "high")))
+    a.model.settings.thinking_effort = "high"
+    a.swap_model(StubModel())
+    assert a.model.settings.thinking_effort == "default"
 
 
 def test_recompact_docstring_describes_alias_semantics() -> None:
@@ -9513,6 +9589,64 @@ def test_resume_restores_a_recipe_that_differs_only_in_provider(
     a.resume(meta, [], ToolState())
     assert len(calls) == 1
     assert a.model_recipe == spec
+
+
+def _thinking_stub() -> StubModel:
+    return StubModel(supports_thinking=True, valid_efforts=("low", "high"))
+
+
+def test_resume_restores_the_thinking_selection(tmp_path: Path) -> None:
+    a1 = _build_agent(model=_thinking_stub(), session_dir=tmp_path)
+    a1.model.settings.take(
+        thinking_effort="high",
+        thinking_budget="fixed",
+        thinking_output="text",
+    )
+    a1.runtime.publish(SaveSession())
+    loaded = load_session(tmp_path)
+    assert loaded is not None
+
+    a2 = _build_agent(model=_thinking_stub(), session_dir=tmp_path)
+    a2.resume(*loaded)
+    settings = a2.model.settings
+    assert (
+        settings.thinking_effort,
+        settings.thinking_budget,
+        settings.thinking_output,
+    ) == (
+        "high",
+        "fixed",
+        "text",
+    )
+
+
+def test_a_settings_change_alone_rewrites_meta(tmp_path: Path) -> None:
+    """``/effort`` appends no tape record and changes no status."""
+    a = _build_agent(model=_thinking_stub(), session_dir=tmp_path)
+    a.runtime.publish(SaveSession())
+    a.model.settings.thinking_effort = "low"
+    a.runtime.publish(SaveSession())
+    loaded = load_session(tmp_path)
+    assert loaded is not None
+    assert loaded[0].thinking_effort == "low"
+
+
+def test_resume_of_a_session_without_thinking_keeps_the_model_selection() -> None:
+    a = _build_agent(model=_thinking_stub())
+    a.model.settings.thinking_effort = "low"
+    a.resume(SessionMeta(session_id="old"), [], ToolState())
+    assert a.model.settings.thinking_effort == "low"
+
+
+def test_resume_lowers_a_recorded_effort_to_the_nearest_offered_rung() -> None:
+    a = _build_agent(model=_thinking_stub())
+    a.resume(
+        SessionMeta(thinking_effort="max", thinking_budget="bogus"),
+        [],
+        ToolState(),
+    )
+    assert a.model.settings.thinking_effort == "high"
+    assert a.model.settings.thinking_budget == "none"
 
 
 @pytest.mark.asyncio

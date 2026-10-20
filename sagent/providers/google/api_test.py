@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from dataclasses import replace
 from typing import TYPE_CHECKING, cast
 
+import json
 import logging
 
 import httpx2
@@ -104,7 +105,7 @@ def _thinking_capability() -> ModelCapability:
 # object cannot hold the thinking selections these tests are about.
 def _settings(
     *,
-    thinking_effort: ThinkingEffort = "none",
+    thinking_effort: ThinkingEffort = "default",
     thinking_budget: ThinkingBudget = "none",
     thinking_output: ThinkingOutput = "none",
 ) -> ModelSettings:
@@ -254,6 +255,49 @@ async def test_google_stream_parses_text_tool_call_and_finish_reason() -> None:
     assert resp.tokens.response == 5
     assert resp.message_id.startswith("gemini_")
     assert resp.request_id == resp.message_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("version", "billed_as"),
+    [
+        ("gemini-2.5-flash-lite", "gemini-2.5-flash-lite"),
+        ("gemini-2.5-flash-unlisted-build", "gemini-2.5-flash"),
+        (None, "gemini-2.5-flash"),
+    ],
+)
+async def test_google_stream_bills_the_row_model_version_reports(
+    version: str | None,
+    billed_as: str,
+) -> None:
+    """``modelVersion`` names the served row; unlisted or absent keeps the request."""
+    chunk: dict[str, PlainTree] = {
+        "candidates": [
+            {"content": {"parts": [{"text": "ok"}]}, "finishReason": "STOP"},
+        ],
+        "usageMetadata": {
+            "promptTokenCount": 1_000_000,
+            "candidatesTokenCount": 1_000_000,
+        },
+    }
+    if version is not None:
+        chunk["modelVersion"] = version
+    sse_body = b"data: " + json.dumps(chunk).encode() + b"\n\n"
+
+    def handle(request: httpx2.Request) -> httpx2.Response:
+        del request
+        return httpx2.Response(
+            200,
+            content=sse_body,
+            headers={"Content-Type": "text/event-stream"},
+        )
+
+    p = Google.from_key("k")
+    m = p.model("gemini-2.5-flash")
+    m._client = httpx2.AsyncClient(transport=httpx2.MockTransport(handle))
+    resp = await m.stream(ModelRequest(messages=[UserMessage(text="x")]))
+    assert resp.served_model_id == (version or "")
+    assert resp.spend == p.model(billed_as).spend(resp.tokens)
 
 
 @pytest.mark.asyncio
@@ -418,6 +462,7 @@ def test_google_build_response_cache_tokens_split_input_cost() -> None:
         usage=usage,
         finish_reason="STOP",
         model=model,
+        catalog=Google.catalog,
     )
     assert resp.tokens.cache_read == 300
     # ``promptTokenCount`` is cache-inclusive; stored input drops the cached
@@ -462,7 +507,7 @@ def test_google_utility_model_uses_flash_lite() -> None:
     """Utility resolves to the Flash-Lite Google names for new projects."""
     p = Google.from_key("k")
     m = p.model("utility")
-    assert m.capability.model_id == "gemini-flash-lite-3.5"
+    assert m.capability.model_id == "gemini-3.5-flash-lite"
 
 
 def test_google_model_properties() -> None:
@@ -514,9 +559,10 @@ def test_gemini_3_sends_a_thinking_level_not_a_budget(
     }
 
 
-def test_gemini_3_effort_none_sends_no_level() -> None:
-    """``none`` lets the model's default level apply; it never asks for "off"."""
-    assert _level_wire("gemini-3.1-pro-preview", "none") == {"includeThoughts": True}
+def test_gemini_3_default_effort_sends_no_level() -> None:
+    assert _level_wire("gemini-3.1-pro-preview", "default") == {
+        "includeThoughts": True,
+    }
 
 
 def test_gemini_3_8_cannot_select_the_minimal_level() -> None:
@@ -525,9 +571,10 @@ def test_gemini_3_8_cannot_select_the_minimal_level() -> None:
         _level_wire("gemini-3.8-flash", "min")
 
 
-def test_gemini_2_5_fixed_effort_none_sends_no_budget() -> None:
-    """No effort, no cap: 2.5 then thinks at its own default."""
-    assert _level_wire("gemini-2.5-flash", "none") == {"includeThoughts": True}
+def test_gemini_2_5_default_effort_sends_no_budget() -> None:
+    assert _level_wire("gemini-2.5-flash", "default") == {
+        "includeThoughts": True,
+    }
 
 
 def test_build_request_adaptive_thinking_uses_dynamic_budget() -> None:
@@ -761,7 +808,7 @@ async def test_google_actual_request_tokens_wraps_generate_request() -> None:
     body = from_plain(loads(seen[0].content), dict[str, object])
     assert set(body) == {"generateContentRequest"}
     inner = from_plain(body["generateContentRequest"], dict[str, object])
-    model_id = m.capability.wire_model_id or m.capability.model_id
+    model_id = m.capability.model_id
     assert inner["model"] == f"models/{model_id}"
     assert "systemInstruction" in inner
 

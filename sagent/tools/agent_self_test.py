@@ -9,13 +9,15 @@ from typing import TYPE_CHECKING, cast, override
 from unittest.mock import MagicMock, patch
 
 import asyncio
+import re
 
 import pytest
 
 from sagent import providers
 from sagent.agent.agent import Agent
 from sagent.agent.state import current_agent_var, tool_state_var
-from sagent.catalog.table import ModelCatalog, ModelTable
+from sagent.catalog.table import ModelCatalog, ModelTable, base_model_id
+from sagent.providers.providers import PROVIDER_NAMES, provider_class
 from sagent.testing import MockModelCaps
 from sagent.tools.agent_self import AgentSelf
 from sagent.types.capability import (
@@ -29,6 +31,7 @@ from sagent.types.model import (
     ModelRequest,
     ModelResponse,
 )
+from sagent.types.providers import ModelResolver
 from sagent.types.runtime import (
     AssistantMessage,
     Clear,
@@ -372,9 +375,16 @@ async def test_exceeds_cap_suggests_window_variant_when_one_exists() -> None:
         ),
     )
     t = AgentSelf()
+
+    # ``provider_class`` only resolves ``PROVIDER_NAMES``; the stub name needs
+    # a patched lookup, not just a facade attribute.
+    def _stub_lookup(name: str) -> type | None:
+        return catalog if name == "StubCat" else provider_class(name)
+
     with (
         _active(agent),
         patch.object(providers, "StubCat", catalog, create=True),
+        patch("sagent.tools.agent_self.provider_class", _stub_lookup),
     ):
         result = await t.run({"max_request_tokens": 1_000_000})
     assert result.is_error
@@ -386,21 +396,21 @@ async def test_exceeds_cap_suggests_window_variant_when_one_exists() -> None:
 async def test_exceeds_smaller_profile_suggests_the_maximal_bare_id() -> None:
     agent = Agent(
         model=StubProviderModel(
-            model_id="astra-6.0+272k",
+            model_id="gpt-6-astra+272k",
             max_request_tokens=272_000,
         ),
         tools=[],
         model_recipe=ModelRecipe(
             provider="OpenAI",
             auth="env",
-            model_id="astra-6.0+272k",
+            model_id="gpt-6-astra+272k",
             account="",
         ),
     )
     with _active(agent):
         result = await AgentSelf().run({"max_request_tokens": 500_000})
     assert result.is_error
-    assert "model_id=astra-6.0 " in result.content
+    assert "model_id=gpt-6-astra " in result.content
 
 
 @pytest.mark.asyncio
@@ -524,6 +534,114 @@ async def test_diagnostics_catalog_models_no_provider() -> None:
     assert "set catalog_provider" in result.content
 
 
+def _catalogs() -> dict[str, ModelCatalog]:
+    """Every provider catalog the ``catalog=models`` listing can show."""
+    return {
+        name: cls.catalog
+        for name in PROVIDER_NAMES
+        if isinstance(cls := provider_class(name), ModelResolver)
+    }
+
+
+async def _catalog_listing(provider: str) -> str:
+    agent = _make_agent()
+    with _active(agent):
+        result = await AgentSelf().run(
+            {"catalog": "models", "catalog_provider": provider},
+        )
+    assert not result.is_error
+    return result.content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", sorted(_catalogs()))
+async def test_catalog_lists_each_role_and_the_vendor_id_it_names(
+    provider: str,
+) -> None:
+    table = _catalogs()[provider].models
+    content = await _catalog_listing(provider)
+    (line,) = [ln for ln in content.splitlines() if ln.startswith("Roles: ")]
+    body = line.removeprefix("Roles: ")
+    shown = (
+        dict(pair.split("=", 1) for pair in body.split(", ")) if body != "none" else {}
+    )
+    assert shown == dict(table.roles)
+    assert all(table.exact(target) is not None for target in shown.values())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", sorted(_catalogs()))
+async def test_catalog_lists_each_alias_and_the_vendor_id_it_names(
+    provider: str,
+) -> None:
+    table = _catalogs()[provider].models
+    content = await _catalog_listing(provider)
+    (line,) = [ln for ln in content.splitlines() if ln.startswith("Aliases: ")]
+    body = line.removeprefix("Aliases: ")
+    shown = (
+        dict(pair.split("=", 1) for pair in body.split(", ")) if body != "none" else {}
+    )
+    assert shown == dict(table.aliases)
+    assert all(table.exact(target) is not None for target in shown.values())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", sorted(_catalogs()))
+async def test_catalog_lists_vendor_ids_never_a_role_or_retired_name(
+    provider: str,
+) -> None:
+    table = _catalogs()[provider].models
+    content = await _catalog_listing(provider)
+    (line,) = [ln for ln in content.splitlines() if ln.startswith("Known models: ")]
+    body = line.removeprefix("Known models: ")
+    assert (body.split(", ") if body != "none" else []) == list(table)
+
+
+def _description_examples(text: str) -> list[str]:
+    """Return the backticked ids inside each ``(e.g. ...)`` of ``text``."""
+    return [
+        example
+        for group in re.findall(r"\(e\.g\.([^)]*)\)", text)
+        for example in re.findall(r"`+([^`]+)`+", group)
+    ]
+
+
+def test_model_id_examples_name_a_row_some_catalog_still_has() -> None:
+    """An example is a vendor id a catalog lists, so a dropped row fails here."""
+    examples = _description_examples(AgentSelf.description)
+    assert examples
+    catalogs = _catalogs().values()
+    for example in examples:
+        base = base_model_id(example)
+        assert any(c.models.exact(base) is not None for c in catalogs), example
+        assert any(_resolves(c, example) for c in catalogs), example
+
+
+def _resolves(catalog: ModelCatalog, model_id: str) -> bool:
+    try:
+        _ = catalog.resolve(model_id)
+    except ValueError:
+        return False
+    return True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["default", "opus-5.5"])
+async def test_a_role_or_retired_name_is_saved_as_its_vendor_id(name: str) -> None:
+    """A role or retired name is input only; the recipe pins the vendor id."""
+    agent = _make_agent(
+        spec=ModelRecipe(provider="Anthropic", auth="env", model_id=name, account=""),
+    )
+    resolved = providers.Anthropic.catalog.models[name].model_id
+    assert resolved != name
+    with _active(agent):
+        result = await AgentSelf().run({"diagnostics": True})
+    assert not result.is_error
+    assert f"Model:              {resolved}\n" in result.content
+    assert agent.model_recipe is not None
+    assert agent.model_recipe.model_id == resolved
+
+
 @pytest.mark.asyncio
 async def test_diagnostics_reports_live_cost_tracker_state() -> None:
     """``diagnostics`` reads ``cost_tracker`` + ``num_tool_call_rounds``.
@@ -600,7 +718,7 @@ async def test_null_effort_and_cache_ttl_clear_settings() -> None:
             {"model_options": {"effort": None, "cache_ttl": None}},
         )
     assert not result.is_error, result.content
-    assert agent.model.settings.thinking_effort == "none"
+    assert agent.model.settings.thinking_effort == "default"
     assert agent.model.settings.cache_ttl_sec == 0.0
 
 
@@ -849,7 +967,7 @@ async def test_account_default_string_is_preserved() -> None:
 async def test_explicit_current_provider_is_not_overridden_by_inference() -> None:
     """``provider=<current>`` is a choice; a model id must not reroute it."""
     agent = _make_agent(
-        spec=ModelRecipe(provider="Anthropic", auth="env", model_id="opus-4.8"),
+        spec=ModelRecipe(provider="Anthropic", auth="env", model_id="claude-opus-4-8"),
     )
     fake_provider = MagicMock()
     fake_provider.model.return_value = StubProviderModel(model_id="gpt-5.5")
@@ -984,6 +1102,38 @@ async def test_a_valid_switch_applies_its_options_to_the_new_model() -> None:
     assert agent.model is new_model
     assert new_model.settings.thinking_effort == "high"
     assert agent.max_response_tokens == 1_000
+
+
+@pytest.mark.asyncio
+async def test_queued_swap_reply_names_the_vendor_id_a_role_resolves_to() -> None:
+    """The reply and the recipe carry the vendor id; the role is noted once."""
+    agent = _make_agent(
+        spec=ModelRecipe(
+            provider="Anthropic",
+            auth="env",
+            model_id="claude-opus-4-7",
+            account="",
+        ),
+    )
+    provider = MagicMock()
+    resolved = providers.Anthropic.catalog.models["utility"].model_id
+    assert resolved != "utility"
+    provider.model.return_value = StubProviderModel(model_id=resolved)
+    with (
+        patch(
+            "sagent.providers.providers.build_provider",
+            return_value=provider,
+        ),
+        _active(agent),
+    ):
+        result = await AgentSelf().run({"model_id": "utility"})
+        _land_switches(agent)
+    assert not result.is_error, result.content
+    assert (
+        f"model=claude-opus-4-7 -> {resolved} (as utility) (queued)" in result.content
+    )
+    assert agent.model_recipe is not None
+    assert agent.model_recipe.model_id == resolved
 
 
 @pytest.mark.asyncio
@@ -1123,8 +1273,8 @@ async def test_model_swap_clears_effort_and_reports_unset() -> None:
             result = await t.run({"model_id": "plain-stub"})
             _land_switches(agent)
     assert not result.is_error, result.content
-    assert agent.model.settings.thinking_effort == "none"
-    assert "thinking_effort=none (unsupported)" in result.content
+    assert agent.model.settings.thinking_effort == "default"
+    assert "thinking_effort=default (unsupported)" in result.content
 
 
 @pytest.mark.asyncio
@@ -1190,6 +1340,78 @@ async def test_provider_switch_rejected_when_outside_allow_list() -> None:
     assert result.is_error
     assert "not in the allowed list" in result.content
     assert "Anthropic" in result.content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("allow", [("OpenAI",), ("oai",)])
+async def test_provider_alias_switch_records_canonical_name(
+    allow: tuple[str, ...],
+) -> None:
+    agent = _make_agent(
+        spec=ModelRecipe(provider="Anthropic", auth="env", model_id="stub-1"),
+    )
+    fake_provider = MagicMock()
+    fake_provider.model.return_value = StubProviderModel(model_id="gpt-5.5")
+    with (
+        patch(
+            "sagent.providers.providers.build_provider",
+            return_value=fake_provider,
+        ) as build,
+        _active(agent),
+    ):
+        result = await AgentSelf(allow_providers=allow).run(
+            {"provider": "oai", "auth": "env", "model_id": "gpt-5.5"},
+        )
+    _land_switches(agent)
+    assert not result.is_error, result.content
+    build.assert_called_once_with("OpenAI", "env", account=None)
+    assert agent.model_recipe is not None
+    assert agent.model_recipe.provider == "OpenAI"
+
+
+@pytest.mark.asyncio
+async def test_provider_alias_outside_allow_list_is_rejected() -> None:
+    agent = _make_agent(
+        spec=ModelRecipe(
+            provider="OpenAISubscription",
+            auth="credentials",
+            model_id="gpt-stub",
+        ),
+    )
+    t = AgentSelf(allow_providers=("OpenAISubscription",))
+    with _active(agent):
+        result = await t.run({"provider": "ant", "auth": "env"})
+    assert result.is_error
+    assert "not in the allowed list" in result.content
+    assert "'Anthropic'" in result.content
+
+
+@pytest.mark.asyncio
+async def test_model_catalog_accepts_provider_alias() -> None:
+    agent = _make_agent()
+    t = AgentSelf(allow_providers=("OpenAI",))
+    with _active(agent):
+        result = await t.run({"catalog": "models", "catalog_provider": "oai"})
+    assert not result.is_error
+    assert "Provider catalog: OpenAI" in result.content
+
+
+@pytest.mark.asyncio
+async def test_model_catalog_rejects_non_provider_facade_class() -> None:
+    agent = _make_agent()
+    t = AgentSelf()
+    with _active(agent):
+        result = await t.run(
+            {"catalog": "models", "catalog_provider": "SelfHostedModel"},
+        )
+    assert "unknown provider 'SelfHostedModel'" in result.content
+
+
+def test_provider_schema_descriptions_mention_every_registered_alias() -> None:
+    rendered = repr(AgentSelf().directive_schema)
+    for alias, target in providers.PROVIDER_ALIASES.items():
+        assert alias in rendered
+        assert target in rendered
 
 
 @pytest.mark.asyncio

@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Final, TypedDict, override
+from typing import TYPE_CHECKING, Final, TypedDict, cast, override
 from unittest.mock import MagicMock, patch
 
 import asyncio
 import itertools
 import json
 import logging
+import re
 import time
 
 import pytest
@@ -25,8 +26,10 @@ from sagent.agent.state import (
     max_depth_var,
     tool_state_var,
 )
+from sagent.catalog.table import base_model_id
 from sagent.lib.tool_validation import validate_tool_input
-from sagent.providers import PROVIDER_NAMES
+from sagent.providers import PROVIDER_ALIASES, PROVIDER_NAMES
+from sagent.providers.providers import provider_class
 from sagent.testing import MockModelCaps
 from sagent.tools import agent_spawn
 from sagent.tools.agent_self import plan_model_options
@@ -47,6 +50,7 @@ from sagent.types.model import (
     ModelRequest,
     ModelResponse,
 )
+from sagent.types.providers import ModelResolver
 from sagent.types.runtime import (
     AgentIdle,
     AgentSendMessage,
@@ -238,6 +242,30 @@ def test_metadata_basics() -> None:
     t = AgentSpawn()
     assert t.name == "AgentSpawn"
     assert t.tool_id == "application/x-tool-agentspawn"
+
+
+def test_model_id_examples_name_a_row_some_catalog_still_has() -> None:
+    """An example is a vendor id a catalog lists, so a dropped row fails here."""
+    properties = cast(
+        "Mapping[str, Mapping[str, str]]",
+        AgentSpawn().directive_schema["properties"],
+    )
+    description = properties["model_id"]["description"]
+    examples = [
+        example
+        for group in re.findall(r"\(e\.g\.([^)]*)\)", description)
+        for example in re.findall(r"``([^`]+)``", group)
+    ]
+    assert examples
+    catalogs = [
+        cls.catalog
+        for name in PROVIDER_NAMES
+        if isinstance(cls := provider_class(name), ModelResolver)
+    ]
+    for example in examples:
+        assert any(
+            c.models.exact(base_model_id(example)) is not None for c in catalogs
+        ), example
 
 
 def test_summary_short_and_long() -> None:
@@ -922,7 +950,7 @@ def test_build_child_applies_normalized_option_clears() -> None:
         model_options=options,
         parent_agent=parent,
     )
-    assert child.model.settings.thinking_effort == "none"
+    assert child.model.settings.thinking_effort == "default"
     assert child.model.settings.cache_ttl_sec == 0.0
 
 
@@ -969,6 +997,22 @@ def test_build_child_inherits_the_parents_selection() -> None:
     assert child.model.settings.thinking_effort == "high"
 
 
+def test_build_child_carries_an_inherited_effort_to_the_nearest_rung() -> None:
+    """A narrower child model keeps thinking at its ceiling, not ``none``."""
+    parent = _make_parent(_ThinkingEffortModel())
+    parent.model.settings.thinking_effort = "high"
+    child = AgentSpawn()._build_child(
+        system=None,
+        child_model=_ThinkingEffortModel(valid_efforts=("low", "medium")),
+        child_spec=None,
+        child_tools=[],
+        max_rounds=None,
+        model_options={},
+        parent_agent=parent,
+    )
+    assert child.model.settings.thinking_effort == "medium"
+
+
 def test_build_child_drops_an_inherited_knob_the_child_model_rejects() -> None:
     """A spawn onto a narrower model must not fail on the parent's choice."""
     parent = _make_parent(_ThinkingEffortModel())
@@ -982,7 +1026,7 @@ def test_build_child_drops_an_inherited_knob_the_child_model_rejects() -> None:
         model_options={},
         parent_agent=parent,
     )
-    assert child.model.settings.thinking_effort == "none"
+    assert child.model.settings.thinking_effort == "default"
 
 
 @pytest.mark.asyncio
@@ -1117,11 +1161,11 @@ def test_build_child_model_infers_provider_from_bare_model_id() -> None:
     parent.model_recipe = ModelRecipe(
         provider="Anthropic",
         auth="env",
-        model_id="opus-4.8",
+        model_id="claude-opus-4-8",
         account=None,
     )
     fake_provider = MagicMock()
-    fake_provider.model.return_value = StubProviderModel(model_id="luna-6.0")
+    fake_provider.model.return_value = StubProviderModel(model_id="gpt-6-luna")
     with patch(
         "sagent.providers.providers.build_provider",
         return_value=fake_provider,
@@ -1129,7 +1173,7 @@ def test_build_child_model_infers_provider_from_bare_model_id() -> None:
         resolved = AgentSpawn()._build_child_model(
             provider=None,
             auth=None,
-            model_id="luna-6.0",
+            model_id="gpt-6-luna",
             account=None,
             parent_agent=parent,
         )
@@ -1138,9 +1182,41 @@ def test_build_child_model_infers_provider_from_bare_model_id() -> None:
     assert spec == ModelRecipe(
         provider="OpenAI",
         auth="env",
-        model_id="luna-6.0",
+        model_id="gpt-6-luna",
         account=None,
     )
+    build.assert_called_once_with("OpenAI", "env", account=None)
+
+
+def test_build_child_model_infers_provider_and_pins_a_model_alias() -> None:
+    parent = _make_parent()
+    parent.model_recipe = ModelRecipe(
+        provider="Anthropic",
+        auth="env",
+        model_id="claude-opus-4-8",
+        account=None,
+    )
+    fake_provider = MagicMock()
+    fake_provider.model.return_value = StubProviderModel(model_id="gpt-6.1-sol")
+    with patch(
+        "sagent.providers.providers.build_provider",
+        return_value=fake_provider,
+    ) as build:
+        resolved = AgentSpawn()._build_child_model(
+            provider=None,
+            auth=None,
+            model_id="sol",
+            account=None,
+            parent_agent=parent,
+        )
+    assert isinstance(resolved, agent_spawn._ChildModel)
+    assert resolved.spec == ModelRecipe(
+        provider="OpenAI",
+        auth="env",
+        model_id="gpt-6.1-sol",
+        account=None,
+    )
+    fake_provider.model.assert_called_once_with("sol")
     build.assert_called_once_with("OpenAI", "env", account=None)
 
 
@@ -1149,11 +1225,11 @@ def test_build_child_model_inference_preserves_explicit_auth() -> None:
     parent.model_recipe = ModelRecipe(
         provider="Anthropic",
         auth="env",
-        model_id="opus-4.8",
+        model_id="claude-opus-4-8",
         account=None,
     )
     fake_provider = MagicMock()
-    fake_provider.model.return_value = StubProviderModel(model_id="luna-6.0")
+    fake_provider.model.return_value = StubProviderModel(model_id="gpt-6-luna")
     with patch(
         "sagent.providers.providers.build_provider",
         return_value=fake_provider,
@@ -1161,7 +1237,7 @@ def test_build_child_model_inference_preserves_explicit_auth() -> None:
         resolved = AgentSpawn()._build_child_model(
             provider=None,
             auth="credentials",
-            model_id="luna-6.0",
+            model_id="gpt-6-luna",
             account=None,
             parent_agent=parent,
         )
@@ -2134,6 +2210,76 @@ def test_build_child_model_rejects_provider_outside_allow_list() -> None:
     assert result.is_error
     assert "not in the allowed list" in result.content
     assert "Anthropic" in result.content
+
+
+@pytest.mark.parametrize("allow", [("OpenAI",), ("oai",)])
+def test_build_child_model_canonicalizes_provider_alias(
+    allow: tuple[str, ...],
+) -> None:
+    parent = _make_parent()
+    fake_provider = MagicMock()
+    fake_provider.model.return_value = StubProviderModel(model_id="gpt-5.5")
+    with patch(
+        "sagent.providers.providers.build_provider",
+        return_value=fake_provider,
+    ) as build:
+        resolved = AgentSpawn(allow_providers=allow)._build_child_model(
+            provider="oai",
+            auth="env",
+            model_id="gpt-5.5",
+            account=None,
+            parent_agent=parent,
+        )
+    assert isinstance(resolved, agent_spawn._ChildModel)
+    assert resolved.spec is not None
+    assert resolved.spec.provider == "OpenAI"
+    build.assert_called_once_with("OpenAI", "env", account=None)
+
+
+def test_build_child_model_alias_outside_allow_list_is_rejected() -> None:
+    parent = _make_parent()
+    result = AgentSpawn(allow_providers=("OpenAISubscription",))._build_child_model(
+        provider="oai",
+        auth="env",
+        model_id="gpt-5.5",
+        account=None,
+        parent_agent=parent,
+    )
+    assert isinstance(result, ToolResult)
+    assert result.is_error
+    assert "not in the allowed list" in result.content
+    assert "'OpenAI'" in result.content
+
+
+def test_factory_provider_alias_is_canonicalized() -> None:
+    parent = _make_parent()
+    fake_provider = MagicMock()
+    fake_provider.model.return_value = StubProviderModel(model_id="gpt-5.5")
+    with patch(
+        "sagent.providers.providers.build_provider",
+        return_value=fake_provider,
+    ) as build:
+        resolved = AgentSpawn(
+            provider="oai",
+            auth="env",
+            model_id="gpt-5.5",
+            allow_providers=("OpenAI",),
+        )._build_child_model(
+            provider=None,
+            auth=None,
+            model_id=None,
+            account=None,
+            parent_agent=parent,
+        )
+    assert isinstance(resolved, agent_spawn._ChildModel)
+    build.assert_called_once_with("OpenAI", "env", account=None)
+
+
+def test_provider_schema_description_mentions_every_registered_alias() -> None:
+    rendered = repr(AgentSpawn().directive_schema)
+    for alias, target in PROVIDER_ALIASES.items():
+        assert alias in rendered
+        assert target in rendered
 
 
 def test_build_child_model_parent_provider_always_allowed() -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
+from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import TYPE_CHECKING, cast, override
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -16,6 +17,7 @@ import pytest
 
 from sagent.agent.retry import error_status, is_retryable
 from sagent.bin.cli import DEFAULT_TOOLS, resolve_tools
+from sagent.catalog.anthropic import models
 from sagent.lib.codec import from_plain
 from sagent.providers.anthropic.api import (
     Anthropic,
@@ -135,7 +137,7 @@ def _make_request(
 
 
 def test_normalized_anthropic_id_uses_vendor_id_on_the_wire() -> None:
-    model = Anthropic.from_key("k").model("opus-5.5")
+    model = Anthropic.from_key("k").model("claude-opus-5-5")
     kwargs = model._build_kwargs(
         ModelRequest(messages=[UserMessage(text="hello")]),
         [],
@@ -146,7 +148,7 @@ def test_normalized_anthropic_id_uses_vendor_id_on_the_wire() -> None:
 def test_the_default_tools_serialize_as_request_json() -> None:
     # Tool schemas are frozen (nested mappingproxy); the SDK posts them with
     # ``json.dumps``, so a shallow copy fails at the first nested object.
-    model = Anthropic.from_key("k").model("opus-5.5")
+    model = Anthropic.from_key("k").model("claude-opus-5-5")
     kwargs = model._build_kwargs(
         ModelRequest(
             messages=[UserMessage(text="hello")],
@@ -159,7 +161,13 @@ def test_the_default_tools_serialize_as_request_json() -> None:
 
 @pytest.mark.parametrize(
     "model_id",
-    ["opus-4.7", "opus-4.7+200k", "sonnet-4.6", "fable-5.1", "opus-5.5"],
+    [
+        "claude-opus-4-7",
+        "claude-opus-4-7+200k",
+        "claude-sonnet-4-6",
+        "claude-fable-5-1",
+        "claude-opus-5-5",
+    ],
 )
 def test_no_model_sends_the_retired_1m_context_beta(model_id: str) -> None:
     """1M is the default on every 1M model; the beta header is no longer needed."""
@@ -174,11 +182,11 @@ def test_no_model_sends_the_retired_1m_context_beta(model_id: str) -> None:
 @pytest.mark.parametrize(
     ("model_id", "budget", "output", "display"),
     [
-        ("opus-5.5", "auto", "text", "summarized"),
-        ("opus-4.8", "auto", "text", "summarized"),
-        ("sonnet-5.5", "auto", "redacted", "omitted"),
-        ("opus-4.6", "fixed", "text", "summarized"),
-        ("haiku-4.5", "fixed", "redacted", "omitted"),
+        ("claude-opus-5-5", "auto", "text", "summarized"),
+        ("claude-opus-4-8", "auto", "text", "summarized"),
+        ("claude-sonnet-5-5", "auto", "redacted", "omitted"),
+        ("claude-opus-4-6", "fixed", "text", "summarized"),
+        ("claude-haiku-4-5", "fixed", "redacted", "omitted"),
     ],
 )
 def test_thinking_output_selects_the_wire_display(
@@ -197,7 +205,7 @@ def test_thinking_output_selects_the_wire_display(
 
 
 def test_thinking_without_an_output_choice_sends_no_display() -> None:
-    model = Anthropic.from_key("k").model("opus-5.5")
+    model = Anthropic.from_key("k").model("claude-opus-5-5")
     model.settings.thinking_budget = "auto"
     kwargs = model._build_kwargs(ModelRequest(messages=[]), [])
     assert kwargs["thinking"] == {"type": "adaptive"}
@@ -205,7 +213,7 @@ def test_thinking_without_an_output_choice_sends_no_display() -> None:
 
 def test_no_thinking_sends_no_display() -> None:
     """``display`` is invalid with thinking off; nothing to display."""
-    model = Anthropic.from_key("k").model("opus-4.8")
+    model = Anthropic.from_key("k").model("claude-opus-4-8")
     model.settings.thinking_output = "text"
     kwargs = model._build_kwargs(ModelRequest(messages=[]), [])
     assert "thinking" not in kwargs
@@ -552,6 +560,7 @@ def _build_anthropic_message(
     cache_creation: int = 0,
     cache_read: int = 0,
     speed: str | None = None,
+    model: str = "",
 ) -> _RawMessage:
     """Return a duck-typed object mimicking ``anthropic.types.Message``."""
     # Use the real anthropic SDK classes via the lazy-imported module so
@@ -584,13 +593,14 @@ def _build_anthropic_message(
     msg.stop_reason = stop_reason
     msg.stop_sequence = None
     msg.id = "msg_xyz"
+    msg.model = model
     msg._request_id = "req_xyz"
     return cast(_RawMessage, msg)
 
 
 def test_parse_response_text_only() -> None:
     raw = _build_anthropic_message(text="hi", input_tokens=5, output_tokens=2)
-    resp = _parse_response(raw, _free_model())
+    resp = _parse_response(raw, _free_model(), catalog=Anthropic.catalog)
     assert resp.message.text == "hi"
     assert resp.stop_reason == "model_finished"
     assert resp.tokens.request == 5
@@ -602,7 +612,7 @@ def test_parse_response_tool_call_extracted() -> None:
         tool_calls=(("toolu_xyz", "Bash", {"cmd": "ls"}),),
         stop_reason="tool_use",
     )
-    resp = _parse_response(raw, _free_model())
+    resp = _parse_response(raw, _free_model(), catalog=Anthropic.catalog)
     assert len(resp.message.tool_calls) == 1
     call = resp.message.tool_calls[0]
     assert call.id == "toolu_xyz"
@@ -630,7 +640,7 @@ def test_parse_response_drops_placeholder_tool_name() -> None:
         ),
         stop_reason="tool_use",
     )
-    resp = _parse_response(raw, _free_model())
+    resp = _parse_response(raw, _free_model(), catalog=Anthropic.catalog)
     assert [c.name for c in resp.message.tool_calls] == ["Bash"]
 
 
@@ -639,7 +649,7 @@ def test_parse_response_accepts_hyphenated_tool_name() -> None:
         tool_calls=(("toolu_1", "mcp-server_tool", {}),),
         stop_reason="tool_use",
     )
-    resp = _parse_response(raw, _free_model())
+    resp = _parse_response(raw, _free_model(), catalog=Anthropic.catalog)
     assert [c.name for c in resp.message.tool_calls] == ["mcp-server_tool"]
 
 
@@ -650,7 +660,7 @@ def test_parse_response_all_placeholder_calls_is_finished() -> None:
         tool_calls=(("toolu_bad", "$FUNCTION_NAME", {}),),
         stop_reason="tool_use",
     )
-    resp = _parse_response(raw, _free_model())
+    resp = _parse_response(raw, _free_model(), catalog=Anthropic.catalog)
     assert resp.message.tool_calls == ()
     assert resp.stop_reason == "model_finished"
 
@@ -677,7 +687,7 @@ def test_parse_response_cache_tokens_split_correctly() -> None:
             },
         ),
     )
-    resp = _parse_response(raw, model)
+    resp = _parse_response(raw, model, catalog=Anthropic.catalog)
     assert resp.tokens.cache_write == 200
     assert resp.tokens.cache_read == 400
     # Input cost = 1000*1 + 200*4 + 400*0.5 = 2000 / 1M = 0.002.
@@ -686,9 +696,30 @@ def test_parse_response_cache_tokens_split_correctly() -> None:
     ) == pytest.approx(0.002)
 
 
+def test_parse_response_prices_at_the_snapshot_the_alias_served() -> None:
+    model = Anthropic.from_key("k").model("claude-haiku-4-5")
+    snapshot = models()["claude-haiku-4-5-20251001"]
+    raw = _build_anthropic_message(input_tokens=1_000_000, model=snapshot.model_id)
+    resp = _parse_response(raw, model, catalog=Anthropic.catalog)
+    assert resp.served_model_id == "claude-haiku-4-5-20251001"
+    expected = snapshot.prices.cost(
+        resp.tokens,
+        service_tier="auto",
+        at=datetime.now(UTC).date(),
+    )
+    assert resp.spend == expected
+
+
+def test_parse_response_an_unlisted_served_id_keeps_the_requested_rates() -> None:
+    raw = _build_anthropic_message(input_tokens=1_000_000, model="claude-unlisted-9")
+    resp = _parse_response(raw, _fast_model(), catalog=Anthropic.catalog)
+    assert resp.served_model_id == "claude-unlisted-9"
+    assert resp.spend.request == pytest.approx(5.0)
+
+
 def test_parse_response_carries_message_and_request_ids() -> None:
     raw = _build_anthropic_message()
-    resp = _parse_response(raw, _free_model())
+    resp = _parse_response(raw, _free_model(), catalog=Anthropic.catalog)
     assert resp.message_id == "msg_xyz"
     assert resp.request_id == "req_xyz"
 
@@ -712,9 +743,9 @@ def test_anthropic_from_env_reads(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_anthropic_model_known_id_returns_backend() -> None:
     p = Anthropic.from_key("k")
-    m = p.model("haiku-4.5")
-    assert m.capability.model_id == "haiku-4.5"
-    assert m.capability.wire_model_id == "claude-haiku-4-5"
+    m = p.model("claude-haiku-4-5")
+    assert m.capability.model_id == "claude-haiku-4-5"
+    assert m.capability.model_id == "claude-haiku-4-5"
     # Haiku supports thinking via ``enabled`` only (measured: 249 readable
     # thinking chars; ``adaptive`` 400s 'not supported on this model').
     assert m.capability.thinking.budget != frozenset({"none"})
@@ -730,7 +761,7 @@ def test_anthropic_model_unknown_id_raises() -> None:
 def test_anthropic_model_rejects_unknown_provider_options() -> None:
     p = Anthropic.from_key("k")
     with pytest.raises(TypeError, match="typoo"):
-        _ = operator.methodcaller("model", "opus-4.8", typoo=True)(p)
+        _ = operator.methodcaller("model", "claude-opus-4-8", typoo=True)(p)
 
 
 def test_anthropic_model_strips_context_tag_for_profile_lookup() -> None:
@@ -749,17 +780,17 @@ def test_anthropic_default_model_resolves() -> None:
 def test_anthropic_roles_resolve_to_the_latest_of_each_family() -> None:
     """Opus 5.5 is natively 1M, so the default needs no context beta."""
     p = Anthropic.from_key("k")
-    assert p.catalog.resolve("best")[0].model_id == "fable-5.1"
-    assert p.catalog.resolve("default")[0].model_id == "opus-5.5"
-    assert p.catalog.resolve("utility")[0].model_id == "sonnet-5.5"
+    assert p.catalog.resolve("best")[0].model_id == "claude-fable-5-1"
+    assert p.catalog.resolve("default")[0].model_id == "claude-opus-5-5"
+    assert p.catalog.resolve("utility")[0].model_id == "claude-sonnet-5-5"
     assert p.model().limits.max_request_tokens == 1_000_000
     assert "context-1m-2025-08-07" not in p.model().limits.request_betas
 
 
 def test_anthropic_opus_5_5_defaults_to_full_window() -> None:
     p = Anthropic.from_key("k")
-    full = p.model("opus-5.5")
-    small = p.model("opus-5.5+200k")
+    full = p.model("claude-opus-5-5")
+    small = p.model("claude-opus-5-5+200k")
     assert full.limits.max_request_tokens == 1_000_000
     assert small.limits.max_request_tokens == 200_000
 
@@ -767,7 +798,7 @@ def test_anthropic_opus_5_5_defaults_to_full_window() -> None:
 def test_anthropic_utility_model_uses_latest_sonnet() -> None:
     p = Anthropic.from_key("k")
     m = p.model("utility")
-    assert m.capability.model_id == "sonnet-5.5"
+    assert m.capability.model_id == "claude-sonnet-5-5"
 
 
 def test_anthropic_subscription_property_false_on_api_key() -> None:
@@ -804,7 +835,7 @@ def test_anthropic_fable_5_1_model_profile() -> None:
     assert m.capability.prices[PriceKey("auto")].request == 10.0
     assert m.capability.prices[PriceKey("auto")].response == 50.0
     assert m.capability.thinking.effort == frozenset(
-        {"none", "low", "medium", "high", "xhigh", "max"},
+        {"default", "low", "medium", "high", "xhigh", "max"},
     )
     assert "priority" not in m.capability.service_tier
     # ``enabled`` 400s, so the row offers the adaptive budget only.
@@ -813,8 +844,8 @@ def test_anthropic_fable_5_1_model_profile() -> None:
 
 def test_anthropic_fable_5_1_smaller_context() -> None:
     p = Anthropic.from_key("k")
-    m = p.model("fable-5.1+200k")
-    assert m.tagged_model_id == "fable-5.1+200k"
+    m = p.model("claude-fable-5-1+200k")
+    assert m.tagged_model_id == "claude-fable-5-1+200k"
     assert m.limits.max_request_tokens == 200_000
 
 
@@ -831,8 +862,8 @@ def test_anthropic_fable_model_profile() -> None:
 
 def test_anthropic_fable_smaller_context() -> None:
     p = Anthropic.from_key("k")
-    m = p.model("fable-5.0+200k")
-    assert m.tagged_model_id == "fable-5.0+200k"
+    m = p.model("claude-fable-5+200k")
+    assert m.tagged_model_id == "claude-fable-5+200k"
     assert m.limits.max_request_tokens == 200_000
 
 
@@ -846,14 +877,14 @@ def test_anthropic_sonnet_5_model_profile() -> None:
     assert m.capability.prices[PriceKey("auto")].request == 2.0
     assert m.capability.prices[PriceKey("auto")].response == 10.0
     assert m.capability.thinking.effort == frozenset(
-        {"none", "low", "medium", "high", "xhigh", "max"},
+        {"default", "low", "medium", "high", "xhigh", "max"},
     )
 
 
 def test_anthropic_sonnet_5_smaller_context() -> None:
     p = Anthropic.from_key("k")
-    m = p.model("sonnet-5.0+200k")
-    assert m.tagged_model_id == "sonnet-5.0+200k"
+    m = p.model("claude-sonnet-5+200k")
+    assert m.tagged_model_id == "claude-sonnet-5+200k"
     assert m.limits.max_request_tokens == 200_000
 
 
@@ -1026,7 +1057,7 @@ def test_parse_response_bills_fast_when_server_reports_fast() -> None:
         output_tokens=1_000_000,
         speed="fast",
     )
-    resp = _parse_response(raw, _fast_model())
+    resp = _parse_response(raw, _fast_model(), catalog=Anthropic.catalog)
     assert (resp.spend.request + resp.spend.cache_write + resp.spend.cache_read) == 10.0
     assert resp.spend.response == 50.0
 
@@ -1038,7 +1069,7 @@ def test_parse_response_bills_standard_when_server_falls_back() -> None:
         output_tokens=1_000_000,
         speed="standard",
     )
-    resp = _parse_response(raw, _fast_model())
+    resp = _parse_response(raw, _fast_model(), catalog=Anthropic.catalog)
     assert (resp.spend.request + resp.spend.cache_write + resp.spend.cache_read) == 5.0
     assert resp.spend.response == 25.0
 
@@ -1592,7 +1623,7 @@ def test_anthropic_model_is_retryable_provider_error_no_body_attr() -> None:
 
 def test_anthropic_provider_extra_headers_for_1m_omit_the_context_beta() -> None:
     p = Anthropic.from_key("k")
-    model = p.model("opus-4.7")
+    model = p.model("claude-opus-4-7")
     headers = p.extra_headers(model.capability, model.settings)
     assert "context-1m" not in headers.get("anthropic-beta", "")
 

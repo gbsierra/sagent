@@ -210,7 +210,7 @@ def test_model_capabilities() -> None:
     provider = GoogleCLI()
     model = provider.model("gemini-2.5-flash")
     assert model.capability.thinking.budget != frozenset({"none"})
-    assert model.capability.thinking.effort == frozenset({"none"})
+    assert model.capability.thinking.effort == frozenset({"default"})
     assert model.capability.cache_ttl_sec == frozenset({0.0})
     assert model.capability.manage_context_server_side == frozenset({True})
     assert model.capability.account_auth is True

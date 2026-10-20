@@ -347,9 +347,10 @@ class Agent:
         self.description = description
         self.model = model
         self._owned_provider = owned_provider
-        self.model_recipe = model_recipe
         if model_recipe is not None:
+            model_recipe = _pinned(model_recipe)
             last_models.record(model_recipe.provider, model_recipe.model_id)
+        self.model_recipe = model_recipe
         self._base_system_spec: SystemPromptArg = system
         self._system_spec: SystemPromptArg = system
         self._frozen_system = frozen_system
@@ -957,9 +958,10 @@ class Agent:
               it; ``None`` when the caller keeps ownership.
 
         """
-        self.model_recipe = spec
         if spec is not None:
+            spec = _pinned(spec)
             last_models.record(spec.provider, spec.model_id)
+        self.model_recipe = spec
         if model is self.model:
             return
         old = self.model
@@ -1014,7 +1016,7 @@ class Agent:
           provider: New provider class name, e.g. ``"AnthropicCLI"``.
           auth: New auth-method suffix.
           model_id: New provider-specific model id. Option tags ride
-              along (e.g. ``opus-4.8+200k``); the provider's
+              along (e.g. ``claude-opus-4-8+200k``); the provider's
               ``model()`` validates them.
           account: New credential account override.
 
@@ -1087,13 +1089,22 @@ class Agent:
         except BaseException:
             _ = _schedule_provider_close(provider_obj)
             raise
+        # The recipe and label carry the id the built model resolved, never the
+        # name as typed: a role (``default``), alias (``sol``), or retired
+        # spelling is input only, and saving it would let a later catalog
+        # change what a resume runs.
+        requested = target.model_id
+        target = _pinned(target)
+        resolved = target.model_id
+        new_display = (
+            resolved if requested == resolved else f"{resolved} (as {requested})"
+        )
         if target.provider != spec.provider:
             label = (
-                f"{spec.provider}/{spec.model_id} -> "
-                f"{target.provider}/{target.model_id}"
+                f"{spec.provider}/{spec.model_id} -> {target.provider}/{new_display}"
             )
         else:
-            label = f"{spec.model_id} -> {target.model_id}"
+            label = f"{spec.model_id} -> {new_display}"
         return ModelChange(
             model=new_model,
             recipe=target,
@@ -1213,7 +1224,11 @@ class Agent:
         Restores cost / activity / compaction state, the original
         ``session_id`` and ``status``, and (when the persisted
         provider+model differ from the current one) swaps the model.
-        Repopulates ``tool_state`` from the persisted snapshot; its
+        Re-applies the recorded thinking effort, budget, and output through
+        ``ModelSettings.take``, so a rung the model no longer offers lands
+        on the nearest one instead of failing the resume; a session saved
+        before these were recorded keeps the model's own. Repopulates
+        ``tool_state`` from the persisted snapshot; its
         ``_content_cache`` stays empty and reloads lazily on the first
         post-resume ``check_stale`` / ``consume_changed_files`` against
         disk (matching ``restore_tool_state``). Resume never eagerly
@@ -1244,6 +1259,17 @@ class Agent:
             if restored is not None:
                 new_model, new_spec, provider = restored
                 self.swap_model(new_model, spec=new_spec, provider=provider)
+        recorded = {
+            name: value
+            for name, value in (
+                ("thinking_effort", meta.thinking_effort),
+                ("thinking_budget", meta.thinking_budget),
+                ("thinking_output", meta.thinking_output),
+            )
+            if value
+        }
+        if recorded:
+            self.model.settings.take(**recorded)
         # The tape we just replayed came from session.jsonl. Without
         # rebaselining, the next ``SaveSession`` would write all those
         # same records back to the same file, duplicating them.
@@ -2721,7 +2747,11 @@ def _resolve_target_spec(
     account: str | None,
 ) -> ModelRecipe:
     """Resolve a ``change_model`` kwargs payload to a complete ``types.model.ModelRecipe``."""
-    prov_name = provider or spec.provider
+    prov_name = (
+        providers.canonical_provider(provider)
+        if provider is not None
+        else spec.provider
+    )
     if auth is not None:
         final_auth = auth
     elif prov_name == spec.provider:
@@ -2736,12 +2766,48 @@ def _resolve_target_spec(
     elif prov_name == spec.provider or _provider_knows_model(prov_name, spec.model_id):
         final_model_id = spec.model_id
     else:
-        final_model_id = last_models.get(prov_name) or "default"
+        # ``last-models.json`` is a convenience memory: an entry written before
+        # rows were keyed by vendor id, or naming a row the provider has since
+        # dropped, falls back to the provider's default instead of failing.
+        remembered = last_models.get(prov_name)
+        final_model_id = (
+            remembered
+            if remembered is not None and _provider_knows_model(prov_name, remembered)
+            else "default"
+        )
     return ModelRecipe(
         provider=prov_name,
         auth=final_auth,
         account=final_account,
         model_id=final_model_id,
+    )
+
+
+def _pinned(spec: ModelRecipe) -> ModelRecipe:
+    """Return ``spec`` with canonical provider and resolved vendor model id.
+
+    Provider aliases (``oai``, ``antsub``) and model selection conveniences
+    (a role such as ``default``, an alias such as ``sol``, or a retired
+    spelling such as ``opus-5.5``) are input only. Persisting one would make
+    the recipe depend on a later registry or catalog definition. An id the
+    catalog does not resolve, or a provider with no catalog (``SelfHosted``
+    paths), keeps the model id as given; building the model reports a miss.
+    """
+    canonical = providers.canonical_provider(spec.provider)
+    if canonical != spec.provider:
+        spec = dataclasses.replace(spec, provider=canonical)
+    cls = providers.provider_class(canonical)
+    if not isinstance(cls, ModelResolver):
+        return spec
+    try:
+        capability, settings = cls.catalog.resolve(spec.model_id)
+    except (UnknownModelError, UnsupportedTagError):
+        return spec
+    resolved = capability.model_id + settings.context
+    return (
+        spec
+        if resolved == spec.model_id
+        else dataclasses.replace(spec, model_id=resolved)
     )
 
 

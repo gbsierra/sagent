@@ -14,7 +14,11 @@ import shlex
 import time
 
 from sagent.agent.state import agent_registry
-from sagent.providers.providers import infer_provider
+from sagent.providers.providers import (
+    UnknownProviderError,
+    infer_provider,
+    require_provider,
+)
 from sagent.thinking import (
     THINKING_COMMANDS,
     apply_thinking_command,
@@ -60,7 +64,7 @@ def do_switch_model(
         _write(
             printer,
             f"[/model] provider={spec.provider} auth={spec.auth} "
-            f"model={spec.model_id} account={spec.account or 'default'}",
+            f"model={agent.model.tagged_model_id} account={spec.account or 'default'}",
         )
         return
     parsed = _parse_model_args(tokens)
@@ -85,13 +89,17 @@ def do_switch_model(
             model_id=parsed.model_id,
             account=parsed.account if parsed.account_set else None,
         )
-    except (ValueError, RuntimeError) as exc:
+    except (AttributeError, ValueError, RuntimeError) as exc:
         _write(printer, f"[/model] {exc}")
         return
+    # ``target.model_id`` is the id the new model resolved, not the name typed.
+    new_id = target.model_id
+    if parsed.model_id is not None and parsed.model_id != new_id:
+        new_id = f"{new_id} (as {parsed.model_id})"
     if target.provider != spec.provider:
-        label = f"{spec.provider}/{old_id} -> {target.provider}/{target.model_id}"
+        label = f"{spec.provider}/{old_id} -> {target.provider}/{new_id}"
     else:
-        label = f"{old_id} -> {target.model_id}"
+        label = f"{old_id} -> {new_id}"
     queued = " (queued)" if agent.work is not None else ""
     _write(printer, f"[/model] {label}{queued}")
 
@@ -136,9 +144,9 @@ def do_switch_effort(agent: Controllable, value: str, printer: Printer | None) -
     """Render an ``/effort`` slash command against the model's settings.
 
     Bare ``/effort`` (empty ``value``) prints the current effort plus the
-    model's valid options. ``off`` / ``unset`` are aliases for ``none``,
-    the axis's own unset value. Invalid values error with the option
-    list -- a rejected request, never a silent no-op.
+    model's valid options. ``unset`` restores ``default`` (omit the provider
+    knob); ``off`` selects an explicit ``none`` only where the model offers
+    it. Invalid values error with the option list.
 
     Args:
       agent: Agent whose model carries the settings.
@@ -148,21 +156,27 @@ def do_switch_effort(agent: Controllable, value: str, printer: Printer | None) -
     """
     settings = agent.model.settings
     options = ", ".join(sorted(agent.model.capability.thinking.effort))
+    current = settings.thinking_effort
+    effective = settings.effective_thinking_effort
+    shown = current if current == effective else f"{current} ({effective})"
     if not value:
         _write(
             printer,
-            f"[/effort] {settings.thinking_effort}\n[/effort] options: {options}",
+            f"[/effort] {shown}\n[/effort] options: {options}",
         )
         return
     try:
         settings.thinking_effort = cast(
             ThinkingEffort,
-            "none" if value in ("off", "unset") else value,
+            "none" if value == "off" else "default" if value == "unset" else value,
         )
     except ValueError:
         _write(printer, f"[/effort] {value!r} is not one of: {options}")
         return
-    _write(printer, f"[/effort] {settings.thinking_effort}")
+    current = settings.thinking_effort
+    effective = settings.effective_thinking_effort
+    shown = current if current == effective else f"{current} ({effective})"
+    _write(printer, f"[/effort] {shown}")
 
 
 async def do_login(agent: Controllable, printer: Printer | None) -> None:
@@ -359,8 +373,13 @@ def _parse_model_args(tokens: list[str]) -> _ParsedModelArgs | str:
         return (
             "[/model] usage: /model [provider=P] [auth=A] [account=ACCT]"
             " [model=MODEL_ID]   (or --provider/--auth/--account flags,"
-            " or a bare model_id, with context tags like opus-4.8+200k)"
+            " or a bare model_id, with context tags like claude-opus-4-8+200k)"
         )
+    if provider is not None:
+        try:
+            provider = require_provider(provider)
+        except UnknownProviderError as exc:
+            return f"[/model] {exc}"
     return _ParsedModelArgs(
         provider=provider,
         auth=auth,

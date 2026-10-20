@@ -86,8 +86,8 @@ def test_llamacpp_from_env_uses_env_var(monkeypatch: pytest.MonkeyPatch) -> None
 
 
 def test_llamacpp_known_models_include_local() -> None:
-    assert LlamaCpp.catalog.models["local"].model_id == "local-0.0"
-    assert LlamaCpp.catalog.models["qwen3.6-27b-12gb"].model_id == "qwen-27b-12gb-3.6"
+    assert LlamaCpp.catalog.models["local"].model_id == "local"
+    assert LlamaCpp.catalog.models["qwen-27b-12gb-3.6"].model_id == "qwen3.6-27b-12gb"
 
 
 def test_llamacpp_close_idempotent() -> None:

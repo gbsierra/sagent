@@ -39,9 +39,10 @@ else:
     httpx2 = lazy_import("httpx2")  # 100ms cold.
     image = lazy_import("sagent.lib.image")
 
-from sagent.catalog.google import api, models, thinking_config
+from sagent.catalog.google import api, models
 from sagent.catalog.table import ModelCatalog
 from sagent.lib.codec import MutablePlainTree, from_plain, mutable
+from sagent.providers.google.wire import thinking_config
 from sagent.providers.lib.errors import (
     error_status_code,
     is_context_overflow_text,
@@ -159,6 +160,11 @@ class GeminiProvider(Protocol):
         """Key sent as ``x-goog-api-key``; empty when the transport uses OAuth."""
         ...
 
+    @property
+    def catalog(self) -> ModelCatalog:
+        """The provider's rows met with its transport."""
+        ...
+
 
 class _GeminiModel(ModelDefaults):
     """Gemini model backend."""
@@ -239,7 +245,7 @@ class _GeminiModel(ModelDefaults):
     @override
     async def actual_request_tokens(self, request: ModelRequest) -> int:
         """Call ``:countTokens`` for the exact server-side count."""
-        model_id = self.capability.wire_model_id or self.capability.model_id
+        model_id = self.capability.model_id
         url = f"{_API_BASE}/models/{model_id}:countTokens"
         body = _build_request(request, self.capability, self.settings, self.limits)
         client = await self._get_client()
@@ -299,7 +305,7 @@ class _GeminiModel(ModelDefaults):
           httpx2.HTTPStatusError: Any other error status.
 
         """
-        model_id = self.capability.wire_model_id or self.capability.model_id
+        model_id = self.capability.model_id
         url = f"{_API_BASE}/models/{model_id}:streamGenerateContent?alt=sse"
         body = _build_request(request, self.capability, self.settings, self.limits)
         client = await self._get_client()
@@ -319,7 +325,12 @@ class _GeminiModel(ModelDefaults):
                     (await r.aread()).decode(errors="replace"),
                 )
             r.raise_for_status()
-            return await _consume_gemini_stream(r, publish=publish, model=self)
+            return await _consume_gemini_stream(
+                r,
+                publish=publish,
+                model=self,
+                catalog=self._provider.catalog,
+            )
 
 
 def gemini_image_tokens(data: bytes) -> int:
@@ -556,6 +567,7 @@ async def _consume_gemini_stream(
     *,
     publish: Callable[[RuntimeEvent], None] | None = None,
     model: _GeminiModel,
+    catalog: ModelCatalog,
     chunk_unwrap: Callable[[dict[str, MutablePlainTree]], dict[str, MutablePlainTree]]
     | None = None,
 ) -> ModelResponse:
@@ -566,6 +578,7 @@ async def _consume_gemini_stream(
     tool_calls: list[ToolCall] = []
     usage: dict[str, MutablePlainTree] = {}
     finish_reason: str | None = None
+    served_model_id = ""
     malformed_chunks = 0
     parsed_chunks = 0
 
@@ -589,6 +602,13 @@ async def _consume_gemini_stream(
             parsed_chunks += 1
             if chunk_unwrap is not None:
                 event = chunk_unwrap(event)
+            # Source: GenerateContentResponse.modelVersion -- "Output only. The
+            # model version used to generate the response."
+            # https://ai.google.dev/api/generate-content#generatecontentresponse
+            # (read 2026-10-17).
+            version = event.get("modelVersion")
+            if isinstance(version, str) and version:
+                served_model_id = version
             event_usage = event.get("usageMetadata")
             if isinstance(event_usage, dict):
                 usage = event_usage
@@ -648,6 +668,8 @@ async def _consume_gemini_stream(
         usage=usage,
         finish_reason=finish_reason,
         model=model,
+        catalog=catalog,
+        served_model_id=served_model_id,
     )
     if finish_reason is None:
         raise StreamInterruptedError(response)
@@ -663,6 +685,8 @@ def _build_response(
     usage: dict[str, MutablePlainTree],
     finish_reason: str | None,
     model: _GeminiModel,
+    catalog: ModelCatalog,
+    served_model_id: str = "",
 ) -> ModelResponse:
     """Build a ``ModelResponse`` from Gemini's parsed stream fields."""
     output_tokens = from_plain(usage.get("candidatesTokenCount"), int, default=0)
@@ -697,5 +721,9 @@ def _build_response(
         ),
         message_id=message_id,
         request_id=message_id,
-        spend=model.spend(tokens),
+        spend=model.spend(
+            tokens,
+            served=catalog.served(model.capability, served_model_id),
+        ),
+        served_model_id=served_model_id,
     )

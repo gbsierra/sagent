@@ -9,6 +9,7 @@ import time
 
 import pytest
 
+from sagent.providers import PROVIDER_ALIASES
 from sagent.providers.lib.errors import PolicyBlockedError
 from sagent.repl.render import (
     _STREAM_BUF_FLUSH_CHARS,
@@ -938,6 +939,11 @@ def test_help_text_contains_core_commands() -> None:
     assert "glob" in HELP_TEXT
 
 
+def test_help_text_lists_every_registered_provider_alias() -> None:
+    for alias in PROVIDER_ALIASES:
+        assert alias in HELP_TEXT
+
+
 def test_help_text_documents_recompact_as_compact_alias() -> None:
     line = next(line for line in HELP_TEXT.splitlines() if "/recompact" in line)
     assert "alias" in line
@@ -1001,7 +1007,7 @@ def test_service_suspended_surfaces_the_provider_message() -> None:
         provider="OpenAISubscription",
         auth="credentials",
         account=None,
-        model_id="sol-5.6+fast",
+        model_id="gpt-5.6-sol+fast",
         retry_at=time.time() + 7.0,
         delay_sec=7.0,
         server_supplied=False,

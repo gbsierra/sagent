@@ -5,7 +5,7 @@ Usage::
     from sagent.providers import MiniMax
 
     provider = MiniMax.from_env()       # MINIMAX_API_KEY
-    model = provider.model()            # minimax-3.0
+    model = provider.model()            # MiniMax-M3
     response = await model.buffer(request)
 
 Self-hosted::

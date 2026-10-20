@@ -65,7 +65,7 @@ def test_moonshot_base_url_override_via_from_key() -> None:
 
 
 def test_moonshot_offers_no_prompt_cache() -> None:
-    m = Moonshot.from_key("k").model("kimi-2.6")
+    m = Moonshot.from_key("k").model("kimi-k2.6")
     assert m.capability.cache_ttl_sec == frozenset({0.0})
 
 
@@ -91,11 +91,11 @@ def test_no_request_carries_the_fixed_temperature(model_id: str) -> None:
 
 
 def test_k3_sends_max_verbatim_rather_than_openais_high() -> None:
-    assert _body("kimi-3.0", effort="max")["reasoning_effort"] == "max"
+    assert _body("kimi-k3", effort="max")["reasoning_effort"] == "max"
 
 
 def test_k3_with_no_effort_leaves_the_server_default() -> None:
-    body = _body("kimi-3.0")
+    body = _body("kimi-k3")
     assert "reasoning_effort" not in body
     assert "thinking" not in body
 
@@ -105,15 +105,15 @@ def test_k3_with_no_effort_leaves_the_server_default() -> None:
     [("none", "disabled"), ("auto", "enabled")],
 )
 def test_k2_6_sends_its_thinking_switch(budget: ThinkingBudget, wire: str) -> None:
-    assert _body("kimi-2.6", budget=budget)["thinking"] == {"type": wire}
+    assert _body("kimi-k2.6", budget=budget)["thinking"] == {"type": wire}
 
 
 def test_k2_7_code_is_never_sent_the_thinking_parameter() -> None:
-    assert "thinking" not in _body("kimi-code-2.7")
+    assert "thinking" not in _body("kimi-k2.7-code")
 
 
 def test_the_wire_carries_the_vendor_id() -> None:
-    assert _body("kimi-code-highspeed-2.7")["model"] == "kimi-k2.7-code-highspeed"
+    assert _body("kimi-k2.7-code-highspeed")["model"] == "kimi-k2.7-code-highspeed"
 
 
 if __name__ == "__main__":

@@ -33,7 +33,9 @@ from sagent.catalog.table import (
 )
 from sagent.lib.codec import PlainTree, immutable
 from sagent.providers.providers import (
+    PROVIDER_ALIASES,
     PROVIDER_NAMES,
+    canonical_provider,
     infer_provider,
     provider_class,
 )
@@ -144,13 +146,21 @@ class AgentSelf:
                 "model_id": {
                     "type": "string",
                     "description": (
-                        "Optional model ID. Provider/auth are inferred from known"
-                        " model prefixes when possible."
+                        "Optional exact model ID, role (for example 'default'),"
+                        " or catalog alias (for example 'sol'). Provider/auth"
+                        " are inferred when exactly one API catalog accepts it."
                     ),
                 },
                 "provider": {
                     "type": "string",
-                    "description": "Optional provider class name override.",
+                    "description": (
+                        "Optional provider class name override. Short aliases: "
+                        + ", ".join(
+                            f"'{alias}'={target}"
+                            for alias, target in PROVIDER_ALIASES.items()
+                        )
+                        + "."
+                    ),
                 },
                 "auth": {
                     "type": "string",
@@ -205,8 +215,8 @@ class AgentSelf:
                 "catalog_provider": {
                     "type": "string",
                     "description": (
-                        "Provider name for catalog='models'."
-                        " Omit to use the active provider."
+                        "Provider name (or alias like 'oai') for"
+                        " catalog='models'. Omit to use the active provider."
                     ),
                 },
             },
@@ -221,7 +231,9 @@ class AgentSelf:
         allow_providers: tuple[str, ...] | None = None,
     ) -> None:
         self._allow_providers: tuple[str, ...] = (
-            tuple(allow_providers) if allow_providers is not None else PROVIDER_NAMES
+            tuple(canonical_provider(p) for p in allow_providers)
+            if allow_providers is not None
+            else PROVIDER_NAMES
         )
 
     def summary(self, args: Mapping[str, object]) -> str:
@@ -369,7 +381,7 @@ def plan_model_options(
         planned["thinking"] = value
     if "effort" in options:
         raw_value = options["effort"]
-        value = "none" if raw_value is None else raw_value
+        value = "default" if raw_value is None else raw_value
         if not isinstance(value, str):
             return ToolResult(
                 call_id="",
@@ -467,9 +479,11 @@ def _supported_model_options(model: Model) -> dict[str, str]:
     capability = model.capability
     if capability.thinking.budget != frozenset({"none"}):
         supported["thinking"] = "boolean"
-    efforts = capability.thinking.effort - {"none"}
-    if efforts:
-        supported["effort"] = " | ".join(repr(e) for e in sorted(efforts))
+    explicit_efforts = capability.thinking.effort - {"default"}
+    if explicit_efforts:
+        supported["effort"] = " | ".join(
+            repr(e) for e in sorted(capability.thinking.effort)
+        )
     if capability.cache_ttl_sec != frozenset({0.0}):
         supported["cache_ttl"] = " | ".join(
             repr(k) for k, v in CACHE_TTL_SEC.items() if v in capability.cache_ttl_sec
@@ -658,6 +672,7 @@ def _model_catalog_lines(provider_name: str) -> list[str]:
     """List statically known models for one provider, gated by allow-list."""
     if not provider_name:
         return ["Known models: set catalog_provider or configure an active provider."]
+    provider_name = canonical_provider(provider_name)
     provider_cls = provider_class(provider_name)
     if provider_cls is None:
         return [f"Known models: unknown provider {provider_name!r}."]
@@ -671,8 +686,12 @@ def _model_catalog_lines(provider_name: str) -> list[str]:
     lines = [f"Provider catalog: {provider_name}"]
     if isinstance(provider_cls, ModelResolver):
         table = provider_cls.catalog.models
-        roles = ", ".join(f"{role}={table[role].model_id}" for role in table.roles)
+        roles = ", ".join(f"{role}={target}" for role, target in table.roles.items())
+        aliases = ", ".join(
+            f"{alias}={target}" for alias, target in table.aliases.items()
+        )
         lines.append(f"Roles: {roles or 'none'}")
+        lines.append(f"Aliases: {aliases or 'none'}")
         lines.append(f"Known models: {', '.join(table) or 'none'}")
     else:
         lines.append("Known models: unavailable for this provider.")
@@ -727,7 +746,9 @@ def _agent_option_lines(agent: AgentSelfAgent) -> list[str]:
     if capability.thinking.budget == frozenset({"none"}):
         thinking = "unsupported"
     effort = settings.thinking_effort
-    if capability.thinking.effort == frozenset({"none"}):
+    if effort == "default" and capability.default_effort is not None:
+        effort = f"default ({capability.default_effort})"
+    if capability.thinking.effort == frozenset({"default"}):
         effort = "unsupported"
     service_tier = settings.service_tier
     if capability.service_tier == frozenset({"auto"}):
@@ -1014,6 +1035,8 @@ def _plan_model(
         )
     model_id = str(d.get("model_id", "")).strip() or None
     provider = str(d.get("provider", "")).strip() or None
+    if provider is not None:
+        provider = canonical_provider(provider)
     auth = str(d["auth"]).strip() if "auth" in d else None
     account = str(d["account"]).strip() if "account" in d else None
     if account == "":

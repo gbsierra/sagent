@@ -43,9 +43,10 @@ from sagent.agent.state import (
     max_depth_var,
 )
 from sagent.lib.codec import PlainTree, from_plain, immutable
-from sagent.providers import PROVIDER_NAMES
+from sagent.providers import PROVIDER_ALIASES, PROVIDER_NAMES
 from sagent.providers.providers import (
     build_provider_with_account_fallback,
+    canonical_provider,
     default_auth_for_provider,
     infer_provider,
 )
@@ -150,7 +151,7 @@ class AgentSpawn:
     ) -> None:
         if account == "":
             raise ValueError("account cannot be empty; pass None to inherit.")
-        self._provider = provider
+        self._provider = canonical_provider(provider) if provider is not None else None
         self._auth = auth
         self._model_id = model_id
         self._account = account
@@ -163,7 +164,7 @@ class AgentSpawn:
         self._max_attempts = max_attempts
         self._verbosity = verbosity
         self._allow_providers: tuple[str, ...] = (
-            tuple(allow_providers)
+            tuple(canonical_provider(p) for p in allow_providers)
             if allow_providers is not None
             else tuple(PROVIDER_NAMES)
         )
@@ -188,7 +189,13 @@ class AgentSpawn:
                             "Provider class name from ``sagent.providers``"
                             " (e.g. "
                             + ", ".join(f"``{n}``" for n in self._allow_providers)
-                            + "). Prefer ``*Subscription`` variants when listed;"
+                            + "). Short aliases: "
+                            + ", ".join(
+                                f"``{alias}``={target}"
+                                for alias, target in PROVIDER_ALIASES.items()
+                            )
+                            + "."
+                            " Prefer ``*Subscription`` variants when listed;"
                             " they reuse the host's logged-in CLI subscription"
                             " and don't need API-key env vars. Defaults to"
                             " inheriting the parent's provider."
@@ -210,10 +217,11 @@ class AgentSpawn:
                     "model_id": {
                         "type": "string",
                         "description": (
-                            "Model ID for the chosen provider (e.g."
-                            " ``sonnet-4.6``, ``gemini-pro-3.1``,"
-                            " ``sol-6.0``). Defaults to inheriting the parent's"
-                            " model id."
+                            "The provider's own model ID (e.g."
+                            " ``claude-sonnet-4-6``, ``gemini-3.1-pro-preview``,"
+                            " ``gpt-6-sol``) or a role (``default``,"
+                            " ``utility``), or a catalog alias such as ``sol``."
+                            " Defaults to inheriting the parent's model id."
                         ),
                     },
                     "model_options": {
@@ -835,6 +843,8 @@ class AgentSpawn:
     ) -> _ChildModel | ToolResult:
         """Resolve the child's model, its recipe, and the provider it now owns."""
         parent_spec = parent_agent.model_recipe if parent_agent is not None else None
+        if provider is not None:
+            provider = canonical_provider(provider)
         llm_asked = any(x is not None for x in (provider, auth, model_id, account))
         factory_asked = any(
             x is not None

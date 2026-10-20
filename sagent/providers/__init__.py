@@ -26,11 +26,15 @@ from sagent.providers.openai.api import OpenAI
 from sagent.providers.openai.compat import OpenAICompat
 from sagent.providers.openai.sub import OpenAISubscription
 from sagent.providers.providers import (
+    PROVIDER_ALIASES,
     PROVIDER_NAMES,
     ProviderName,
+    UnknownProviderError,
     build_provider,
+    canonical_provider,
     default_auth_for_provider,
     infer_provider,
+    require_provider,
 )
 from sagent.providers.selfhosted.server import (
     SelfHosted,
@@ -39,6 +43,7 @@ from sagent.providers.selfhosted.server import (
 
 
 __all__ = [
+    "PROVIDER_ALIASES",
     "PROVIDER_NAMES",
     "Anthropic",
     "AnthropicCLI",
@@ -54,7 +59,10 @@ __all__ = [
     "ProviderName",
     "SelfHosted",
     "SelfHostedModel",
+    "UnknownProviderError",
     "build_provider",
+    "canonical_provider",
     "default_auth_for_provider",
     "infer_provider",
+    "require_provider",
 ]

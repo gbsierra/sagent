@@ -1,8 +1,7 @@
 """Anthropic model catalog, expressed as ``ModelCapability`` rows.
 
-Sources:
-  - Limits, cutoffs: https://docs.anthropic.com/en/docs/about-claude/models
-  - Pricing: https://docs.anthropic.com/en/docs/about-claude/pricing
+Sources: limits, prices, and thinking per ``_SOURCES`` (a few rows override
+it in :func:`models`); also
   - Fast mode: https://docs.anthropic.com/en/docs/build-with-claude/fast-mode
   - Vision: https://platform.claude.com/docs/en/build-with-claude/vision
   - Request size: https://platform.claude.com/docs/en/api/overview
@@ -14,11 +13,12 @@ Sources:
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import date
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
 
+from sagent.catalog.provenance import Source
 from sagent.catalog.table import ModelTable
-from sagent.lib.codec import from_plain
 from sagent.types.capability import (
     ContextTag,
     ModelCapability,
@@ -28,7 +28,6 @@ from sagent.types.capability import (
 from sagent.types.cost import (
     PriceCatalog,
     PriceKey,
-    TokenCount,
     TokenPrice,
 )
 
@@ -38,6 +37,8 @@ if TYPE_CHECKING:
         Mapping,
     )
 
+    from sagent.catalog.provenance import Fact
+
 
 __all__ = [
     "CACHE_TTL_SEC",
@@ -45,7 +46,6 @@ __all__ = [
     "cli",
     "models",
     "subscription",
-    "usage_tokens",
 ]
 
 
@@ -77,8 +77,7 @@ def models() -> ModelTable:
     """
     # The reference row: every other model states only how it differs from it.
     default = ModelCapability(
-        model_id="opus-5.5",
-        wire_model_id="claude-opus-5-5",
+        model_id="claude-opus-5-5",
         knowledge_cutoff="June 2026",
         approx_chars_per_token=2.38,
         context=_limits(),
@@ -94,7 +93,7 @@ def models() -> ModelTable:
             fast_response=40.0,
         ),
         thinking=ThinkingCapability(
-            effort=frozenset({"none", "low", "medium", "high", "xhigh", "max"}),
+            effort=frozenset({"low", "medium", "high", "xhigh", "max"}),
             budget=frozenset({"none", "auto"}),
             output=frozenset({"none", "text", "redacted"}),
         ),
@@ -106,8 +105,7 @@ def models() -> ModelTable:
     )
     fable_5_1 = replace(
         default,
-        model_id="fable-5.1",
-        wire_model_id="claude-fable-5-1",
+        model_id="claude-fable-5-1",
         prices=_prices(
             _card(
                 request=10.0,
@@ -120,8 +118,7 @@ def models() -> ModelTable:
     )
     fable_5_0 = replace(
         default,
-        model_id="fable-5.0",
-        wire_model_id="claude-fable-5",
+        model_id="claude-fable-5",
         knowledge_cutoff="January 2026",
         prices=_prices(
             _card(
@@ -137,13 +134,12 @@ def models() -> ModelTable:
         fable_5_1,
         fable_5_0,
         # Invitation-only (Project Glasswing); same specs and prices as Fable.
-        replace(fable_5_1, model_id="mythos-5.1", wire_model_id="claude-mythos-5-1"),
-        replace(fable_5_0, model_id="mythos-5.0", wire_model_id="claude-mythos-5"),
+        replace(fable_5_1, model_id="claude-mythos-5-1"),
+        replace(fable_5_0, model_id="claude-mythos-5"),
         default,
         replace(
             default,
-            model_id="opus-5.0",
-            wire_model_id="claude-opus-5",
+            model_id="claude-opus-5",
             knowledge_cutoff="May 2026",
             prices=_prices(
                 _card(
@@ -159,8 +155,7 @@ def models() -> ModelTable:
         ),
         replace(
             default,
-            model_id="opus-4.8",
-            wire_model_id="claude-opus-4-8",
+            model_id="claude-opus-4-8",
             knowledge_cutoff="January 2026",
             prices=_prices(
                 _card(
@@ -179,8 +174,7 @@ def models() -> ModelTable:
         # standard, so a fast row would misprice both.
         replace(
             default,
-            model_id="opus-4.7",
-            wire_model_id="claude-opus-4-7",
+            model_id="claude-opus-4-7",
             knowledge_cutoff="January 2026",
             prices=_prices(
                 _card(
@@ -194,8 +188,7 @@ def models() -> ModelTable:
         ),
         replace(
             default,
-            model_id="opus-4.6",
-            wire_model_id="claude-opus-4-6",
+            model_id="claude-opus-4-6",
             knowledge_cutoff="May 2025",
             approx_chars_per_token=3.12,
             context=_limits(image_edge_px=1568),
@@ -210,13 +203,12 @@ def models() -> ModelTable:
             ),
             thinking=replace(
                 extended,
-                effort=frozenset({"none", "low", "medium", "high", "max"}),
+                effort=frozenset({"low", "medium", "high", "max"}),
             ),
         ),
         replace(
             default,
-            model_id="opus-4.5",
-            wire_model_id="claude-opus-4-5",
+            model_id="claude-opus-4-5",
             knowledge_cutoff="May 2025",
             approx_chars_per_token=3.12,
             context=_limits(
@@ -235,28 +227,27 @@ def models() -> ModelTable:
             ),
             thinking=replace(
                 extended,
-                effort=frozenset({"none", "low", "medium", "high"}),
+                effort=frozenset({"low", "medium", "high"}),
                 budget=frozenset({"none", "fixed"}),
             ),
         ),
         replace(
             default,
-            model_id="sonnet-5.5",
-            wire_model_id="claude-sonnet-5-5",
+            model_id="claude-sonnet-5-5",
             prices=_prices(
+                # Cache hits are 0.05x input here, not the standard 0.1x.
                 _card(
                     request=2.0,
                     response=10.0,
                     cache_write=2.5,
                     cache_write_1h=4.0,
-                    cache_read=0.2,
+                    cache_read=0.1,
                 ),
             ),
         ),
         replace(
             default,
-            model_id="sonnet-5.0",
-            wire_model_id="claude-sonnet-5",
+            model_id="claude-sonnet-5",
             knowledge_cutoff="January 2026",
             prices=_prices(
                 _card(
@@ -270,8 +261,7 @@ def models() -> ModelTable:
         ),
         replace(
             default,
-            model_id="sonnet-4.6",
-            wire_model_id="claude-sonnet-4-6",
+            model_id="claude-sonnet-4-6",
             knowledge_cutoff="August 2025",
             approx_chars_per_token=3.12,
             context=_limits(image_edge_px=1568),
@@ -286,13 +276,16 @@ def models() -> ModelTable:
             ),
             thinking=replace(
                 extended,
-                effort=frozenset({"none", "low", "medium", "high", "max"}),
+                effort=frozenset({"low", "medium", "high", "max"}),
             ),
         ),
+        # Deprecated 2026-09-30, retiring 2026-11-30 (replacement
+        # ``claude-sonnet-5-5``); requests fail after that date. Source:
+        # https://platform.claude.com/docs/en/about-claude/model-deprecations
+        # (read 2026-10-17).
         replace(
             default,
-            model_id="sonnet-4.5",
-            wire_model_id="claude-sonnet-4-5",
+            model_id="claude-sonnet-4-5",
             knowledge_cutoff="January 2025",
             approx_chars_per_token=3.12,
             context=_limits(
@@ -311,14 +304,40 @@ def models() -> ModelTable:
             ),
             thinking=replace(
                 extended,
-                effort=frozenset({"none"}),
+                effort=frozenset(),
                 budget=frozenset({"none", "fixed"}),
+            ),
+        ),
+        # The one row priced by prompt length: a request whose prompt (cache
+        # reads and writes included) is over 100,000 tokens pays the upper
+        # band. No fast mode. Sources (both read 2026-10-17):
+        # https://platform.claude.com/docs/en/models/haiku-5-5/overview
+        # https://platform.claude.com/docs/en/about-claude/pricing#long-context-pricing
+        replace(
+            default,
+            model_id="claude-haiku-5-5",
+            prices=PriceCatalog(
+                {
+                    PriceKey("auto"): _card(
+                        request=0.1,
+                        response=0.5,
+                        cache_write=0.125,
+                        cache_write_1h=0.2,
+                        cache_read=0.01,
+                    ),
+                    PriceKey("auto", effective_prompt_tokens=100_000): _card(
+                        request=0.5,
+                        response=2.5,
+                        cache_write=0.625,
+                        cache_write_1h=1.0,
+                        cache_read=0.05,
+                    ),
+                },
             ),
         ),
         replace(
             default,
-            model_id="haiku-4.5",
-            wire_model_id="claude-haiku-4-5",
+            model_id="claude-haiku-4-5",
             knowledge_cutoff="February 2025",
             approx_chars_per_token=3.12,
             context=_limits(
@@ -337,17 +356,104 @@ def models() -> ModelTable:
             ),
             thinking=replace(
                 extended,
-                effort=frozenset({"none"}),
+                effort=frozenset(),
                 budget=frozenset({"none", "fixed"}),
             ),
         ),
+    )
+    # 4.5 and earlier ids are dateless aliases of dated snapshots, and the API
+    # reports the snapshot it served; 4.6 and later are dateless and pinned.
+    # Source: https://platform.claude.com/docs/en/about-claude/models/model-ids-and-versions
+    # (checked 2026-10-17). The haiku pair is also what ``claude`` 2.1.227's
+    # initialize handshake reports for its ``haiku`` alias (probed 2026-10-17).
+    by_id = {row.model_id: row for row in rows}
+    rows += tuple(
+        replace(by_id[alias], model_id=snapshot)
+        for alias, snapshot in (
+            ("claude-opus-4-5", "claude-opus-4-5-20251101"),
+            ("claude-sonnet-4-5", "claude-sonnet-4-5-20250929"),
+            ("claude-haiku-4-5", "claude-haiku-4-5-20251001"),
+        )
+    )
+    # output_config.effort defaults to high on every supported model except
+    # Opus 5.5 and Haiku 5.5, whose published default is medium.
+    # https://platform.claude.com/docs/en/build-with-claude/effort
+    medium_defaults = {"claude-opus-5-5", "claude-haiku-5-5"}
+    rows = tuple(
+        replace(
+            row,
+            default_effort=(
+                "medium"
+                if row.model_id in medium_defaults
+                else "high"
+                if row.thinking.effort - {"default", "none"}
+                else None
+            ),
+        )
+        for row in rows
     )
     # A tier is offered exactly when it is priced.
     rows = tuple(replace(row, service_tier=row.prices.service_tiers) for row in rows)
     return ModelTable(
         rows=rows,
-        roles={"best": "fable", "default": "opus", "utility": "sonnet"},
+        roles={
+            "best": "claude-fable-5-1",
+            "default": "claude-opus-5-5",
+            "utility": "claude-sonnet-5-5",
+        },
+        renamed=_RENAMED,
+        sources=_SOURCES,
+        row_sources={
+            "claude-sonnet-5-5": {"prices": Source(_PRICING, date(2026, 10, 18))},
+            "claude-haiku-5-5": {
+                "limits": Source(
+                    "https://platform.claude.com/docs/en/models/haiku-5-5/overview",
+                    date(2026, 10, 17),
+                ),
+                "prices": Source(
+                    f"{_PRICING}#long-context-pricing",
+                    date(2026, 10, 17),
+                ),
+            },
+        },
     )
+
+
+_PRICING: Final = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+_SOURCES: Final[Mapping[Fact, Source]] = MappingProxyType(
+    {
+        "limits": Source("https://docs.anthropic.com/en/docs/about-claude/models"),
+        "prices": Source(_PRICING, date(2026, 10, 3)),
+        "thinking": Source(
+            "https://platform.claude.com/docs/en/build-with-claude/thinking",
+            date(2026, 10, 3),
+        ),
+    },
+)
+
+
+# Sagent's own spellings before rows were keyed by vendor id; kept so saved
+# sessions and settings load. Never extend: a new row has only its vendor id.
+_RENAMED: Final = MappingProxyType(
+    {
+        "fable-5.1": "claude-fable-5-1",
+        "fable-5.0": "claude-fable-5",
+        "mythos-5.1": "claude-mythos-5-1",
+        "mythos-5.0": "claude-mythos-5",
+        "opus-5.5": "claude-opus-5-5",
+        "opus-5.0": "claude-opus-5",
+        "opus-4.8": "claude-opus-4-8",
+        "opus-4.7": "claude-opus-4-7",
+        "opus-4.6": "claude-opus-4-6",
+        "opus-4.5": "claude-opus-4-5",
+        "sonnet-5.5": "claude-sonnet-5-5",
+        "sonnet-5.0": "claude-sonnet-5",
+        "sonnet-4.6": "claude-sonnet-4-6",
+        "sonnet-4.5": "claude-sonnet-4-5",
+        "haiku-4.5": "claude-haiku-4-5",
+    },
+)
 
 
 # A row carries only what the MODEL can do; caching, retry, and auth mode are
@@ -360,9 +466,9 @@ def api() -> ModelCapability:
 
     One model, three ways in::
 
-        models()["opus-5.0"] & api()          # API key: full tiers, cache
-        models()["opus-5.0"] & subscription() # same wire, OAuth-billed
-        models()["opus-5.0"] & cli()          # subprocess: no effort/tier
+        models()["claude-opus-5"] & api()          # API key: full tiers, cache
+        models()["claude-opus-5"] & subscription() # same wire, OAuth-billed
+        models()["claude-opus-5"] & cli()          # subprocess: no effort/tier
 
     Returns:
       capability: The API transport's restrictions.
@@ -389,9 +495,9 @@ def cli() -> ModelCapability:
 
     One model, three ways in::
 
-        models()["opus-5.0"] & api()          # API key: full tiers, cache
-        models()["opus-5.0"] & subscription() # same wire, OAuth-billed
-        models()["opus-5.0"] & cli()          # subprocess: no effort/tier
+        models()["claude-opus-5"] & api()          # API key: full tiers, cache
+        models()["claude-opus-5"] & subscription() # same wire, OAuth-billed
+        models()["claude-opus-5"] & cli()          # subprocess: no effort/tier
 
     Returns:
       capability: The CLI transport's restrictions.
@@ -399,7 +505,7 @@ def cli() -> ModelCapability:
     """
     return ModelCapability(
         thinking=ThinkingCapability(
-            effort=frozenset({"none"}),
+            effort=frozenset(),
             budget=frozenset({"none", "auto", "fixed"}),
             output=frozenset({"none", "text"}),
         ),
@@ -412,45 +518,15 @@ def subscription() -> ModelCapability:
 
     One model, three ways in::
 
-        models()["opus-5.0"] & api()          # API key: full tiers, cache
-        models()["opus-5.0"] & subscription() # same wire, OAuth-billed
-        models()["opus-5.0"] & cli()          # subprocess: no effort/tier
+        models()["claude-opus-5"] & api()          # API key: full tiers, cache
+        models()["claude-opus-5"] & subscription() # same wire, OAuth-billed
+        models()["claude-opus-5"] & cli()          # subprocess: no effort/tier
 
     Returns:
       capability: The subscription transport's restrictions.
 
     """
     return replace(api(), account_auth=True)
-
-
-def usage_tokens(usage: Mapping[str, object], *, cache_ttl_sec: float) -> TokenCount:
-    """Read one Messages-API ``usage`` block into disjoint meters.
-
-    ``cache_creation`` splits the write by lifetime. A block without it (an
-    older transcript) is attributed wholly to ``cache_ttl_sec``, the lifetime
-    the request asked for.
-
-    Args:
-      usage: The response's ``usage`` object, as a mapping.
-      cache_ttl_sec: Lifetime the request's cache breakpoints asked for.
-
-    Returns:
-      tokens: The request's usage.
-
-    """
-    written = from_plain(usage.get("cache_creation_input_tokens"), int, default=0)
-    split = from_plain(usage.get("cache_creation"), dict[str, object], default={})
-    if split:
-        written_1h = from_plain(split.get("ephemeral_1h_input_tokens"), int, default=0)
-    else:
-        written_1h = written if cache_ttl_sec >= 3600.0 else 0
-    return TokenCount(
-        request=from_plain(usage.get("input_tokens"), int, default=0),
-        response=from_plain(usage.get("output_tokens"), int, default=0),
-        cache_write=written - written_1h,
-        cache_write_1h=written_1h,
-        cache_read=from_plain(usage.get("cache_read_input_tokens"), int, default=0),
-    )
 
 
 def _card(

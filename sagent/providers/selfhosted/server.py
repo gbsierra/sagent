@@ -770,7 +770,10 @@ class SelfHostedModel(ModelDefaults):
             "add_generation_prompt": True,
             "return_tensors": "pt",
         }
-        kwargs["enable_thinking"] = self.settings.thinking_effort != "none"
+        kwargs["enable_thinking"] = self.settings.thinking_effort not in {
+            "default",
+            "none",
+        }
         if request.tools:
             kwargs["tools"] = [_tool_schema(t) for t in request.tools]
         rendered = _apply_chat_template(

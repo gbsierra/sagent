@@ -138,7 +138,7 @@ def _mode_parts(agent: Agent) -> list[str]:
         parts.append(f"thinking={settings.thinking_budget}")
     if settings.thinking_output != "none":
         parts.append(f"reasoning={settings.thinking_output}")
-    if settings.thinking_effort != "none":
+    if settings.thinking_effort != "default":
         parts.append(f"effort={settings.thinking_effort}")
     if settings.cache_ttl_sec:
         parts.append(f"cache_ttl={settings.cache_ttl_sec:g}s")

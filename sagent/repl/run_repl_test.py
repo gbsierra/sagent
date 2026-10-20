@@ -18,6 +18,7 @@ from prompt_toolkit.key_binding import KeyPressEvent
 
 import pytest
 
+from sagent import providers
 from sagent.agent.agent import Agent, _resolve_target_spec
 from sagent.agent.background import BackgroundTaskEntry
 from sagent.agent.runtime import AgentRuntime, Compactor, Model
@@ -364,6 +365,41 @@ def test_parse_model_args_mixed_flags_and_bare_model() -> None:
     assert out == ("Google", "sub", None, "gemini-3-pro")
 
 
+@pytest.mark.parametrize(
+    "tokens",
+    [
+        ("provider=oai", "gpt-5.5"),
+        ("--provider", "OAI", "gpt-5.5"),
+        ("-p", "oai", "gpt-5.5"),
+    ],
+)
+def test_parse_model_args_canonicalizes_provider_alias(tokens: tuple[str, ...]) -> None:
+    parsed = _parse_model_args(list(tokens))
+    assert not isinstance(parsed, str)
+    assert parsed.provider == "OpenAI"
+
+
+def test_parse_model_args_unknown_provider_returns_error_string() -> None:
+    out = _parse_model_args(["provider=oaii"])
+    assert isinstance(out, str)
+    assert out.startswith("[/model]")
+    assert "'oaii'" in out
+    assert "oaisub" in out
+
+
+def test_resolve_target_spec_canonicalizes_provider_alias() -> None:
+    with patch.object(last_models, "load", return_value={}):
+        out = _resolve_target_spec(
+            _DEFAULT_SPEC,
+            provider="antsub",
+            auth=None,
+            model_id=None,
+            account=None,
+        )
+    assert out.provider == "AnthropicCLI"
+    assert out.auth == "credentials"
+
+
 def test_provider_switch_uses_last_used_when_known(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -374,9 +410,21 @@ def test_provider_switch_uses_last_used_when_known(
     Google model in the sagent ``last-models.json``, the resolver picks
     that up. ``Google.DEFAULT_MODEL`` is the cold-start fallback.
     """
+    monkeypatch.setattr(
+        last_models,
+        "load",
+        lambda: {"Google": "gemini-2.5-flash-lite"},
+    )
+    out = _parse("provider=Google")
+    assert out == ("Google", "env", None, "gemini-2.5-flash-lite")
+
+
+def test_provider_switch_skips_a_last_used_id_the_catalog_dropped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(last_models, "load", lambda: {"Google": "remembered-model"})
     out = _parse("provider=Google")
-    assert out == ("Google", "env", None, "remembered-model")
+    assert out == ("Google", "env", None, "default")
 
 
 def test_provider_switch_preserves_current_model_when_new_provider_knows_it() -> None:
@@ -654,6 +702,37 @@ def test_do_switch_model_infer_provider_overrides_provider_and_auth() -> None:
     )
 
 
+def test_do_switch_model_label_names_the_vendor_id_a_role_resolves_to() -> None:
+    """``/model default`` announces the vendor id, noting the role typed."""
+    resolved = providers.OpenAI.catalog.models["default"].model_id
+    assert resolved != "default"
+    agent = _FakeAgent(
+        model=_FakeModel(model_id="gpt-6-sol"),
+        model_recipe=ModelRecipe(provider="OpenAI", auth="env", model_id="gpt-6-sol"),
+    )
+    agent.change_model_result = ModelRecipe(
+        provider="OpenAI",
+        auth="env",
+        model_id=resolved,
+    )
+    printer = RecordingPrinter()
+    do_switch_model(_as_agent(agent), "default", printer)
+    assert agent.change_model_calls[0]["model_id"] == "default"
+    assert any(
+        f"gpt-6-sol -> {resolved} (as default)" in line for line in printer.slash_blocks
+    )
+
+
+def test_do_switch_model_status_names_the_id_the_running_model_reports() -> None:
+    agent = _FakeAgent(
+        model=_FakeModel(model_id="gpt-6.1-sol"),
+        model_recipe=ModelRecipe(provider="OpenAI", auth="env", model_id="gpt-6.1-sol"),
+    )
+    printer = RecordingPrinter()
+    do_switch_model(_as_agent(agent), "", printer)
+    assert any("model=gpt-6.1-sol " in line for line in printer.slash_blocks)
+
+
 def test_do_switch_model_change_model_error_writes_to_printer() -> None:
     """``Agent.change_model`` errors surface verbatim to the printer."""
     agent = _FakeAgent()
@@ -665,6 +744,44 @@ def test_do_switch_model_change_model_error_writes_to_printer() -> None:
     ):
         do_switch_model(_as_agent(agent), "claude-sonnet-4-6", printer)
     assert any("no credentials" in line for line in printer.slash_blocks)
+
+
+def test_do_switch_model_provider_alias_passes_canonical_name() -> None:
+    agent = _FakeAgent()
+    printer = RecordingPrinter()
+    do_switch_model(_as_agent(agent), "provider=oai model=gpt-5.5", printer)
+    assert agent.change_model_calls == [
+        {
+            "provider": "OpenAI",
+            "auth": None,
+            "model_id": "gpt-5.5",
+            "account": None,
+        },
+    ]
+    assert any(
+        "Anthropic/claude-opus-4-7 -> OpenAI/gpt-5.5" in line
+        for line in printer.slash_blocks
+    )
+
+
+def test_do_switch_model_unknown_provider_writes_error() -> None:
+    agent = _FakeAgent()
+    printer = RecordingPrinter()
+    do_switch_model(_as_agent(agent), "provider=oaii", printer)
+    assert agent.change_model_calls == []
+    assert any(
+        line.startswith("[/model]") and "'oaii'" in line
+        for line in printer.slash_blocks
+    )
+
+
+def test_do_switch_model_attribute_error_writes_to_printer() -> None:
+    """A provider without the requested ``from_<auth>`` raises AttributeError."""
+    agent = _FakeAgent()
+    agent.change_model_side_effect = AttributeError("no ``from_bogus`` method")
+    printer = RecordingPrinter()
+    do_switch_model(_as_agent(agent), "provider=oai auth=bogus", printer)
+    assert any("no ``from_bogus`` method" in line for line in printer.slash_blocks)
 
 
 def test_do_switch_thinking_selects_the_budget() -> None:
@@ -757,7 +874,7 @@ def test_do_switch_effort_rejects_invalid_value() -> None:
     agent = _FakeAgent()
     printer = RecordingPrinter()
     do_switch_effort(_as_agent(agent), "bogus", printer)
-    assert agent.model.settings.thinking_effort == "none"
+    assert agent.model.settings.thinking_effort == "default"
     assert "is not one of" in printer.slash_blocks[0]
 
 

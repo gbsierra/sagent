@@ -144,7 +144,7 @@ def _settings_for(capability: ModelCapability, effort: ThinkingEffort) -> ModelS
     return replace(
         ModelSettings.narrowest(capability),
         thinking_effort=effort,
-        thinking_budget=budget if effort != "none" else "none",
+        thinking_budget=budget if effort not in {"default", "none"} else "none",
         thinking_output=output,
     )
 
@@ -162,7 +162,7 @@ def test_every_advertised_effort_reaches_the_wire(
     """
     make, thinking_of = _WIRE_BUILDERS[provider_name]
     model = make().model(model_id)
-    for effort in model.capability.thinking.effort - {"none"}:
+    for effort in model.capability.thinking.effort - {"default", "none"}:
         sent = thinking_of(model, _settings_for(model.capability, effort))
         assert sent is not None, (
             f"{provider_name}/{model_id} advertises effort {effort!r} but the"
@@ -171,23 +171,22 @@ def test_every_advertised_effort_reaches_the_wire(
 
 
 @pytest.mark.parametrize(("provider_name", "model_id"), _ROWS, ids=str)
-def test_a_row_with_no_efforts_sends_no_thinking_knob(
+def test_default_effort_sends_no_thinking_knob(
     provider_name: str,
     model_id: str,
 ) -> None:
-    """A row that advertises no effort must not send one.
-
-    ``thinking_effort == {"none"}`` is a positive claim: the model
-    REJECTS the knob (the qwen ``-instruct`` ids reject ``enable_thinking``). A builder reading
-    a private table instead of the row sends it anyway and earns a 400.
-    """
+    """Every model preserves its provider-owned default by omitting effort."""
     make, thinking_of = _WIRE_BUILDERS[provider_name]
     model = make().model(model_id)
-    if model.capability.thinking.effort - {"none"}:
-        pytest.skip("row advertises efforts")
-    assert thinking_of(model, _settings_for(model.capability, "none")) is None, (
-        f"{provider_name}/{model_id} advertises no effort yet the wire body"
-        " carries a thinking knob"
+    sent = thinking_of(model, ModelSettings.narrowest(model.capability))
+    if provider_name == "Anthropic":
+        carries_effort = sent is not None
+    elif provider_name == "Google":
+        carries_effort = isinstance(sent, dict) and "thinkingLevel" in sent
+    else:
+        carries_effort = isinstance(sent, dict) and "reasoning_effort" in sent
+    assert not carries_effort, (
+        f"{provider_name}/{model_id} default effort emitted an effort knob: {sent}"
     )
 
 
@@ -203,7 +202,7 @@ def test_distinct_efforts_stay_distinct_on_the_wire(
     """
     make, thinking_of = _WIRE_BUILDERS[provider_name]
     model = make().model(model_id)
-    efforts = sorted(model.capability.thinking.effort - {"none"})
+    efforts = sorted(model.capability.thinking.effort - {"default", "none"})
     if not efforts:
         pytest.skip("row advertises no efforts")
     by_wire: dict[str, set[str]] = {}

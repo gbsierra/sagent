@@ -39,7 +39,16 @@ __all__ = [
 ]
 
 
-type ThinkingEffort = Literal["none", "min", "low", "medium", "high", "xhigh", "max"]
+type ThinkingEffort = Literal[
+    "default",
+    "none",
+    "min",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+]
 
 type ThinkingBudget = Literal["none", "auto", "fixed"]
 
@@ -79,14 +88,18 @@ class ModelLimits:
 class ThinkingCapability:
     """Reasoning knobs one model or transport accepts, one set per axis."""
 
-    effort: frozenset[ThinkingEffort] = frozenset({"none"})
-    """Effort levels accepted."""
+    effort: frozenset[ThinkingEffort] = frozenset({"default"})
+    """Effort selections accepted; ``default`` means omit the wire knob."""
 
     budget: frozenset[ThinkingBudget] = frozenset({"none"})
     """Budget modes accepted."""
 
     output: frozenset[ThinkingOutput] = frozenset({"none"})
     """Reasoning-visibility modes accepted."""
+
+    def __post_init__(self) -> None:
+        """Make the provider-owned default selectable on every transport."""
+        object.__setattr__(self, "effort", self.effort | {"default"})
 
     def __and__(self, other: ThinkingCapability) -> ThinkingCapability:
         """Narrow each axis to what BOTH offer."""
@@ -111,10 +124,7 @@ class ModelCapability:
     """
 
     model_id: str = ""
-    """Our normalized model id, without option tags."""
-
-    wire_model_id: str = ""
-    """Vendor id when it differs from :attr:`model_id`; blank means identical."""
+    """The vendor's model id, as its API takes it, without context tags."""
 
     knowledge_cutoff: str | None = None
     """Vendor-published knowledge cutoff, formatted for the system prompt."""
@@ -132,6 +142,9 @@ class ModelCapability:
 
     thinking: ThinkingCapability = field(default_factory=ThinkingCapability)
     """Reasoning effort, budget, and visibility this transport accepts."""
+
+    default_effort: ThinkingEffort | None = None
+    """Published effective effort when ``default`` is selected, if named."""
 
     effort_as_level: bool = False
     """Whether the wire takes the effort as a named level.
@@ -175,6 +188,11 @@ class ModelCapability:
     account_auth: bool = False
     """Whether this transport bills an account rather than an API key."""
 
+    def __post_init__(self) -> None:
+        """Reject the sentinel as an effective provider level."""
+        if self.default_effort == "default":
+            raise ValueError("default_effort must name the effective provider level")
+
     def __and__(self, other: ModelCapability) -> Self:
         """Narrow to what BOTH offer -- a catalog row met with a transport.
 
@@ -206,12 +224,12 @@ class ModelCapability:
         return hash(
             (
                 self.model_id,
-                self.wire_model_id,
                 self.knowledge_cutoff,
                 self.approx_chars_per_token,
                 frozenset(self.context.items()),
                 frozenset(self.prices.items()),
                 self.thinking,
+                self.default_effort,
                 self.effort_as_level,
                 self.service_tier,
                 self.manage_context_server_side,
@@ -251,7 +269,7 @@ class ModelSettings:
     context: ContextTag = ""
     """Selected context window."""
 
-    thinking_effort: ThinkingEffort = "none"
+    thinking_effort: ThinkingEffort = "default"
     """Selected effort level."""
 
     thinking_budget: ThinkingBudget = "none"
@@ -328,8 +346,13 @@ class ModelSettings:
         The lenient counterpart to assignment, and the ONLY way to cross
         capabilities: a knob the incoming model rejects is not merely stale,
         it ships on the next request and earns a 400 -- but a swap or a
-        resume must not FAIL on it either. Each unoffered axis falls back to
-        the lowest rung this capability does offer.
+        resume must not FAIL on it either.
+
+        An unoffered ``thinking_effort`` above ``none`` lands on the nearest
+        offered rung that still thinks -- ``max`` on a row topping out at
+        ``high`` becomes ``high``, not ``none`` -- and a tie rounds down.
+        Every other unoffered axis, and an effort with no thinking rung to
+        land on, falls back to the lowest rung this capability does offer.
 
         Args:
           choices: Field name to desired value.
@@ -344,8 +367,15 @@ class ModelSettings:
             raise ValueError(f"not settings axes: {', '.join(unknown)}")
         narrow = type(self).narrowest(self.capability, context=self.context)
         for name, wanted in choices.items():
-            offered = _offers(self.capability, name, wanted)
-            setattr(self, name, wanted if offered else getattr(narrow, name))
+            if _offers(self.capability, name, wanted):
+                setattr(self, name, wanted)
+                continue
+            nearest = (
+                _nearest_effort(self.capability.thinking.effort, wanted)
+                if name == "thinking_effort"
+                else None
+            )
+            setattr(self, name, nearest or getattr(narrow, name))
 
     @classmethod
     def narrowest(
@@ -412,6 +442,13 @@ class ModelSettings:
         """Ceilings the selected context tag carries."""
         return self.capability.context[self.context]
 
+    @property
+    def effective_thinking_effort(self) -> ThinkingEffort:
+        """Return the published level behind ``default``, when one is known."""
+        if self.thinking_effort == "default":
+            return self.capability.default_effort or "default"
+        return self.thinking_effort
+
 
 def _allowed(capability: ModelCapability, name: str) -> Collection[object]:
     """Return the set ``capability`` offers for the settings axis ``name``."""
@@ -446,6 +483,30 @@ def _ladder[T](alias: object) -> tuple[T, ...]:
     """Return the Literal's members, in declaration order -- least committing first."""
     underlying: object = cast(TypeAliasType, alias).__value__  # pyright: ignore[reportAny] -- PEP 695 aliases expose their target through __value__.
     return cast(tuple[T, ...], get_args(underlying))
+
+
+def _nearest_effort(
+    offered: Collection[ThinkingEffort],
+    wanted: object,
+) -> ThinkingEffort | None:
+    """Return the offered thinking rung closest to ``wanted``, ties rounding down.
+
+    ``None`` when ``wanted`` is ``default``/``none`` or off the ladder, or
+    when no explicit thinking rung is offered: neither provider policy nor
+    "do not think" may be promoted into an explicit reasoning level.
+    """
+    ladder = cast(tuple[ThinkingEffort, ...], _ladder(ThinkingEffort))
+    if wanted in {"default", "none"} or wanted not in ladder:
+        return None
+    target = ladder.index(wanted)
+    rungs = [
+        i
+        for i, rung in enumerate(ladder)
+        if rung not in {"default", "none"} and rung in offered
+    ]
+    if not rungs:
+        return None
+    return ladder[min(rungs, key=lambda i: (abs(i - target), i))]
 
 
 def _lowest[T](name: str, offered: Collection[T], ladder: Sequence[T]) -> T:

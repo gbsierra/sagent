@@ -16,13 +16,13 @@ _TODAY = date(2026, 10, 3)
 @pytest.mark.parametrize(
     ("model_id", "published"),
     [
-        ("minimax-2.7", (0.3, 1.2, 0.06, 0.375)),
-        ("minimax-highspeed-2.7", (0.6, 2.4, 0.06, 0.375)),
-        ("minimax-2.5", (0.3, 1.2, 0.03, 0.375)),
-        ("minimax-highspeed-2.5", (0.6, 2.4, 0.03, 0.375)),
-        ("minimax-2.1", (0.3, 1.2, 0.03, 0.375)),
-        ("minimax-highspeed-2.1", (0.6, 2.4, 0.03, 0.375)),
-        ("minimax-2.0", (0.3, 1.2, 0.03, 0.375)),
+        ("MiniMax-M2.7", (0.3, 1.2, 0.06, 0.375)),
+        ("MiniMax-M2.7-highspeed", (0.6, 2.4, 0.06, 0.375)),
+        ("MiniMax-M2.5", (0.3, 1.2, 0.03, 0.375)),
+        ("MiniMax-M2.5-highspeed", (0.6, 2.4, 0.03, 0.375)),
+        ("MiniMax-M2.1", (0.3, 1.2, 0.03, 0.375)),
+        ("MiniMax-M2.1-highspeed", (0.6, 2.4, 0.03, 0.375)),
+        ("MiniMax-M2", (0.3, 1.2, 0.03, 0.375)),
     ],
 )
 def test_m2_rows_bill_the_published_card(
@@ -49,7 +49,7 @@ def test_m3_bills_its_band_and_tier(
     prompt_tokens: int,
     published: tuple[float, float, float],
 ) -> None:
-    price = minimax.models()["minimax-3.0"].prices.rate(
+    price = minimax.models()["MiniMax-M3"].prices.rate(
         service_tier=tier,
         prompt_tokens=prompt_tokens,
         at=_TODAY,
@@ -62,7 +62,7 @@ def test_m3_bills_its_band_and_tier(
 def test_only_m3_offers_priority() -> None:
     rows = minimax.models()
     assert {m for m, row in rows.items() if "priority" in row.service_tier} == {
-        "minimax-3.0",
+        "MiniMax-M3",
     }
 
 
@@ -72,27 +72,27 @@ def test_api_adds_priority_to_the_compatible_transport() -> None:
 
 def test_m2_thinking_cannot_be_disabled_and_m3_can() -> None:
     rows = minimax.models()
-    assert rows["minimax-2.7"].thinking.budget == {"none"}
-    assert rows["minimax-3.0"].thinking.budget == {"none", "auto"}
+    assert rows["MiniMax-M2.7"].thinking.budget == {"none"}
+    assert rows["MiniMax-M3"].thinking.budget == {"none", "auto"}
 
 
 def test_windows_match_the_published_limits() -> None:
     rows = minimax.models()
-    m3 = rows["minimax-3.0"].context[""]
+    m3 = rows["MiniMax-M3"].context[""]
     assert (m3.max_request_tokens, m3.max_response_tokens) == (1_000_000, 524_288)
     assert (m3.max_request_bytes, m3.max_image_bytes) == (64 << 20, 10 << 20)
-    m2 = rows["minimax-2.7"].context[""]
+    m2 = rows["MiniMax-M2.7"].context[""]
     assert (m2.max_request_tokens, m2.max_response_tokens) == (204_800, 204_800)
 
 
 def test_roles_name_live_rows() -> None:
     rows = minimax.models()
-    assert rows["default"].model_id == "minimax-3.0"
-    assert rows["utility"].model_id == "minimax-3.0"
+    assert rows["default"].model_id == "MiniMax-M3"
+    assert rows["utility"].model_id == "MiniMax-M3"
 
 
 @pytest.mark.parametrize(
-    ("model_id", "wire_id"),
+    ("retired", "vendor_id"),
     [
         ("minimax-3.0", "MiniMax-M3"),
         ("minimax-2.7", "MiniMax-M2.7"),
@@ -100,10 +100,14 @@ def test_roles_name_live_rows() -> None:
         ("minimax-highspeed-2.7", "MiniMax-M2.7-highspeed"),
     ],
 )
-def test_vendor_ids_resolve_to_their_rows(model_id: str, wire_id: str) -> None:
+def test_a_retired_sagent_name_reaches_its_vendor_row(
+    retired: str,
+    vendor_id: str,
+) -> None:
+    """A session saved under the old spelling loads as the vendor id."""
     rows = minimax.models()
-    assert rows[model_id].wire_model_id == wire_id
-    assert rows[wire_id].model_id == model_id
+    assert rows[retired].model_id == vendor_id
+    assert rows.exact(retired) is None
 
 
 @pytest.mark.parametrize(

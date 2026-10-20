@@ -1100,6 +1100,7 @@ class _AnthropicCLIModel(CLISubprocessModel, ModelDefaults):
         # across rounds), and billing is unaffected either way
         # (``total_cost`` comes from ``modelUsage.costUSD``, summed).
         last_round_usage: dict[str, MutablePlainTree] | None = None
+        served_model_id = ""
         message_id = ""
         stop_reason: str | None = None
         while True:
@@ -1142,6 +1143,16 @@ class _AnthropicCLIModel(CLISubprocessModel, ModelDefaults):
                     usage = msg.get("usage")
                     if isinstance(usage, dict):
                         last_round_usage = usage
+                    # A ``stream_event`` wraps the raw Messages API event, for
+                    # the main session only (subagent rounds are not
+                    # forwarded), so ``message.model`` is the model that ran
+                    # this round. Sources:
+                    # https://code.claude.com/docs/en/agent-sdk/streaming-output
+                    # https://platform.claude.com/docs/en/api/http/messages/create
+                    # (both read 2026-10-17).
+                    served = msg.get("model")
+                    if isinstance(served, str) and served:
+                        served_model_id = served
                 _dispatch_stream_event(
                     inner,
                     text_parts,
@@ -1166,6 +1177,7 @@ class _AnthropicCLIModel(CLISubprocessModel, ModelDefaults):
             thinking_blocks=thinking_blocks,
             stop_reason=stop_reason,
             fallback_message_id=message_id,
+            served_model_id=served_model_id,
         )
 
     async def _spawn_spare_initialized(self) -> Subproc:
@@ -1213,7 +1225,7 @@ class _AnthropicCLIModel(CLISubprocessModel, ModelDefaults):
             )
             spawn_owned_tmpdir = tmpdir
         argv = _build_anthropic_argv(
-            model_id=self.capability.wire_model_id or self.capability.model_id,
+            model_id=self.capability.model_id,
             system_prompt=self._pending_system,
             bridge_url=self._tools_bridge.url,
             bridge_server_name=self._tools_bridge.server_name,
@@ -1849,6 +1861,7 @@ def _build_model_response(
     thinking_blocks: list[dict[str, str]],
     stop_reason: str | None,
     fallback_message_id: str,
+    served_model_id: str = "",
 ) -> ModelResponse:
     """Assemble a ``ModelResponse`` with normalized token semantics."""
     model_usage = cast(dict[str, MutablePlainTree], usage_event.get("modelUsage") or {})
@@ -1914,4 +1927,5 @@ def _build_model_response(
         # breakdown. Booking it to ``request`` keeps ``spend.total`` exact;
         # the per-bucket split is simply not observable on this transport.
         spend=TokenCost(request=total_cost),
+        served_model_id=served_model_id,
     )
