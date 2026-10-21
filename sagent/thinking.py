@@ -93,6 +93,8 @@ def thinking_offered(command: str, settings: ModelSettings) -> bool:
       offered: True when applying ``command`` would succeed.
 
     """
+    if command == "off" and settings.capability.thinking.control == "always":
+        return False
     budget, output, _ = _axes(command, settings, show=True)
     capability = settings.capability
     return budget in capability.thinking.budget and output in capability.thinking.output
@@ -109,6 +111,10 @@ def describe_thinking(settings: ModelSettings, *, show: bool) -> str:
       words: One or two words from :data:`THINKING_COMMANDS`.
 
     """
+    if settings.capability.thinking.control == "always":
+        return (
+            "always show" if show and settings.thinking_output == "text" else "always"
+        )
     if settings.thinking_output == "redacted":
         return "redact"
     budget = {"none": "off", "auto": "adaptive", "fixed": "on"}[

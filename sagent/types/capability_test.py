@@ -9,6 +9,8 @@ from typing import Final
 import pytest
 
 from sagent.types.capability import (
+    LimitCondition,
+    LimitOverlay,
     ModelCapability,
     ModelLimits,
     ModelSettings,
@@ -42,6 +44,7 @@ def _row() -> ModelCapability:
             effort=frozenset({"none", "low", "high"}),
             budget=frozenset({"none", "auto"}),
             output=frozenset({"none", "text", "redacted"}),
+            control="budget",
         ),
         service_tier=frozenset({"auto", "default", "priority"}),
         cache_ttl_sec=frozenset({300.0, 3600.0}),
@@ -113,13 +116,6 @@ def test_the_meet_passes_context_and_prices_through() -> None:
     assert met.prices == _row().prices
 
 
-def test_the_meet_keeps_the_rows_effort_spelling() -> None:
-    """A model fact: the transport can neither grant nor revoke it."""
-    level_row = ModelCapability(effort_as_level=True)
-    assert (level_row & ModelCapability()).effort_as_level is True
-    assert (_row() & ModelCapability(effort_as_level=True)).effort_as_level is False
-
-
 def test_the_transport_declares_retries_and_auth() -> None:
     """Not intersected: a catalog row cannot know who bills or retries it.
 
@@ -139,7 +135,9 @@ def test_the_transport_declares_retries_and_auth() -> None:
 def test_every_settings_axis_names_a_capability_field() -> None:
     """The membership check is total only if the names line up."""
     capability_names = {f.name for f in fields(ModelCapability)}
-    thinking_names = {f"thinking_{f.name}" for f in fields(ThinkingCapability)}
+    thinking_names = {
+        f"thinking_{f.name}" for f in fields(ThinkingCapability) if f.name != "control"
+    }
     for f in fields(ModelSettings):
         if f.name == "capability":
             continue
@@ -422,6 +420,81 @@ def test_limits_are_derived_not_cached() -> None:
         ModelSettings.narrowest(row, context="+1m").limits.max_request_tokens
         == 1_000_000
     )
+
+
+def test_limit_overlay_resolves_from_selected_thinking_state() -> None:
+    thinking_limits = ModelLimits(max_request_tokens=180_000)
+    row = replace(
+        _row(),
+        limit_overlays=(
+            LimitOverlay(
+                when=LimitCondition(thinking=True),
+                limits=thinking_limits,
+            ),
+        ),
+    )
+    settings = ModelSettings.narrowest(row)
+    assert settings.limits.max_request_tokens == 200_000
+    settings.thinking_budget = "auto"
+    assert settings.limits == thinking_limits
+
+
+def test_more_specific_limit_overlay_wins_without_order_dependence() -> None:
+    thinking = LimitOverlay(
+        when=LimitCondition(thinking=True),
+        limits=ModelLimits(max_request_tokens=180_000),
+    )
+    thinking_priority = LimitOverlay(
+        when=LimitCondition(thinking=True, service_tier="priority"),
+        limits=ModelLimits(max_request_tokens=160_000),
+    )
+    row = replace(_row(), limit_overlays=(thinking_priority, thinking))
+    settings = ModelSettings.narrowest(row)
+    settings.thinking_budget = "auto"
+    settings.service_tier = "priority"
+    assert settings.limits.max_request_tokens == 160_000
+
+
+def test_equal_specificity_limit_overlays_are_ambiguous() -> None:
+    row = replace(
+        _row(),
+        limit_overlays=(
+            LimitOverlay(
+                when=LimitCondition(thinking=True),
+                limits=ModelLimits(max_request_tokens=180_000),
+            ),
+            LimitOverlay(
+                when=LimitCondition(service_tier="priority"),
+                limits=ModelLimits(max_request_tokens=170_000),
+            ),
+        ),
+    )
+    settings = ModelSettings.narrowest(row)
+    settings.thinking_budget = "auto"
+    settings.service_tier = "priority"
+    with pytest.raises(ValueError, match="ambiguous limit overlays for m"):
+        _ = settings.limits
+
+
+def test_transport_intersection_preserves_model_limit_overlays() -> None:
+    overlay = LimitOverlay(
+        when=LimitCondition(thinking=True),
+        limits=ModelLimits(max_request_tokens=180_000),
+    )
+    row = replace(_row(), limit_overlays=(overlay,))
+    assert (row & ModelCapability()).limit_overlays == (overlay,)
+
+
+def test_duplicate_limit_conditions_fail_when_the_row_is_built() -> None:
+    condition = LimitCondition(thinking=True)
+    with pytest.raises(ValueError, match="duplicate limit condition for m"):
+        replace(
+            _row(),
+            limit_overlays=(
+                LimitOverlay(when=condition, limits=ModelLimits()),
+                LimitOverlay(when=condition, limits=ModelLimits()),
+            ),
+        )
 
 
 def test_settings_over_an_empty_axis_cannot_be_constructed() -> None:

@@ -747,7 +747,7 @@ class _AnthropicModel(ModelDefaults):
     ) -> dict[str, object]:
         """Build kwargs for the Anthropic messages API."""
         budget = self.settings.thinking_budget
-        has_thinking = budget != "none"
+        has_thinking = self.settings.thinking_active
         max_tok = request.max_response_tokens or self.limits.max_response_tokens
         kwargs: dict[str, object] = {
             "model": self.capability.model_id,

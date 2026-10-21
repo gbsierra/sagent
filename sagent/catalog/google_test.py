@@ -143,7 +143,7 @@ def test_a_gemini_3_row_offers_only_the_levels_it_accepts(
     """A level the model rejects is a 400; no level past ``high`` exists."""
     row = google.models()[model_id]
     assert row.thinking.effort == efforts
-    assert row.effort_as_level
+    assert row.thinking.control == "budget"
 
 
 @pytest.mark.parametrize(

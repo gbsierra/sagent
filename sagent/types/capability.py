@@ -36,6 +36,7 @@ __all__ = [
     "SummaryKind",
     "ThinkingBudget",
     "ThinkingCapability",
+    "ThinkingControl",
     "ThinkingEffort",
     "ThinkingOutput",
 ]
@@ -55,6 +56,8 @@ type ThinkingEffort = Literal[
 type ThinkingBudget = Literal["none", "auto", "fixed"]
 
 type ThinkingOutput = Literal["none", "text", "redacted"]
+
+type ThinkingControl = Literal["none", "budget", "effort", "always"]
 
 type ContextTag = Literal["", "+200k", "+272k", "+1m"]
 
@@ -132,6 +135,14 @@ class ThinkingCapability:
     output: frozenset[ThinkingOutput] = frozenset({"none"})
     """Reasoning-visibility modes accepted."""
 
+    control: ThinkingControl = "none"
+    """Which selection controls reasoning, or that reasoning is always active.
+
+    This is a model semantic, not a wire spelling.  In particular, an
+    always-reasoning model can reject every budget parameter while still
+    producing reasoning tokens.
+    """
+
     def __post_init__(self) -> None:
         """Make the provider-owned default selectable on every transport."""
         object.__setattr__(self, "effort", self.effort | {"default"})
@@ -142,6 +153,9 @@ class ThinkingCapability:
             effort=self.effort & other.effort,
             budget=self.budget & other.budget,
             output=self.output & other.output,
+            # ``self`` is the catalog row.  A transport narrows selectable
+            # knobs but cannot change when the model reasons.
+            control=self.control,
         )
 
 
@@ -149,8 +163,8 @@ class ThinkingCapability:
 class ModelCapability:
     """What one model offers: every value a caller may select.
 
-    One catalog row, or one transport's restrictions. ``prices``,
-    ``effort_as_level``, and the trailing transport facts have no
+    One catalog row, or one transport's restrictions. ``prices`` and the
+    trailing transport facts have no
     :class:`ModelSettings` counterpart -- nothing selects a price, a wire
     spelling, a retry policy, or an auth mode.
 
@@ -183,13 +197,6 @@ class ModelCapability:
 
     default_effort: ThinkingEffort | None = None
     """Published effective effort when ``default`` is selected, if named."""
-
-    effort_as_level: bool = False
-    """Whether the wire takes the effort as a named level.
-
-    Gemini 3 ``thinkingLevel``, Qwen 3.8 and Kimi K3 ``reasoning_effort``;
-    otherwise the wire takes a token budget derived from the effort.
-    """
 
     service_tier: frozenset[ServiceTier] = frozenset({"auto", "default"})
     """Speed/price tiers this transport accepts.
@@ -304,7 +311,6 @@ class ModelCapability:
                 frozenset(self.prices.items()),
                 self.thinking,
                 self.default_effort,
-                self.effort_as_level,
                 self.service_tier,
                 self.manage_context_server_side,
                 self.cache_ttl_sec,
@@ -516,7 +522,7 @@ class ModelSettings:
         """Ceilings resolved from the selected context and runtime mode."""
         return self.capability.resolve_limits(
             context=self.context,
-            thinking=self.thinking_budget != "none",
+            thinking=self.thinking_active,
             effort=self.effective_thinking_effort,
             service_tier=self.service_tier,
         )
@@ -527,6 +533,25 @@ class ModelSettings:
         if self.thinking_effort == "default":
             return self.capability.default_effort or "default"
         return self.thinking_effort
+
+    @property
+    def thinking_active(self) -> bool:
+        """Whether this selection makes the model reason.
+
+        Budget-controlled and effort-controlled APIs use different axes;
+        always-reasoning models use neither.  Keeping this model fact explicit
+        prevents callers from mistaking "no budget parameter" for "no
+        reasoning".
+        """
+        match self.capability.thinking.control:
+            case "none":
+                return False
+            case "always":
+                return True
+            case "budget":
+                return self.thinking_budget != "none"
+            case "effort":
+                return self.effective_thinking_effort != "none"
 
 
 def _condition_matches(

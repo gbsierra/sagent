@@ -17,6 +17,7 @@ from datetime import date
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
 
+from sagent.catalog.generated.anthropic import MODELS as GENERATED_MODELS
 from sagent.catalog.provenance import Source
 from sagent.catalog.table import ModelTable
 from sagent.types.capability import (
@@ -45,6 +46,7 @@ __all__ = [
     "api",
     "cli",
     "models",
+    "source_models",
     "subscription",
 ]
 
@@ -70,7 +72,7 @@ CACHE_TTL_SEC: Final = frozenset({300.0, 3600.0})
 # Knowledge cutoffs are the vendor's "reliable knowledge cutoff", and prices
 # its published table (input, output, 5m/1h cache write, cache hit), both
 # verified on 2026-10-03.
-def models() -> ModelTable:
+def source_models() -> ModelTable:
     """Return every Anthropic model, as the API-key transport sees it.
 
     Returns:
@@ -98,6 +100,7 @@ def models() -> ModelTable:
             effort=frozenset({"low", "medium", "high", "xhigh", "max"}),
             budget=frozenset({"none", "auto"}),
             output=frozenset({"none", "text", "redacted"}),
+            control="budget",
         ),
     )
     # The 4.6-and-earlier reasoning contract: a fixed budget alongside adaptive.
@@ -419,6 +422,11 @@ def models() -> ModelTable:
             },
         },
     )
+
+
+def models() -> ModelTable:
+    """Return the checked-in generated Anthropic catalog."""
+    return GENERATED_MODELS
 
 
 _PRICING: Final = "https://platform.claude.com/docs/en/about-claude/pricing"

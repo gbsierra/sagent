@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Final
 
 import math
 
+from sagent.catalog.generated.openai import MODELS as GENERATED_MODELS
 from sagent.catalog.provenance import Source
 from sagent.catalog.table import ModelTable
 from sagent.types.capability import (
@@ -46,6 +47,7 @@ __all__ = [
     "image_tokens",
     "keeps_reasoning_across_turns",
     "models",
+    "source_models",
     "subscription",
     "subscription_models",
     "tokenizer",
@@ -235,7 +237,7 @@ def compatible() -> ModelCapability:
 # every budget by ~7%. tiktoken says 3.81 locally; the gap is request
 # framing the local tokenizer never sees.
 @cache
-def models() -> ModelTable:
+def source_models() -> ModelTable:
     """Return every OpenAI model, as the API-key transport sees it.
 
     Returns:
@@ -285,6 +287,7 @@ def models() -> ModelTable:
             effort=frozenset({"low", "medium", "high", "xhigh", "max"}),
             budget=frozenset({"none", "auto"}),
             output=frozenset({"none", "text"}),
+            control="effort",
         ),
     )
     # GPT-6 Sol/Luna and GPT-5.6: "none, low, medium (default), high, xhigh, and max".
@@ -1047,6 +1050,11 @@ def models() -> ModelTable:
         renamed=_RENAMED,
         sources=_SOURCES,
     )
+
+
+def models() -> ModelTable:
+    """Return the checked-in generated OpenAI catalog."""
+    return GENERATED_MODELS
 
 
 def image_tokens(model_id: str, width: int, height: int) -> int:

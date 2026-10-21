@@ -1,1 +1,1 @@
-"""Generated catalog baselines.  Files in this package are not hand-edited."""
+"""Generated catalog candidates and final tables; never hand-edited."""

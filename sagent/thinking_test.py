@@ -30,7 +30,11 @@ def _capability(
     return ModelCapability(
         model_id="m",
         context=MappingProxyType({"": ModelLimits(max_request_tokens=1_000)}),
-        thinking=ThinkingCapability(budget=budgets, output=outputs),
+        thinking=ThinkingCapability(
+            budget=budgets,
+            output=outputs,
+            control="budget",
+        ),
     )
 
 
@@ -148,6 +152,26 @@ def test_off_is_offerable_even_on_a_model_that_cannot_think() -> None:
     )
     assert thinking_offered("off", settings)
     assert not thinking_offered("adaptive", settings)
+
+
+def test_an_always_reasoning_model_does_not_offer_off() -> None:
+    capability = _capability(
+        budgets=frozenset({"none"}),
+        outputs=frozenset({"none", "text"}),
+    )
+    capability = ModelCapability(
+        model_id=capability.model_id,
+        context=capability.context,
+        thinking=ThinkingCapability(
+            output=frozenset({"none", "text"}),
+            control="always",
+        ),
+    )
+    settings = ModelSettings.narrowest(capability)
+
+    assert settings.thinking_active
+    assert not thinking_offered("off", settings)
+    assert describe_thinking(settings, show=False) == "always"
 
 
 @pytest.mark.parametrize(

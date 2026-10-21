@@ -20,6 +20,7 @@ from datetime import date
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
 
+from sagent.catalog.generated.moonshot import MODELS as GENERATED_MODELS
 from sagent.catalog.provenance import Source
 from sagent.catalog.table import ModelTable
 from sagent.types.capability import (
@@ -41,17 +42,20 @@ if TYPE_CHECKING:
     from sagent.catalog.provenance import Fact
 
 
-__all__ = ["models"]
+__all__ = ["models", "source_models"]
 
 
-def models() -> ModelTable:
+def source_models() -> ModelTable:
     """Return every model this vendor serves, keyed by base id.
 
     Returns:
       models: Capability per base model id.
 
     """
-    always_thinks = ThinkingCapability(output=frozenset({"none", "text"}))
+    always_thinks = ThinkingCapability(
+        output=frozenset({"none", "text"}),
+        control="always",
+    )
     code = ModelCapability(
         model_id="kimi-k2.7-code",
         context=_limits(),
@@ -78,13 +82,16 @@ def models() -> ModelTable:
                 always_thinks,
                 effort=frozenset({"low", "high", "max"}),
             ),
-            effort_as_level=True,
         ),
         ModelCapability(
             model_id="kimi-k2.6",
             context=_limits(),
             prices=_prices(_card(request=0.95, response=4.0, cache_read=0.16)),
-            thinking=replace(always_thinks, budget=frozenset({"none", "auto"})),
+            thinking=replace(
+                always_thinks,
+                budget=frozenset({"none", "auto"}),
+                control="budget",
+            ),
         ),
         code,
         replace(
@@ -115,6 +122,11 @@ def models() -> ModelTable:
         },
         sources=_SOURCES,
     )
+
+
+def models() -> ModelTable:
+    """Return the checked-in generated Moonshot catalog."""
+    return GENERATED_MODELS
 
 
 _SOURCES: Final[Mapping[Fact, Source]] = MappingProxyType(

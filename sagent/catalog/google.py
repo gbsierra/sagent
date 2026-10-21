@@ -13,6 +13,7 @@ from datetime import date
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
 
+from sagent.catalog.generated.google import MODELS as GENERATED_MODELS
 from sagent.catalog.provenance import Source
 from sagent.catalog.table import ModelTable
 from sagent.types.capability import (
@@ -38,6 +39,7 @@ __all__ = [
     "api",
     "cli",
     "models",
+    "source_models",
     "subscription",
 ]
 
@@ -46,7 +48,7 @@ __all__ = [
 # A row carries only what the MODEL can do; caching, retry, auth mode, and the
 # fast path are transport facts, since ``&`` can only remove and a row saying
 # ``False`` would pin every transport.
-def models() -> ModelTable:
+def source_models() -> ModelTable:
     """Return every Gemini model, as the API-key transport sees it.
 
     Returns:
@@ -59,6 +61,7 @@ def models() -> ModelTable:
         effort=frozenset({"min", "low", "medium", "high"}),
         budget=frozenset({"none", "auto", "fixed"}),
         output=frozenset({"none", "text"}),
+        control="budget",
     )
     # "minimal is not supported and returns an error" on these.
     no_minimal = replace(levels, effort=frozenset({"low", "medium", "high"}))
@@ -76,10 +79,9 @@ def models() -> ModelTable:
             over_200k=_card(request=4.0, response=18.0, cache_read=0.4),
         ),
         thinking=no_minimal,
-        effort_as_level=True,
     )
     # 2.5 cannot take ``thinkingLevel``; every effort maps to a token cap.
-    legacy = replace(pro, thinking=budgets, effort_as_level=False)
+    legacy = replace(pro, thinking=budgets)
     # The 3.6-3.8 Flash cards are introductory through 2026-12-31.
     flash = replace(
         pro,
@@ -184,6 +186,11 @@ def models() -> ModelTable:
         },
         sources=_SOURCES,
     )
+
+
+def models() -> ModelTable:
+    """Return the checked-in generated Google catalog."""
+    return GENERATED_MODELS
 
 
 _SOURCES: Final[Mapping[Fact, Source]] = MappingProxyType(

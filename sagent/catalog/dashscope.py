@@ -15,9 +15,9 @@ whose page is gone keep the 2026-10-03 read of the text-generation table.
 
 Thinking axes: ``budget`` ``none`` is ``enable_thinking=false``; ``auto``
 thinks at the model's default depth; ``fixed`` caps it with
-``thinking_budget``. Rows with ``effort_as_level`` (Qwen 3.8) take the
-effort as ``reasoning_effort`` instead, and reject ``thinking_budget``
-alongside it. Effort ``none`` sends no depth knob at all.
+``thinking_budget``. Qwen 3.8's provider wire mapping takes the effort as
+``reasoning_effort`` instead and rejects ``thinking_budget`` alongside it.
+Effort ``none`` sends no depth knob at all.
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ from datetime import date
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, cast
 
+from sagent.catalog.generated.dashscope import MODELS as GENERATED_MODELS
 from sagent.catalog.provenance import Fact, Source
 from sagent.catalog.table import ModelTable
 from sagent.types.capability import (
@@ -47,10 +48,10 @@ from sagent.types.cost import (
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-__all__ = ["models"]
+__all__ = ["models", "source_models"]
 
 
-def models() -> ModelTable:
+def source_models() -> ModelTable:
     """Return every model this vendor serves, keyed by base id.
 
     Returns:
@@ -61,6 +62,7 @@ def models() -> ModelTable:
         effort=frozenset({"none", "min", "low", "medium", "high", "xhigh", "max"}),
         budget=frozenset({"none", "auto", "fixed"}),
         output=frozenset({"none", "text"}),
+        control="budget",
     )
     # Qwen 3.8 accepts ``reasoning_effort`` low / medium / xhigh; the other
     # spellings it folds onto these, so offering them would only alias.
@@ -68,6 +70,7 @@ def models() -> ModelTable:
         effort=frozenset({"none", "low", "medium", "xhigh"}),
         budget=frozenset({"none", "auto"}),
         output=frozenset({"none", "text"}),
+        control="budget",
     )
     # Images ride as base64 data URIs, capped at 20 MB as a STRING; base64
     # inflates 4/3, so raw bytes above ~15 MB would be rejected. Every live
@@ -90,7 +93,6 @@ def models() -> ModelTable:
             limit_overlays=_thinking_limit(vision),
             prices=_prices((0, 2.0, 6.0), cache_read=0.25),
             thinking=levels,
-            effort_as_level=True,
         ),
         ModelCapability(
             model_id="qwen3.8-flash",
@@ -98,7 +100,6 @@ def models() -> ModelTable:
             limit_overlays=_thinking_limit(vision),
             prices=_prices((0, 0.15, 0.47), cache_read=0.016),
             thinking=levels,
-            effort_as_level=True,
         ),
         ModelCapability(
             model_id="qwen3.8-27b",
@@ -107,7 +108,6 @@ def models() -> ModelTable:
             limit_overlays=_thinking_limit(vision),
             prices=_prices((0, 0.5, 3.0), cache_read=0.1),
             thinking=levels,
-            effort_as_level=True,
         ),
         ModelCapability(
             model_id="qwen3.8-2.4t-a95b",
@@ -115,8 +115,11 @@ def models() -> ModelTable:
             limit_overlays=_thinking_limit(text),
             prices=_prices((0, 2.0, 6.0), cache_read=0.25),
             # "Supports thinking mode only": no ``enable_thinking=false``.
-            thinking=replace(levels, budget=frozenset({"auto"})),
-            effort_as_level=True,
+            thinking=replace(
+                levels,
+                budget=frozenset({"auto"}),
+                control="always",
+            ),
         ),
         ModelCapability(
             model_id="qwen3.7-max",
@@ -275,6 +278,11 @@ def models() -> ModelTable:
         # band their prices, from each model's own qwencloud page.
         row_sources=_PAGE_READ,
     )
+
+
+def models() -> ModelTable:
+    """Return the checked-in generated DashScope catalog."""
+    return GENERATED_MODELS
 
 
 _DOCS: Final = "https://www.alibabacloud.com/help/en/model-studio"

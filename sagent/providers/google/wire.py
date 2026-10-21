@@ -5,7 +5,7 @@ Source: https://ai.google.dev/gemini-api/docs/generate-content/thinking
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 from sagent.providers.lib.thinking_budget import EFFORT_BUDGET_TOKENS
 
@@ -42,13 +42,13 @@ def thinking_config(
       config: The wire object, or ``None`` when the request sends none.
 
     """
-    if settings.thinking_budget == "none":
+    if not settings.thinking_active:
         return None
     config: dict[str, MutablePlainTree] = {
         "includeThoughts": settings.thinking_output == "text",
     }
     effort = settings.thinking_effort
-    if capability.effort_as_level:
+    if capability.model_id in _THINKING_LEVEL_MODELS:
         # Gemini 3 accepts ``thinkingBudget`` only for backwards compatibility.
         if effort != "default":
             config["thinkingLevel"] = _thinking_level(effort)
@@ -68,3 +68,18 @@ def _thinking_level(effort: ThinkingEffort) -> str:
             return effort
         case "default" | "none" | "xhigh" | "max":
             raise ValueError(f"effort {effort!r} has no Gemini thinkingLevel")
+
+
+_THINKING_LEVEL_MODELS: Final = frozenset(
+    {
+        "gemini-3.1-pro-preview",
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash",
+        "gemini-3-flash-preview",
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
+    },
+)
+"""Exact routes whose API contract uses ``thinkingLevel``."""

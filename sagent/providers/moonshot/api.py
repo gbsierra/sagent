@@ -54,17 +54,15 @@ class _MoonshotModel(OpenAICompatModel):
         # The base folds ``max`` onto OpenAI's ``high``; K3 takes the level
         # verbatim, and its row offers only levels the wire spells.
         if (
-            self.capability.effort_as_level
+            self.capability.model_id == "kimi-k3"
             and self.settings.thinking_effort != "default"
         ):
             body["reasoning_effort"] = self.settings.thinking_effort
         # Only K2.6 offers a switch; K3 and K2.7 Code "should not" be sent
         # the ``thinking`` parameter at all.
-        if self.capability.thinking.budget == frozenset({"none", "auto"}):
+        if self.capability.thinking.control == "budget":
             body["thinking"] = {
-                "type": "disabled"
-                if self.settings.thinking_budget == "none"
-                else "enabled",
+                "type": "disabled" if not self.settings.thinking_active else "enabled",
             }
         return body
 

@@ -161,6 +161,27 @@ def test_every_model_offers_provider_default(row: ModelCapability) -> None:
 
 
 @pytest.mark.parametrize("row", _ROWS)
+def test_reasoning_control_has_the_axis_it_names(row: ModelCapability) -> None:
+    """A row must not claim control through an axis with no on-state."""
+    control = row.thinking.control
+    if control == "budget":
+        assert row.thinking.budget - {"none"}, row.model_id
+    elif control == "effort":
+        assert row.thinking.effort - {"default", "none"}, row.model_id
+    elif control == "always":
+        assert ModelSettings.narrowest(row).thinking_active, row.model_id
+
+
+@pytest.mark.parametrize(("models", "transport"), _TRANSPORTS, ids=_TRANSPORT_IDS)
+def test_a_transport_preserves_reasoning_behavior(
+    models: Mapping[str, ModelCapability],
+    transport: ModelCapability,
+) -> None:
+    for row in models.values():
+        assert (row & transport).thinking.control == row.thinking.control
+
+
+@pytest.mark.parametrize("row", _ROWS)
 def test_a_named_provider_default_is_an_advertised_level(
     row: ModelCapability,
 ) -> None:

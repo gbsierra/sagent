@@ -1,31 +1,36 @@
-name: Model catalog drift
+name: Refresh model catalog candidates
 
-# Compares every hosted catalog with models.dev once a day. A disagreement not
-# yet triaged opens (or refreshes) one issue; when none remain, that issue is
-# closed. models.dev is a drift detector, not a source of truth: the issue asks
-# a person to reopen the vendor page each row cites.
+# models.dev supplies review candidates, not unquestioned runtime facts. The
+# checked-in runtime catalogs are generated from Sagent's typed, vendor-reviewed
+# sources. This job materializes upstream changes in one persistent PR so a
+# maintainer can verify affected facts against the provider links before
+# changing those typed sources and regenerating the final catalogs.
 on:
   schedule:
     - cron: "23 7 * * *"
   workflow_dispatch:
 
 permissions:
-  contents: read
-  issues: write
+  contents: write
+  pull-requests: write
 
 concurrency:
-  group: model-drift
+  group: model-catalog-refresh
   cancel-in-progress: false
 
 jobs:
-  drift:
-    name: Compare catalogs with models.dev
-    # Forks would each open their own issue for the same drift.
+  refresh:
+    name: Generate and propose catalog candidates
     if: github.repository == 'rekursiv-ai/sagent'
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      BRANCH: automation/model-catalog-refresh
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -33,34 +38,45 @@ jobs:
 
       - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
 
-      - name: Check drift and file the result
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TITLE: Model catalog drift
+      - name: Generate checked-in data
+        run: uv run --frozen python -m sagent.catalog.generate
+
+      - name: Verify generated catalogs
         run: |
-          set +e
-          uv run --frozen python -m sagent.bin.verify_models --drift --report drift.md
-          status=$?
-          set -e
-          # pipefail: a failed `gh issue list` must fail the step, not read as
-          # "no open issue" and create a duplicate.
-          set -o pipefail
-          number="$(gh issue list --state open --search "in:title \"$TITLE\"" \
-            --json number,title \
-            --jq "[.[] | select(.title == env.TITLE)] | .[0].number // \"\"")"
-          if [ -f drift.md ]; then
+          uv run --frozen python -m sagent.bin.verify_models --offline
+          uv run --frozen pytest -q \
+            sagent/catalog/generated_codec_test.py \
+            sagent/catalog/generate_test.py \
+            sagent/catalog/catalog_test.py \
+            sagent/providers/wire_conformance_test.py
+
+      - name: Create or update the review pull request
+        env:
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          number="$(gh pr list --state open --head "$BRANCH" \
+            --json number --jq '.[0].number // ""')"
+          if git diff --quiet -- sagent/catalog/generated; then
+            echo "No generated catalog changes."
             if [ -n "$number" ]; then
-              gh issue edit "$number" --body-file drift.md
-            else
-              gh issue create --title "$TITLE" --body-file drift.md
+              gh pr close "$number" \
+                --comment "Generated catalog candidates now match the base branch."
             fi
-          elif [ "$status" -eq 0 ]; then
-            if [ -n "$number" ]; then
-              gh issue close "$number" --comment "No untriaged drift as of $(date -u +%F)."
-            fi
-          else
-            # No report means models.dev was unreadable or the offline audit
-            # failed: a broken check, not drift, so fail the run instead.
-            echo "::error::drift check failed before producing a report"
-            exit "$status"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -C "$BRANCH"
+          git add sagent/catalog/generated
+          git commit -m "Refresh model catalog candidates"
+          git fetch origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH" || true
+          git push --force-with-lease origin "HEAD:$BRANCH"
+
+          if [ -z "$number" ]; then
+            gh pr create \
+              --base "$BASE_BRANCH" \
+              --head "$BRANCH" \
+              --title "Refresh model catalog candidates" \
+              --body "Generated models.dev candidates changed. Verify affected facts against the provider sources recorded in the catalog before updating the typed source and regenerating. This PR is intentionally not auto-merged."
           fi

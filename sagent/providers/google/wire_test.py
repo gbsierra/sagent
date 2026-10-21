@@ -35,7 +35,6 @@ def _wire(
     ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"],
 )
 def test_gemini_2_5_takes_a_budget_not_a_level(model_id: str) -> None:
-    assert not google.models()[model_id].effort_as_level
     assert _wire(model_id, effort="max") == {
         "includeThoughts": True,
         "thinkingBudget": 24_576,

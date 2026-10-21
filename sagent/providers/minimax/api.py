@@ -51,12 +51,10 @@ class _MiniMaxModel(OpenAICompatModel):
         body["reasoning_split"] = True
         # Only M3 offers a switch; M2.x accepts ``disabled`` but ignores it,
         # so its rows offer nothing to send.
-        if self.capability.thinking.budget == frozenset({"none"}):
+        if self.capability.thinking.control != "budget":
             return body
         body["thinking"] = {
-            "type": "disabled"
-            if self.settings.thinking_budget == "none"
-            else "adaptive",
+            "type": "disabled" if not self.settings.thinking_active else "adaptive",
         }
         return body
 

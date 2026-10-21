@@ -102,3 +102,15 @@ def test_generate_atomically_writes_importable_module(tmp_path: Path) -> None:
     assert "DO NOT EDIT" in text
     assert "source_sha256" in text
     compile(text, str(output), "exec")
+    for provider_id in (
+        "anthropic",
+        "dashscope",
+        "google",
+        "minimax",
+        "moonshot",
+        "openai",
+    ):
+        provider_output = tmp_path / f"{provider_id}.py"
+        provider_text = provider_output.read_text()
+        assert "decode_catalog(DATA)" in provider_text
+        compile(provider_text, str(provider_output), "exec")

@@ -158,7 +158,6 @@ def test_roles_name_the_vendor_recommendations() -> None:
 
 def test_qwen_3_8_takes_its_effort_as_a_level() -> None:
     rows = dashscope.models()
-    assert rows["qwen3.8-max"].effort_as_level
     assert rows["qwen3.8-max"].thinking.effort == {
         "default",
         "none",
@@ -166,7 +165,7 @@ def test_qwen_3_8_takes_its_effort_as_a_level() -> None:
         "medium",
         "xhigh",
     }
-    assert not rows["qwen3.7-plus"].effort_as_level
+    assert rows["qwen3.8-max"].thinking.control == "budget"
 
 
 @pytest.mark.parametrize(

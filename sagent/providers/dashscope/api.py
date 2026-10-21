@@ -66,23 +66,22 @@ class _DashScopeModel(OpenAICompatModel):
                 else "max_tokens"
             )
             body[field] = cap
-        offered = self.capability.thinking.budget
-        # A row offering only ``none`` claims the model REJECTS the toggle
-        # (the ``-instruct`` / ``-coder`` ids); never send one.
-        if offered <= {"default", "none"}:
+        control = self.capability.thinking.control
+        # Non-reasoning rows reject every thinking knob.
+        if control == "none":
             return body
         settings = self.settings
-        body["enable_thinking"] = settings.thinking_budget != "none"
+        body["enable_thinking"] = settings.thinking_active
         # Hybrid and level rows still offer effort ``none``; like ``default``
         # it sends no depth knob (and indexes no budget-cap table).
-        if settings.thinking_budget == "none" or settings.thinking_effort in {
+        if not settings.thinking_active or settings.thinking_effort in {
             "default",
             "none",
         }:
             return body
         # Qwen 3.8 errors when ``reasoning_effort`` and ``thinking_budget``
         # arrive together, so a level row never sends the cap.
-        if self.capability.effort_as_level:
+        if self.capability.model_id in _EFFORT_LEVEL_MODELS:
             body["reasoning_effort"] = settings.thinking_effort
         elif settings.thinking_budget == "fixed":
             body["thinking_budget"] = EFFORT_BUDGET_TOKENS[settings.thinking_effort]
@@ -105,6 +104,16 @@ _COMPLETION_CAP: Final = frozenset(
 Absent: ``qwen3.8-27b`` and ``qwen3.8-2.4t-a95b`` are neither Max, Plus, nor
 Flash; ``qwen3.6-max-preview`` predates the Max 3.7 floor.
 """
+
+_EFFORT_LEVEL_MODELS: Final = frozenset(
+    {
+        "qwen3.8-max",
+        "qwen3.8-flash",
+        "qwen3.8-27b",
+        "qwen3.8-2.4t-a95b",
+    },
+)
+"""Exact routes whose API accepts ``reasoning_effort`` rather than a budget."""
 
 
 class DashScope(OpenAICompat):

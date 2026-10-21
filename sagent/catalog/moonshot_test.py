@@ -59,13 +59,15 @@ def test_rows_bill_the_published_card(model_id: str, published: TokenPrice) -> N
 
 def test_k3_always_thinks_at_a_named_level() -> None:
     k3 = moonshot.models()["kimi-k3"]
-    assert k3.effort_as_level
+    assert k3.thinking.control == "always"
     assert k3.thinking.effort == {"default", "low", "high", "max"}
     assert k3.thinking.budget == {"none"}
 
 
 def test_k2_6_thinking_can_be_disabled_and_k2_7_code_cannot() -> None:
     rows = moonshot.models()
+    assert rows["kimi-k2.6"].thinking.control == "budget"
+    assert rows["kimi-k2.7-code"].thinking.control == "always"
     assert rows["kimi-k2.6"].thinking.budget == {"none", "auto"}
     assert rows["kimi-k2.7-code"].thinking.budget == {"none"}
 

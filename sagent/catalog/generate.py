@@ -17,20 +17,26 @@ import pprint
 
 import httpx2
 
+from sagent.catalog import anthropic, dashscope, google, minimax, moonshot, openai
+from sagent.catalog.generated_codec import encode_catalog
 from sagent.lib.atomic_file import atomic_write_bytes
 
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
+    from sagent.catalog.table import ModelTable
+
 
 __all__ = [
     "MODELS_DEV_URL",
     "SUPPORTED_PROVIDERS",
     "generate",
+    "generate_catalogs",
     "main",
     "normalize",
     "render",
+    "render_catalog",
 ]
 
 
@@ -178,10 +184,57 @@ def render(baseline: Mapping[str, object]) -> str:
     )
 
 
+def render_catalog(
+    provider_id: str,
+    table: ModelTable,
+) -> str:
+    """Render one final, runtime-ready provider catalog as inert data."""
+    # Preserve traversal order: the codec's safe ``py/id`` back-references
+    # must follow the value they reference.
+    literal = pprint.pformat(encode_catalog(table), width=100, sort_dicts=False)
+    return (
+        "# ruff: noqa: I001, Q000\n"
+        "# fmt: off\n"
+        f'"""Generated {provider_id} catalog.  DO NOT EDIT.\n\n'
+        "Regenerate: python -m sagent.catalog.generate\n"
+        '"""\n\n'
+        "from typing import Final\n\n"
+        "from sagent.catalog.generated_codec import decode_catalog\n"
+        "from sagent.lib.codec import PlainTree\n\n"
+        f"DATA: Final[PlainTree] = {literal}\n\n"
+        "MODELS = decode_catalog(DATA)\n"
+    )
+
+
+def _source_tables() -> Mapping[str, ModelTable]:
+    """Return typed, provider-reviewed generation inputs."""
+    return {
+        "anthropic": anthropic.source_models(),
+        "dashscope": dashscope.source_models(),
+        "google": google.source_models(),
+        "minimax": minimax.source_models(),
+        "moonshot": moonshot.source_models(),
+        "openai": openai.source_models(),
+    }
+
+
+def generate_catalogs(baseline: Mapping[str, object], output_dir: Path) -> None:
+    """Atomically write every final hosted catalog after full normalization."""
+    providers = baseline.get("providers")
+    if not isinstance(providers, dict) or any(
+        provider_id not in providers for provider_id in SUPPORTED_PROVIDERS
+    ):
+        raise GenerationError("normalized baseline is missing a supported provider")
+    for provider_id, table in _source_tables().items():
+        content = render_catalog(provider_id, table).encode()
+        atomic_write_bytes(output_dir / f"{provider_id}.py", content)
+
+
 def generate(body: bytes, output: Path) -> None:
-    """Normalize ``body`` and atomically replace ``output``."""
-    content = render(normalize(body)).encode()
-    atomic_write_bytes(output, content)
+    """Normalize ``body`` and atomically replace every generated artifact."""
+    baseline = normalize(body)
+    atomic_write_bytes(output, render(baseline).encode())
+    generate_catalogs(baseline, output.parent)
 
 
 def _fetch() -> bytes:
@@ -203,7 +256,8 @@ def main() -> int:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     args = parser.parse_args()
     body = args.input.read_bytes() if args.input is not None else _fetch()
-    generate(body, cast(Path, args.output))
+    output = cast(Path, args.output)
+    generate(body, output)
     return 0
 
 
