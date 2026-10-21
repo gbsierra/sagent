@@ -25,12 +25,14 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import date
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, cast
 
-from sagent.catalog.provenance import Source
+from sagent.catalog.provenance import Fact, Source
 from sagent.catalog.table import ModelTable
 from sagent.types.capability import (
     ContextTag,
+    LimitCondition,
+    LimitOverlay,
     ModelCapability,
     ModelLimits,
     ThinkingCapability,
@@ -44,9 +46,6 @@ from sagent.types.cost import (
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
-
-    from sagent.catalog.provenance import Fact
-
 
 __all__ = ["models"]
 
@@ -88,6 +87,7 @@ def models() -> ModelTable:
         ModelCapability(
             model_id="qwen3.8-max",
             context=vision,
+            limit_overlays=_thinking_limit(vision),
             prices=_prices((0, 2.0, 6.0), cache_read=0.25),
             thinking=levels,
             effort_as_level=True,
@@ -95,6 +95,7 @@ def models() -> ModelTable:
         ModelCapability(
             model_id="qwen3.8-flash",
             context=vision,
+            limit_overlays=_thinking_limit(vision),
             prices=_prices((0, 0.15, 0.47), cache_read=0.016),
             thinking=levels,
             effort_as_level=True,
@@ -103,6 +104,7 @@ def models() -> ModelTable:
             model_id="qwen3.8-27b",
             # The model page lists image and video input for this release.
             context=vision,
+            limit_overlays=_thinking_limit(vision),
             prices=_prices((0, 0.5, 3.0), cache_read=0.1),
             thinking=levels,
             effort_as_level=True,
@@ -110,6 +112,7 @@ def models() -> ModelTable:
         ModelCapability(
             model_id="qwen3.8-2.4t-a95b",
             context=text,
+            limit_overlays=_thinking_limit(text),
             prices=_prices((0, 2.0, 6.0), cache_read=0.25),
             # "Supports thinking mode only": no ``enable_thinking=false``.
             thinking=replace(levels, budget=frozenset({"auto"})),
@@ -118,18 +121,21 @@ def models() -> ModelTable:
         ModelCapability(
             model_id="qwen3.7-max",
             context=text,
+            limit_overlays=_thinking_limit(text),
             prices=_prices((0, 2.5, 7.5), cache_hit=0.2),
             thinking=hybrid,
         ),
         ModelCapability(
             model_id="qwen3.7-plus",
             context=vision,
+            limit_overlays=_thinking_limit(vision),
             prices=_prices((0, 0.4, 1.6), (256_000, 1.2, 4.8), cache_hit=0.2),
             thinking=hybrid,
         ),
         ModelCapability(
             model_id="qwen3.7-flash",
             context=vision,
+            limit_overlays=_thinking_limit(vision),
             prices=_prices(
                 (0, 0.03, 0.13),
                 (32_000, 0.10, 0.40),
@@ -149,12 +155,14 @@ def models() -> ModelTable:
         ModelCapability(
             model_id="qwen3.6-plus",
             context=vision_64k,
+            limit_overlays=_thinking_limit(vision_64k),
             prices=_prices((0, 0.5, 3.0), (256_000, 2.0, 6.0), cache_hit=1.0),
             thinking=hybrid,
         ),
         ModelCapability(
             model_id="qwen3.6-flash",
             context=vision_64k,
+            limit_overlays=_thinking_limit(vision_64k),
             prices=_prices((0, 0.25, 1.5), (256_000, 1.0, 4.0), cache_hit=1.0),
             thinking=hybrid,
         ),
@@ -290,7 +298,7 @@ def _page(mid: str, *facts: Fact) -> Mapping[Fact, Source]:
 # which no model page states.
 _PAGE_READ: Final[Mapping[str, Mapping[Fact, Source]]] = MappingProxyType(
     {
-        mid: _page(mid, *facts)
+        mid: _page(mid, *cast(tuple[Fact, ...], facts))
         for mid, facts in (
             ("qwen3.8-max", ("limits", "prices")),
             ("qwen3.8-flash", ("limits", "prices")),
@@ -334,6 +342,19 @@ def _prices(
             )
             for floor, request, response in bands
         },
+    )
+
+
+def _thinking_limit(
+    limits: Mapping[ContextTag, ModelLimits],
+) -> tuple[LimitOverlay, ...]:
+    """Return the model-page input ceiling used while thinking is enabled."""
+    base = limits[""]
+    return (
+        LimitOverlay(
+            when=LimitCondition(thinking=True),
+            limits=replace(base, max_request_tokens=983_616),
+        ),
     )
 
 

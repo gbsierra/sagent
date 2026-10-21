@@ -27,6 +27,8 @@ from sagent.types.cost import PriceCatalog, ServiceTier
 
 __all__ = [
     "ContextTag",
+    "LimitCondition",
+    "LimitOverlay",
     "ModelCapability",
     "ModelLimits",
     "ModelSettings",
@@ -85,6 +87,39 @@ class ModelLimits:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class LimitCondition:
+    """Finite settings predicate for a vendor-published conditional limit."""
+
+    context: ContextTag | None = None
+    thinking: bool | None = None
+    effort: ThinkingEffort | None = None
+    service_tier: ServiceTier | None = None
+
+    def __post_init__(self) -> None:
+        if all(
+            value is None
+            for value in (self.context, self.thinking, self.effort, self.service_tier)
+        ):
+            raise ValueError("limit condition must select at least one settings axis")
+
+    @property
+    def specificity(self) -> int:
+        """Number of settings axes constrained by this condition."""
+        return sum(
+            value is not None
+            for value in (self.context, self.thinking, self.effort, self.service_tier)
+        )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class LimitOverlay:
+    """Replacement ceilings under one declared settings condition."""
+
+    when: LimitCondition
+    limits: ModelLimits
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class ThinkingCapability:
     """Reasoning knobs one model or transport accepts, one set per axis."""
 
@@ -136,6 +171,9 @@ class ModelCapability:
         default_factory=lambda: MappingProxyType({"": ModelLimits()}),
     )
     """Limits per selectable context tag; its KEYS are the allowed set."""
+
+    limit_overlays: tuple[LimitOverlay, ...] = ()
+    """Vendor-published limit changes selected by non-context settings."""
 
     prices: PriceCatalog = field(default_factory=PriceCatalog)
     """USD rates, keyed by service tier and request-size threshold."""
@@ -192,6 +230,41 @@ class ModelCapability:
         """Reject the sentinel as an effective provider level."""
         if self.default_effort == "default":
             raise ValueError("default_effort must name the effective provider level")
+        seen: set[LimitCondition] = set()
+        for overlay in self.limit_overlays:
+            if overlay.when in seen:
+                raise ValueError(f"duplicate limit condition for {self.model_id}")
+            seen.add(overlay.when)
+
+    def resolve_limits(
+        self,
+        *,
+        context: ContextTag,
+        thinking: bool,
+        effort: ThinkingEffort,
+        service_tier: ServiceTier,
+    ) -> ModelLimits:
+        """Resolve ceilings for selected settings without order-based choices."""
+        matches = [
+            overlay
+            for overlay in self.limit_overlays
+            if _condition_matches(
+                overlay.when,
+                context=context,
+                thinking=thinking,
+                effort=effort,
+                service_tier=service_tier,
+            )
+        ]
+        if not matches:
+            return self.context[context]
+        highest = max(overlay.when.specificity for overlay in matches)
+        winners = [
+            overlay for overlay in matches if overlay.when.specificity == highest
+        ]
+        if len(winners) != 1:
+            raise ValueError(f"ambiguous limit overlays for {self.model_id}")
+        return winners[0].limits
 
     def __and__(self, other: ModelCapability) -> Self:
         """Narrow to what BOTH offer -- a catalog row met with a transport.
@@ -227,6 +300,7 @@ class ModelCapability:
                 self.knowledge_cutoff,
                 self.approx_chars_per_token,
                 frozenset(self.context.items()),
+                self.limit_overlays,
                 frozenset(self.prices.items()),
                 self.thinking,
                 self.default_effort,
@@ -439,8 +513,13 @@ class ModelSettings:
 
     @property
     def limits(self) -> ModelLimits:
-        """Ceilings the selected context tag carries."""
-        return self.capability.context[self.context]
+        """Ceilings resolved from the selected context and runtime mode."""
+        return self.capability.resolve_limits(
+            context=self.context,
+            thinking=self.thinking_budget != "none",
+            effort=self.effective_thinking_effort,
+            service_tier=self.service_tier,
+        )
 
     @property
     def effective_thinking_effort(self) -> ThinkingEffort:
@@ -448,6 +527,26 @@ class ModelSettings:
         if self.thinking_effort == "default":
             return self.capability.default_effort or "default"
         return self.thinking_effort
+
+
+def _condition_matches(
+    condition: LimitCondition,
+    *,
+    context: ContextTag,
+    thinking: bool,
+    effort: ThinkingEffort,
+    service_tier: ServiceTier,
+) -> bool:
+    """Whether one finite limit condition matches selected settings."""
+    return all(
+        expected is None or expected == actual
+        for expected, actual in (
+            (condition.context, context),
+            (condition.thinking, thinking),
+            (condition.effort, effort),
+            (condition.service_tier, service_tier),
+        )
+    )
 
 
 def _allowed(capability: ModelCapability, name: str) -> Collection[object]:

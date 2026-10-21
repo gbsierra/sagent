@@ -9,6 +9,7 @@ from datetime import date
 import pytest
 
 from sagent.catalog import dashscope
+from sagent.types.capability import ModelSettings
 from sagent.types.cost import PriceKey
 
 
@@ -100,6 +101,28 @@ def test_the_model_pages_state_the_caps_the_api_enforces(
     limits = dashscope.models()[model_id].context[""]
     assert limits.max_request_tokens == max_request
     assert limits.max_response_tokens == max_response
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "qwen3.8-max",
+        "qwen3.8-flash",
+        "qwen3.8-27b",
+        "qwen3.7-max",
+        "qwen3.7-plus",
+        "qwen3.7-flash",
+        "qwen3.6-plus",
+        "qwen3.6-flash",
+    ],
+)
+def test_thinking_uses_the_published_lower_input_limit(model_id: str) -> None:
+    row = dashscope.models()[model_id]
+    settings = ModelSettings.narrowest(row)
+
+    assert settings.limits.max_request_tokens == 991_808
+    settings.thinking_budget = "auto"
+    assert settings.limits.max_request_tokens == 983_616
 
 
 @pytest.mark.parametrize(
