@@ -134,25 +134,29 @@ def tool_schema(schema: Mapping[str, PlainTree]) -> MutablePlainTree:
 def _schema_node(node: object) -> MutablePlainTree:
     """Translate one JSON Schema node, and everything below it."""
     if isinstance(node, list):
-        return [_schema_node(item) for item in node]
+        items = cast("list[object]", node)
+        return [_schema_node(item) for item in items]
     if not isinstance(node, dict):
         return cast("MutablePlainTree", node)
+    entries = cast("dict[str, object]", node)
     out: dict[str, MutablePlainTree] = {}
-    for raw_key, value in node.items():
+    for raw_key, value in entries.items():
         key = str(raw_key)
         if key in _DROPPED_SCHEMA_KEYS:
             continue
         # ``properties`` maps names to schemas; recursing into the map itself
         # would read the property NAMES as schema keys.
         if key == "properties" and isinstance(value, dict):
-            out[key] = {str(k): _schema_node(v) for k, v in value.items()}
+            properties = cast("dict[str, object]", value)
+            out[key] = {str(k): _schema_node(v) for k, v in properties.items()}
         elif key in _SCHEMA_LIST_KEYS and isinstance(value, list):
-            out[key] = [_schema_node(item) for item in value]
+            items = cast("list[object]", value)
+            out[key] = [_schema_node(item) for item in items]
         elif key == "items":
             out[key] = _schema_node(value)
         else:
             out[key] = cast("MutablePlainTree", value)
-    types = _declared_types(node.get("type"))
+    types = _declared_types(entries.get("type"))
     if types:
         out["type"] = types[0]
     if len(types) > 1 and types[1] == "null":
@@ -166,5 +170,6 @@ def _declared_types(value: object) -> list[str]:
         return [value]
     if not isinstance(value, list):
         return []
-    names = [item for item in value if isinstance(item, str) and item != "null"]
-    return [*names, "null"] if any(item == "null" for item in value) else names
+    items = cast("list[object]", value)
+    names = [item for item in items if isinstance(item, str) and item != "null"]
+    return [*names, "null"] if any(item == "null" for item in items) else names

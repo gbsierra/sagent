@@ -92,6 +92,7 @@ def test_tool_schema_drops_additional_properties_recursively() -> None:
         },
     )
     wire = tool_schema(schema)
+    assert isinstance(wire, dict)
     properties = wire["properties"]
     assert isinstance(properties, dict)
     nested = properties["nested"]
@@ -100,7 +101,9 @@ def test_tool_schema_drops_additional_properties_recursively() -> None:
     assert "additionalProperties" not in nested
     items = wire["items"]
     assert isinstance(items, list)
-    assert "additionalProperties" not in items[0]
+    first = items[0]
+    assert isinstance(first, dict)
+    assert "additionalProperties" not in first
 
 
 def test_tool_schema_collapses_a_type_array_to_its_first_member() -> None:
@@ -154,6 +157,7 @@ def test_tool_schema_keeps_a_property_named_additional_properties() -> None:
         },
     )
     wire = tool_schema(schema)
+    assert isinstance(wire, dict)
     properties = wire["properties"]
     assert isinstance(properties, dict)
     assert properties["additionalProperties"] == {"type": "boolean"}

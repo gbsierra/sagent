@@ -5,12 +5,12 @@
 Regenerate: python -m sagent.catalog.generate
 """
 
-from typing import Final
+from typing import Final, cast
 
 from sagent.catalog.generated_codec import decode_catalog
 from sagent.lib.codec import PlainTree
 
-DATA: Final[PlainTree] = {'rows': {'py/tuple': [{'py/object': 'sagent.types.capability.ModelCapability',
+DATA: Final[PlainTree] = cast('PlainTree', {'rows': {'py/tuple': [{'py/object': 'sagent.types.capability.ModelCapability',
                         'model_id': 'qwen3.8-max',
                         'knowledge_cutoff': None,
                         'approx_chars_per_token': 4.0,
@@ -797,6 +797,6 @@ DATA: Final[PlainTree] = {'rows': {'py/tuple': [{'py/object': 'sagent.types.capa
                                      'qwen3.6-flash': {'py/mappingproxy': {'limits': {'py/object': 'sagent.catalog.provenance.Source',
                                                                                       'url': 'https://www.qwencloud.com/models/qwen3.6-flash',
                                                                                       'checked': {'py/hook': ['datetime.date',
-                                                                                                              '2026-10-20']}}}}}}}
+                                                                                                              '2026-10-20']}}}}}}})
 
 MODELS = decode_catalog(DATA)

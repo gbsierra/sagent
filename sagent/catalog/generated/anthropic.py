@@ -5,12 +5,12 @@
 Regenerate: python -m sagent.catalog.generate
 """
 
-from typing import Final
+from typing import Final, cast
 
 from sagent.catalog.generated_codec import decode_catalog
 from sagent.lib.codec import PlainTree
 
-DATA: Final[PlainTree] = {'rows': {'py/tuple': [{'py/object': 'sagent.types.capability.ModelCapability',
+DATA: Final[PlainTree] = cast('PlainTree', {'rows': {'py/tuple': [{'py/object': 'sagent.types.capability.ModelCapability',
                         'model_id': 'claude-fable-5-1',
                         'knowledge_cutoff': 'June 2026',
                         'approx_chars_per_token': 2.38,
@@ -599,6 +599,6 @@ DATA: Final[PlainTree] = {'rows': {'py/tuple': [{'py/object': 'sagent.types.capa
                                                                               'prices': {'py/object': 'sagent.catalog.provenance.Source',
                                                                                          'url': 'https://platform.claude.com/docs/en/about-claude/pricing#long-context-pricing',
                                                                                          'checked': {'py/hook': ['datetime.date',
-                                                                                                                 '2026-10-17']}}}}}}}
+                                                                                                                 '2026-10-17']}}}}}}})
 
 MODELS = decode_catalog(DATA)

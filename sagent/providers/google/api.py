@@ -407,9 +407,11 @@ def _gemini_error_message(status: int, body: str) -> str:
     with contextlib.suppress(json.JSONDecodeError, AttributeError, TypeError):
         parsed: object = json.loads(body)
         if isinstance(parsed, dict):
-            error = parsed.get("error")
+            top = cast("dict[str, object]", parsed)
+            error = top.get("error")
             if isinstance(error, dict):
-                message = error.get("message")
+                envelope = cast("dict[str, object]", error)
+                message = envelope.get("message")
                 if isinstance(message, str) and message:
                     return f"HTTP {status}: {message}"
     return body or f"HTTP {status}"

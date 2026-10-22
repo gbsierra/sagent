@@ -929,17 +929,19 @@ def test_build_request_narrows_a_type_array_for_gemini() -> None:
 def _proto_offences(node: object, path: str) -> list[str]:
     """Return where a schema uses something Gemini's Schema proto has no field for."""
     if isinstance(node, list):
+        items = cast("list[object]", node)
         return [
             offence
-            for index, item in enumerate(node)
+            for index, item in enumerate(items)
             for offence in _proto_offences(item, f"{path}[{index}]")
         ]
     if not isinstance(node, dict):
         return []
-    offences = [f"{path}.{key}" for key in ("additionalProperties",) if key in node]
-    if isinstance(node.get("type"), list):
-        offences.append(f"{path}.type={node['type']!r}")
-    for key, value in node.items():
+    schema = cast("dict[str, object]", node)
+    offences = [f"{path}.{key}" for key in ("additionalProperties",) if key in schema]
+    if isinstance(schema.get("type"), list):
+        offences.append(f"{path}.type={schema['type']!r}")
+    for key, value in schema.items():
         offences.extend(_proto_offences(value, f"{path}.{key}"))
     return offences
 

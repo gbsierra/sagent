@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import json
 
@@ -46,11 +46,11 @@ def test_normalize_keeps_only_mapped_fields() -> None:
     baseline = normalize(_body(), minimum_provider_count=len(SUPPORTED_PROVIDERS))
     providers = baseline["providers"]
     assert isinstance(providers, dict)
-    openai = providers["openai"]
+    openai = cast("dict[str, object]", providers["openai"])
     assert isinstance(openai, dict)
-    models = openai["models"]
+    models = cast("dict[str, object]", openai["models"])
     assert isinstance(models, dict)
-    model = models["openai-model"]
+    model = cast("dict[str, object]", models["openai-model"])
     assert isinstance(model, dict)
 
     assert model["limit"] == {"context": 100, "input": 90, "output": 10}

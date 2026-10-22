@@ -198,10 +198,10 @@ def render_catalog(
         f'"""Generated {provider_id} catalog.  DO NOT EDIT.\n\n'
         "Regenerate: python -m sagent.catalog.generate\n"
         '"""\n\n'
-        "from typing import Final\n\n"
+        "from typing import Final, cast\n\n"
         "from sagent.catalog.generated_codec import decode_catalog\n"
         "from sagent.lib.codec import PlainTree\n\n"
-        f"DATA: Final[PlainTree] = {literal}\n\n"
+        f"DATA: Final[PlainTree] = cast('PlainTree', {literal})\n\n"
         "MODELS = decode_catalog(DATA)\n"
     )
 

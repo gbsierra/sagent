@@ -210,24 +210,27 @@ def test_a_type_array_reaches_the_wire_as_the_anyof_union() -> None:
 def _mfjs_offences(node: object, path: str) -> list[str]:
     """Return where a schema leaves the MFJS subset Kimi validates against."""
     if isinstance(node, list):
+        items = cast("list[object]", node)
         return [
             offence
-            for index, item in enumerate(node)
+            for index, item in enumerate(items)
             for offence in _mfjs_offences(item, f"{path}[{index}]")
         ]
     if not isinstance(node, dict):
         return []
+    schema = cast("dict[str, object]", node)
     offences: list[str] = []
-    if isinstance(node.get("type"), list):
-        offences.append(f"{path}.type={node['type']!r}")
-    offences.extend(f"{path}.{key}" for key in node if key in _DROPPED_SCHEMA_KEYS)
-    for key, value in node.items():
+    if isinstance(schema.get("type"), list):
+        offences.append(f"{path}.type={schema['type']!r}")
+    offences.extend(f"{path}.{key}" for key in schema if key in _DROPPED_SCHEMA_KEYS)
+    for key, value in schema.items():
         if key == "properties" and isinstance(value, dict):
             # A property named like a dropped key is a NAME, not a schema
             # key; only the schemas it maps to are checked.
+            properties = cast("dict[str, object]", value)
             offences.extend(
                 offence
-                for name, sub in value.items()
+                for name, sub in properties.items()
                 for offence in _mfjs_offences(sub, f"{path}.{name}")
             )
         else:

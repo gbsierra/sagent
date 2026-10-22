@@ -110,27 +110,32 @@ _TYPE_SCOPED_KEYS: Final[Mapping[str, frozenset[str]]] = MappingProxyType(
 def _schema_node(node: object) -> MutablePlainTree:
     """Translate one JSON Schema node, and everything below it."""
     if isinstance(node, list):
-        return [_schema_node(item) for item in node]
+        items = cast("list[object]", node)
+        return [_schema_node(item) for item in items]
     if not isinstance(node, dict):
         return cast("MutablePlainTree", node)
+    entries = cast("dict[str, object]", node)
     out: dict[str, MutablePlainTree] = {}
-    for raw_key, value in node.items():
+    for raw_key, value in entries.items():
         key = str(raw_key)
         if key in _DROPPED_SCHEMA_KEYS:
             continue
         # ``properties`` and ``$defs`` map names to schemas; recursing into
         # the map itself would read the property NAMES as schema keys.
         if key in _SCHEMA_MAP_KEYS and isinstance(value, dict):
-            out[key] = {str(k): _schema_node(v) for k, v in value.items()}
+            schema_map = cast("dict[str, object]", value)
+            out[key] = {str(k): _schema_node(v) for k, v in schema_map.items()}
         elif key in _SCHEMA_LIST_KEYS and isinstance(value, list):
-            out[key] = [_schema_node(item) for item in value]
+            items = cast("list[object]", value)
+            out[key] = [_schema_node(item) for item in items]
         elif key in ("items", "additionalProperties") and isinstance(
             value,
             (dict, list),
         ):
             # Both take a schema (``additionalProperties`` also takes a bool,
             # which is neither and passes through below).
-            out[key] = _schema_node(value)
+            schema = cast("dict[str, object] | list[object]", value)
+            out[key] = _schema_node(schema)
         else:
             out[key] = cast("MutablePlainTree", value)
     return _union_of_types(out)
@@ -174,7 +179,8 @@ def _union_of_types(out: dict[str, MutablePlainTree]) -> MutablePlainTree:
         # constrains the union's every branch, so it rides inside each one
         # rather than being overwritten, or merged, which would turn "both"
         # into "either".
-        for branch in branches:
-            cast("dict[str, MutablePlainTree]", branch)["anyOf"] = prior
+        for candidate in branches:
+            if isinstance(candidate, dict):
+                candidate["anyOf"] = prior
     out["anyOf"] = branches
     return out

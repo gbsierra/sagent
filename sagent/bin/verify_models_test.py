@@ -23,7 +23,12 @@ from sagent.catalog.sources.live import LiveLimits
 from sagent.providers.anthropic.api import Anthropic
 from sagent.providers.google.api import Google
 from sagent.providers.openai.api import OpenAI
-from sagent.types.capability import ModelCapability, ModelLimits, ThinkingCapability
+from sagent.types.capability import (
+    ModelCapability,
+    ModelLimits,
+    ThinkingCapability,
+    ThinkingEffort,
+)
 
 
 if TYPE_CHECKING:
@@ -124,8 +129,8 @@ class TestCompare:
     def test_effort_must_match_the_vendors_level_list_exactly(
         self,
         capsys: pytest.CaptureFixture[str],
-        catalog_effort: frozenset[str],
-        live_effort: frozenset[str] | None,
+        catalog_effort: frozenset[ThinkingEffort],
+        live_effort: frozenset[ThinkingEffort] | None,
         errors: int,
     ) -> None:
         known = {
@@ -477,7 +482,7 @@ class TestMain:
         assert "claude-opus-5-5" in queried
 
 
-type _Upstream = dict[str, dict[str, dict[str, dict[str, float]]]]
+type _Upstream = dict[str, dict[str, dict[str, dict[str, float | str]]]]
 
 
 def _triaged_upstream() -> _Upstream:

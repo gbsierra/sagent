@@ -251,7 +251,7 @@ async def check_drift(report_path: pathlib.Path | None) -> int:
         # A provider key vanishing or emptying upstream must not read as "no
         # drift": Anthropic and Google carry no triage pins, so nothing else
         # would notice their comparisons silently stopping.
-        if not rows:
+        if rows is None or not rows:
             _out(f"  {key}: models.dev lists no models; provider key moved?")
             errors += 1
             continue

@@ -58,8 +58,11 @@ def test_additional_properties_is_inside_the_subset_and_survives() -> None:
         },
     )
     wire = tool_schema(schema)
+    assert isinstance(wire, dict)
     assert wire["additionalProperties"] is False
-    nested = wire["properties"]["nested"]
+    properties = wire["properties"]
+    assert isinstance(properties, dict)
+    nested = properties["nested"]
     assert isinstance(nested, dict)
     assert nested["additionalProperties"] is False
 
@@ -104,6 +107,7 @@ def test_a_union_beside_an_anyof_narrows_every_branch() -> None:
         },
     )
     wire = tool_schema(schema)
+    assert isinstance(wire, dict)
     branches = wire["anyOf"]
     assert isinstance(branches, list)
     assert branches == [
@@ -129,12 +133,15 @@ def test_fields_the_subset_names_unsupported_are_dropped_recursively() -> None:
         },
     )
     wire = tool_schema(schema)
+    assert isinstance(wire, dict)
     assert "title" not in wire
     assert "$comment" not in wire
-    when = wire["properties"]["when"]
+    properties = wire["properties"]
+    assert isinstance(properties, dict)
+    when = properties["when"]
     assert isinstance(when, dict)
     assert when == {"type": "string"}
-    pair = wire["properties"]["pair"]
+    pair = properties["pair"]
     assert isinstance(pair, dict)
     assert pair == {"anyOf": [{"type": "array"}, {"type": "null"}]}
 
@@ -154,6 +161,7 @@ def test_a_property_named_like_a_dropped_key_survives() -> None:
         },
     )
     wire = tool_schema(schema)
+    assert isinstance(wire, dict)
     properties = wire["properties"]
     assert isinstance(properties, dict)
     assert properties == {"title": {"type": "string"}, "format": {"type": "string"}}

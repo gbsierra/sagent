@@ -20,9 +20,7 @@ def test_every_explicit_thinking_effort_has_a_cap() -> None:
 
 def test_caps_grow_with_effort() -> None:
     """A higher effort must never send a smaller cap."""
-    caps = [
-        EFFORT_BUDGET_TOKENS[e] for e in _EFFORTS if e not in {"default", "none"}
-    ]
+    caps = [EFFORT_BUDGET_TOKENS[e] for e in _EFFORTS if e not in {"default", "none"}]
     assert caps == sorted(caps)
     assert len(set(caps)) == len(caps)
 

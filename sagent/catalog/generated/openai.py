@@ -5,12 +5,12 @@
 Regenerate: python -m sagent.catalog.generate
 """
 
-from typing import Final
+from typing import Final, cast
 
 from sagent.catalog.generated_codec import decode_catalog
 from sagent.lib.codec import PlainTree
 
-DATA: Final[PlainTree] = {'rows': {'py/tuple': [{'py/object': 'sagent.types.capability.ModelCapability',
+DATA: Final[PlainTree] = cast('PlainTree', {'rows': {'py/tuple': [{'py/object': 'sagent.types.capability.ModelCapability',
                         'model_id': 'gpt-6-astra',
                         'knowledge_cutoff': 'April 30, 2026',
                         'approx_chars_per_token': 3.71,
@@ -1539,6 +1539,6 @@ DATA: Final[PlainTree] = {'rows': {'py/tuple': [{'py/object': 'sagent.types.capa
                                               'url': 'https://developers.openai.com/api/docs/models',
                                               'checked': {'py/hook': ['datetime.date',
                                                                       '2026-10-03']}}}},
- 'row_sources': {'py/mappingproxy': {}}}
+ 'row_sources': {'py/mappingproxy': {}}})
 
 MODELS = decode_catalog(DATA)
