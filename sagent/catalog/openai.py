@@ -23,6 +23,7 @@ from sagent.catalog.provenance import Source
 from sagent.catalog.table import ModelTable
 from sagent.types.capability import (
     ContextTag,
+    InputModality,
     ModelCapability,
     ModelLimits,
     ThinkingCapability,
@@ -67,6 +68,13 @@ _ALIASES: Final = MappingProxyType(
 
 _SOURCES: Final[Mapping[Fact, Source]] = MappingProxyType(
     {
+        # "Input modalities: text" on each model page, the same page
+        # ``limits`` and ``thinking`` read; the images-vision guide in the
+        # module docstring states which models take an image at all.
+        "inputs": Source(
+            "https://developers.openai.com/api/docs/models",
+            date(2026, 10, 3),
+        ),
         # One page per model; ``<id>.md`` is the rendering that states the
         # input cap.
         "limits": Source(
@@ -131,6 +139,40 @@ _RENAMED: Final = MappingProxyType(
 
 # "Input modalities: text" on each model page.
 _TEXT_ONLY: Final = frozenset({"o3-mini", "gpt-4"})
+_IMAGE_INPUTS: Final[frozenset[InputModality]] = frozenset({"text", "image"})
+_DOCUMENT_INPUTS: Final[frozenset[InputModality]] = frozenset(
+    {"text", "image", "pdf"},
+)
+
+_INPUTS: Final[Mapping[str, frozenset[InputModality]]] = {
+    "gpt-6-astra": _DOCUMENT_INPUTS,
+    "gpt-6.1-sol": _DOCUMENT_INPUTS,
+    "gpt-6-sol": _DOCUMENT_INPUTS,
+    "gpt-6-luna": _DOCUMENT_INPUTS,
+    "gpt-5.6-sol": _DOCUMENT_INPUTS,
+    "gpt-5.6": _DOCUMENT_INPUTS,
+    "gpt-5.6-luna": _DOCUMENT_INPUTS,
+    "gpt-5.6-terra": _DOCUMENT_INPUTS,
+    "gpt-5.5": _DOCUMENT_INPUTS,
+    "gpt-5.5-pro": _DOCUMENT_INPUTS,
+    "gpt-5.4": _DOCUMENT_INPUTS,
+    "gpt-5.4-pro": _IMAGE_INPUTS,
+    "gpt-5.4-mini": _IMAGE_INPUTS,
+    "gpt-5.4-nano": _IMAGE_INPUTS,
+    "gpt-5.2": _IMAGE_INPUTS,
+    "gpt-5.2-pro": _IMAGE_INPUTS,
+    "gpt-5.1": _IMAGE_INPUTS,
+    "o1": _DOCUMENT_INPUTS,
+    "o3-mini": frozenset({"text"}),
+    "gpt-4.1": _DOCUMENT_INPUTS,
+    "gpt-4.1-mini": _DOCUMENT_INPUTS,
+    "gpt-4.1-nano": _IMAGE_INPUTS,
+    "gpt-4o": _DOCUMENT_INPUTS,
+    "gpt-4o-mini": _DOCUMENT_INPUTS,
+    "gpt-4-turbo": _IMAGE_INPUTS,
+    "gpt-4": frozenset({"text"}),
+}
+"""Reviewed input modalities for the rows in :func:`source_models`."""
 
 
 _ALL_TURNS: Final = frozenset(
@@ -206,6 +248,7 @@ def compatible() -> ModelCapability:
 
     """
     return ModelCapability(
+        inputs=frozenset({"text", "image"}),
         thinking=ThinkingCapability(
             effort=frozenset({"none", "min", "low", "medium", "high", "xhigh", "max"}),
             budget=frozenset({"none", "auto", "fixed"}),
@@ -251,6 +294,7 @@ def source_models() -> ModelTable:
         model_id="gpt-6-astra",
         knowledge_cutoff="April 30, 2026",
         approx_chars_per_token=3.71,
+        inputs=_DOCUMENT_INPUTS,
         context=_limits(image_edge_px=65_535),
         prices=_prices(
             {
@@ -1041,6 +1085,7 @@ def source_models() -> ModelTable:
     rows = tuple(
         replace(row, default_effort=default_efforts.get(row.model_id)) for row in rows
     )
+    rows = tuple(replace(row, inputs=_INPUTS[row.model_id]) for row in rows)
     # A tier is offered exactly when it is priced.
     rows = tuple(replace(row, service_tier=row.prices.service_tiers) for row in rows)
     return ModelTable(
@@ -1128,6 +1173,10 @@ def api() -> ModelCapability:
 
     """
     return ModelCapability(
+        # ``text`` and ``image`` only: the Responses wire encodes
+        # ``input_text`` and ``input_image`` blocks, and has no PDF channel
+        # yet, so a row's ``pdf`` fact cannot reach the model over it.
+        inputs=frozenset({"text", "image"}),
         thinking=ThinkingCapability(
             effort=frozenset({"none", "min", "low", "medium", "high", "xhigh", "max"}),
             budget=frozenset({"none", "auto", "fixed"}),
@@ -1153,6 +1202,8 @@ def subscription() -> ModelCapability:
     # unqualified request still sends the default, so dropping it would make
     # ``ModelSettings()`` invalid on every Codex model.
     return ModelCapability(
+        # Same wire as :func:`api`, so the same two blocks.
+        inputs=frozenset({"text", "image"}),
         thinking=ThinkingCapability(
             effort=frozenset({"none", "min", "low", "medium", "high", "xhigh", "max"}),
             budget=frozenset({"none", "auto", "fixed"}),

@@ -70,6 +70,7 @@ from sagent.lib.codec import PlainTree
 from sagent.providers.lib.errors import PolicyBlockedError
 from sagent.tools.read import Read
 from sagent.types.capability import (
+    InputModality,
     ModelCapability,
     ModelLimits,
     ModelSettings,
@@ -244,6 +245,11 @@ class StubModel:
     max_image_dim: int = 8_000
     max_image_bytes: int = 5 * 1024 * 1024
     max_request_bytes: int = 32 * 1024 * 1024
+    # Permissive by default so a stub never changes what a test observes:
+    # ``_AgentModel.stream`` withholds an attachment the active model does not
+    # declare, and a text-only default would silently strip every image and PDF
+    # a test attaches. Narrow it to exercise the withholding path.
+    inputs: frozenset[InputModality] = frozenset({"text", "image", "pdf"})
     chosen: ModelSettings | None = None
     responses: list[AssistantMessage] = field(default_factory=list)
     received: list[ModelRequest] = field(default_factory=list)
@@ -255,6 +261,7 @@ class StubModel:
         thinking: frozenset[ThinkingEffort] = frozenset({"none", *self.valid_efforts})
         return ModelCapability(
             model_id=self.model_id,
+            inputs=self.inputs,
             context=MappingProxyType(
                 {
                     "": ModelLimits(
@@ -7586,6 +7593,60 @@ async def test_fresh_oversize_attachment_rejected_before_send() -> None:
     with pytest.raises(RequestTooLargeError):
         await a._agent_model.stream(history=history, publish=lambda _ev: None)
     assert model.call_index == 0, "oversize fresh attachment must be rejected pre-send"
+
+
+@pytest.mark.asyncio
+async def test_a_text_only_model_is_told_what_was_withheld() -> None:
+    """An unsupported attachment never reaches the wire, and leaves a notice.
+
+    Every encoder decided attachment support for itself and most decided
+    silently: the Responses encoder logged and dropped a PDF, the Anthropic
+    encoder skipped an unlisted MIME type, and the self-hosted and llama.cpp
+    servers ignored ``attachments`` outright. A user who pasted a document
+    into a model that cannot read one got an answer about nothing.
+    """
+    model = StubModel(
+        inputs=frozenset({"text"}),
+        responses=[AssistantMessage(text="ok")],
+    )
+    a = Agent(model=model, tools=[], compactor=None)
+    a.runtime.append_history(
+        UserMessage(
+            text="summarize this",
+            attachments=(BytesMessage(b"%PDF-1.4", "application/pdf"),),
+        ),
+    )
+    await a._agent_model.stream(
+        history=a.runtime.context().messages,
+        publish=lambda _ev: None,
+    )
+    sent = model.received[0]
+    (entry,) = [m for m in sent.messages if isinstance(m, UserMessage)]
+    assert entry.attachments == ()
+    assert "application/pdf not accepted by this model" in entry.text
+    assert "supported inputs: text" in entry.text
+
+
+@pytest.mark.asyncio
+async def test_a_model_that_reads_pdfs_receives_the_bytes_intact() -> None:
+    """The withholding path is keyed on the model's declared modalities."""
+    attachment = BytesMessage(b"%PDF-1.4", "application/pdf")
+    model = StubModel(
+        inputs=frozenset({"text", "image", "pdf"}),
+        responses=[AssistantMessage(text="ok")],
+    )
+    a = Agent(model=model, tools=[], compactor=None)
+    a.runtime.append_history(
+        UserMessage(text="summarize this", attachments=(attachment,)),
+    )
+    await a._agent_model.stream(
+        history=a.runtime.context().messages,
+        publish=lambda _ev: None,
+    )
+    sent = model.received[0]
+    (entry,) = [m for m in sent.messages if isinstance(m, UserMessage)]
+    assert entry.attachments == (attachment,)
+    assert entry.text == "summarize this"
 
 
 @pytest.mark.asyncio

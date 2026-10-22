@@ -44,7 +44,12 @@ from sagent.tools.core import (
     load_tool_description,
     provider_not_allowed_result,
 )
-from sagent.types.capability import ModelSettings, ThinkingEffort
+from sagent.types.capability import (
+    InputModality,
+    ModelSettings,
+    ThinkingEffort,
+    format_modalities,
+)
 from sagent.types.cost import ServiceTier
 from sagent.types.providers import ModelResolver, Provider
 from sagent.types.runtime import (
@@ -61,6 +66,7 @@ if TYPE_CHECKING:
 
     from sagent.agent.cost_tracker import CostTracker
     from sagent.agent.state import ToolState
+    from sagent.catalog.table import ModelTable
     from sagent.types.model import Model, ModelRecipe
 
 
@@ -693,8 +699,30 @@ def _model_catalog_lines(provider_name: str) -> list[str]:
         lines.append(f"Roles: {roles or 'none'}")
         lines.append(f"Aliases: {aliases or 'none'}")
         lines.append(f"Known models: {', '.join(table) or 'none'}")
+        lines.extend(_modality_lines(table))
     else:
         lines.append("Known models: unavailable for this provider.")
+    return lines
+
+
+# Grouping by the declared set answers the question a caller actually asks --
+# "which models can take this screenshot or PDF?" -- in a few lines, where one
+# line per model would repeat "text" for all 35 rows of a vendor table.
+def _modality_lines(table: ModelTable) -> list[str]:
+    """Group a table's vendor ids by the input modality set their rows declare."""
+    groups: dict[frozenset[InputModality], list[str]] = {}
+    for model_id in table:
+        groups.setdefault(table[model_id].inputs, []).append(model_id)
+    if not groups:
+        return []
+    lines = ["Inputs:"]
+    # Widest first: the rows that accept the most are the ones a caller looking
+    # for a place to attach a file is hunting for.
+    for inputs, ids in sorted(
+        groups.items(),
+        key=lambda group: (-len(group[0]), format_modalities(group[0])),
+    ):
+        lines.append(f"  {format_modalities(inputs)}: {', '.join(ids)}")
     return lines
 
 
@@ -761,6 +789,7 @@ def _agent_option_lines(agent: AgentSelfAgent) -> list[str]:
     supported = _supported_model_options(agent.model)
     supported_text = ", ".join(f"{k}: {v}" for k, v in supported.items()) or "none"
     return [
+        f"Inputs:             {format_modalities(capability.inputs)}",
         f"Cache TTL:          {cache_ttl}",
         f"Thinking:           {thinking}",
         f"Effort:             {effort}",

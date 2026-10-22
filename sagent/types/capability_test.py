@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from dataclasses import fields, replace
 from types import MappingProxyType
-from typing import Final
+from typing import Final, cast
 
 import pytest
 
 from sagent.types.capability import (
+    InputModality,
     LimitCondition,
     LimitOverlay,
     ModelCapability,
@@ -16,6 +17,7 @@ from sagent.types.capability import (
     ModelSettings,
     ThinkingCapability,
     ThinkingEffort,
+    format_modalities,
 )
 from sagent.types.cost import PriceCatalog, PriceKey, TokenPrice
 
@@ -101,6 +103,40 @@ def test_the_meet_cannot_grant() -> None:
         thinking=ThinkingCapability(effort=frozenset({"none", "max"})),
     )
     assert met.thinking.effort == frozenset({"default", "none"})
+
+
+def test_the_meet_narrows_input_modalities_to_what_both_accept() -> None:
+    """A transport with no PDF channel cannot inherit the row's ``pdf`` fact."""
+    row = ModelCapability(inputs=frozenset({"text", "image", "pdf"}))
+    transport = ModelCapability(inputs=frozenset({"text", "image"}))
+    assert (row & transport).inputs == frozenset({"text", "image"})
+
+
+def test_the_meet_cannot_grant_an_input_modality() -> None:
+    """A wire that can send video cannot give a text-only row the ability."""
+    row = ModelCapability(inputs=frozenset({"text"}))
+    transport = ModelCapability(inputs=frozenset({"text", "image", "audio", "video"}))
+    assert (row & transport).inputs == frozenset({"text"})
+
+
+def test_a_row_with_no_input_modality_is_rejected() -> None:
+    """An empty set is the meet's absorbing element, not a valid declaration."""
+    with pytest.raises(ValueError, match="at least one modality"):
+        _ = ModelCapability(inputs=frozenset())
+
+
+def test_an_unknown_input_modality_is_rejected() -> None:
+    """A typo must fail at the row, not silently drop every attachment."""
+    with pytest.raises(ValueError, match="unknown input modality: images"):
+        _ = ModelCapability(
+            inputs=cast("frozenset[InputModality]", frozenset({"images"}))
+        )
+
+
+def test_format_modalities_reads_in_declaration_order() -> None:
+    assert format_modalities(frozenset({"pdf", "text", "image"})) == "text, image, pdf"
+    assert format_modalities(frozenset({"video", "text"})) == "text, video"
+    assert format_modalities(frozenset()) == "(none)"
 
 
 def test_the_transport_declares_the_cache_lifetimes() -> None:

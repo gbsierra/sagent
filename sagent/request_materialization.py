@@ -7,9 +7,11 @@ from typing import TYPE_CHECKING, Final
 import dataclasses
 
 from sagent.agent.state import approx_tokens
+from sagent.types.capability import InputModality, format_modalities
 from sagent.types.runtime import (
     AgentSendMessage,
     AssistantMessage,
+    BytesMessage,
     ModelContextEvent,
     ToolResult,
     UserMessage,
@@ -35,6 +37,115 @@ _TRUNCATION_NOTICE: Final = (
     "\n<truncated: kept the first {kept:,} of {total:,} chars to fit the"
     " request budget. Re-run the tool from character {kept:,} for the rest.>"
 )
+
+
+def filter_request_modalities(
+    request: ModelRequest,
+    *,
+    inputs: frozenset[InputModality],
+) -> ModelRequest:
+    """Withhold attachments the active model/transport cannot receive.
+
+    Every wire encoder decided this for itself and most decided silently: the
+    Anthropic and Google encoders skip an unlisted MIME type, the OpenAI
+    Responses encoder logs and skips a PDF, and the self-hosted and llama.cpp
+    servers ignore ``attachments`` outright. A user who pasted a PDF into a
+    model that only reads text then got an answer about nothing, with no
+    indication that the payload never shipped.
+
+    Withheld bytes are replaced by a notice naming the payload and the
+    modalities the model does accept, in the same user or tool entry, so the
+    model can ask for a supported representation instead of answering a
+    question it never received.
+
+    Args:
+      request: Provider request before wire encoding.
+      inputs: Effective input modalities, after the catalog row is met with
+          the transport.
+
+    Returns:
+      filtered: Request whose unsupported attachments carry a notice.
+
+    """
+    out: list[ModelContextEvent] = []
+    for entry in request.messages:
+        if not isinstance(entry, (UserMessage, AgentSendMessage, ToolResult)):
+            out.append(entry)
+            continue
+        kept, dropped = _split_attachments(entry.attachments, inputs)
+        if not dropped:
+            out.append(entry)
+            continue
+        notice = _omitted_notice(dropped, inputs)
+        if isinstance(entry, ToolResult):
+            out.append(
+                dataclasses.replace(
+                    entry,
+                    content=_append_notice(entry.content, notice),
+                    attachments=kept,
+                ),
+            )
+        else:
+            out.append(
+                dataclasses.replace(
+                    entry,
+                    text=_append_notice(entry.text, notice),
+                    attachments=kept,
+                ),
+            )
+    return dataclasses.replace(request, messages=out)
+
+
+def _split_attachments(
+    attachments: tuple[BytesMessage, ...],
+    inputs: frozenset[InputModality],
+) -> tuple[tuple[BytesMessage, ...], list[str]]:
+    """Partition one entry's attachments into what survives and what is withheld.
+
+    An unclassifiable descriptor is KEPT: this layer knows modality families,
+    not MIME types, and each encoder still holds the per-wire allow-list that
+    decides an exotic type such as ``image/svg+xml`` for the format it names.
+    """
+    kept: list[BytesMessage] = []
+    dropped: list[str] = []
+    for attachment in attachments:
+        modality = _attachment_modality(attachment.descriptor)
+        if modality is None or modality in inputs:
+            kept.append(attachment)
+        else:
+            dropped.append(attachment.descriptor)
+    return tuple(kept), dropped
+
+
+def _omitted_notice(dropped: list[str], inputs: frozenset[InputModality]) -> str:
+    """Name what was withheld and what the model does accept."""
+    # ``format_modalities``, not ``sorted``: the accepted set reads in the
+    # catalog's declaration order ("text, image, pdf"), where ``sorted`` would
+    # bury the one member every row has behind ``audio``.
+    withheld = ", ".join(sorted(set(dropped)))
+    return (
+        f"<attachment(s) omitted: {withheld} not accepted by this model;"
+        f" supported inputs: {format_modalities(inputs)}. Convert the payload to"
+        " a supported format and send it again.>"
+    )
+
+
+def _attachment_modality(descriptor: str) -> InputModality | None:
+    """Map a MIME descriptor to its catalog modality family, if it names one."""
+    if descriptor.startswith("image/"):
+        return "image"
+    if descriptor == "application/pdf":
+        return "pdf"
+    if descriptor.startswith("audio/"):
+        return "audio"
+    if descriptor.startswith("video/"):
+        return "video"
+    return None
+
+
+def _append_notice(text: str, notice: str) -> str:
+    """Append one visible attachment notice to existing content."""
+    return f"{text}\n{notice}" if text else notice
 
 
 def elided_placeholder(original_chars: int) -> str:
@@ -92,6 +203,7 @@ def materialize_request(
     request: ModelRequest,
     *,
     tool_result_budget_tokens: int = 0,
+    inputs: frozenset[InputModality] | None = None,
 ) -> ModelRequest:
     """Return ``request`` with provider-visible messages budgeted.
 
@@ -99,11 +211,21 @@ def materialize_request(
       request: Fully-built provider request.
       tool_result_budget_tokens: Aggregate TOKEN budget for full
           ``ToolResult.content`` values. ``0`` disables tool-result elision.
+      inputs: Effective input modalities of the model this request will ship
+          to. ``None`` skips modality filtering, which is what every caller
+          that only measures a request wants: a withheld attachment is not a
+          wire byte, so a path that both measures and sends must pass the
+          same value to both.
 
     Returns:
       materialized: Request with the same knobs and budgeted messages.
 
     """
+    if inputs is not None:
+        # Before budgeting: a withheld attachment is not a byte the provider
+        # sees, so it must not be counted, and the notice the model reads
+        # should survive as part of the text the budget is spent on.
+        request = filter_request_modalities(request, inputs=inputs)
     return dataclasses.replace(
         request,
         messages=materialize_messages(

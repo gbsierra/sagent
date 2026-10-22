@@ -13,7 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import partial
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, cast
 
 import math
 
@@ -23,6 +23,7 @@ from sagent.catalog import anthropic, dashscope, google, minimax, moonshot, open
 from sagent.catalog.provenance import Source
 from sagent.catalog.sources.live import describe
 from sagent.lib.codec import from_plain
+from sagent.types.capability import InputModality, format_modalities
 from sagent.types.cost import PriceKey
 
 
@@ -33,6 +34,7 @@ if TYPE_CHECKING:
     from sagent.catalog.provenance import Fact
     from sagent.catalog.sources.live import Warn
     from sagent.catalog.table import ModelTable
+    from sagent.types.capability import ModelCapability
 
 
 __all__ = [
@@ -72,9 +74,10 @@ class Drift:
     """models.dev provider key."""
     model_id: str
     field: str
-    """models.dev's name for the value (``limit.output``, ``cost.cache_read``)."""
-    ours: float
-    theirs: float
+    """models.dev's name for the value (``limit.output``, ``modalities.input``)."""
+    ours: float | str
+    """Sagent's value: a number for a measured fact, the rendered set for modalities."""
+    theirs: float | str
     source: Source | None
     """Where Sagent read the value."""
     accepted: str = ""
@@ -112,7 +115,7 @@ _DELISTED: Final = (
     "keeps the 2026-10-03 read"
 )
 
-ACCEPTED: Final[Mapping[tuple[str, str], tuple[float, str]]] = MappingProxyType(
+ACCEPTED: Final[Mapping[tuple[str, str], tuple[float | str, str]]] = MappingProxyType(
     {
         ("gpt-5.5", "limit.input"): (922_000, _WINDOW),
         ("gpt-5.5-pro", "limit.input"): (922_000, _WINDOW),
@@ -241,7 +244,59 @@ def compare(
                     ("cost.cache_write", card.cache_write, cost.get("cache_write")),
                 ],
             )
+        _differ_modalities(out, provider, mid, table, cap, row)
     return out
+
+
+def _differ_modalities(  # noqa: PLR0917 -- one row's comparison, kept flat.
+    out: list[Drift],
+    provider: str,
+    mid: str,
+    table: ModelTable,
+    cap: ModelCapability,
+    row: Mapping[str, object],
+) -> None:
+    """Append a :class:`Drift` when a row's input modalities disagree.
+
+    models.dev states the set as a list, Sagent as a frozenset, so the two are
+    compared as sets and rendered in the declared ladder order: a row that
+    lists the same modalities in another order is not drift. An upstream entry
+    that states nothing about modalities is skipped, like a value it omits.
+    """
+    theirs = _upstream_modalities(row)
+    if theirs is None or theirs == cap.inputs:
+        return
+    name = "modalities.input"
+    rendered = format_modalities(theirs)
+    pinned, reason = ACCEPTED.get((mid, name), (None, ""))
+    out.append(
+        Drift(
+            provider=provider,
+            model_id=mid,
+            field=name,
+            ours=format_modalities(cap.inputs),
+            theirs=rendered,
+            source=table.source(mid, "inputs"),
+            accepted=reason if pinned == rendered else "",
+        ),
+    )
+
+
+def _upstream_modalities(row: Mapping[str, object]) -> frozenset[InputModality] | None:
+    """Return models.dev's declared input modalities, or ``None`` when silent.
+
+    A ``modalities`` object with no ``input`` list is skipped, like a numeric
+    value the row omits: reporting ``(none)`` would turn a field models.dev
+    does not publish into a claim that the model reads nothing.
+    """
+    declared = from_plain(row.get("modalities"), dict[str, object], default={})
+    raw = declared.get("input")
+    if not isinstance(raw, list):
+        return None
+    return frozenset(
+        cast(InputModality, from_plain(value, str, default=""))
+        for value in cast(list[object], raw)
+    )
 
 
 def _differ(  # noqa: PLR0917 -- partial-applied per row.
@@ -258,6 +313,10 @@ def _differ(  # noqa: PLR0917 -- partial-applied per row.
         if math.isnan(theirs) or math.isclose(ours, theirs, abs_tol=1e-12):
             continue
         pinned, reason = ACCEPTED.get((mid, name), (math.nan, ""))
+        # A string pin belongs to the modality comparison, whose values are
+        # rendered sets; a numeric pin is a published figure. ``pinned`` may be
+        # an int, so the test is "not a string" rather than ``isinstance(..., float)``.
+        triaged = not isinstance(pinned, str) and math.isclose(pinned, theirs)
         out.append(
             Drift(
                 provider=provider,
@@ -266,7 +325,7 @@ def _differ(  # noqa: PLR0917 -- partial-applied per row.
                 ours=ours,
                 theirs=theirs,
                 source=table.source(mid, fact),
-                accepted=reason if math.isclose(pinned, theirs) else "",
+                accepted=reason if triaged else "",
             ),
         )
 
@@ -348,8 +407,10 @@ def report(drifts: list[Drift], *, at: date) -> str:
     return "\n".join(lines) + "\n"
 
 
-def format_value(value: float) -> str:
-    """Show a token count with separators and a price as written."""
+def format_value(value: float | str) -> str:
+    """Show tokens with separators, a price as written, a modality set verbatim."""
+    if isinstance(value, str):
+        return value
     if float(value).is_integer() and value >= 1000:
         return f"{int(value):,}"
     return f"{value:g}"

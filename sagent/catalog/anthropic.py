@@ -84,6 +84,7 @@ def source_models() -> ModelTable:
         model_id="claude-opus-5-5",
         knowledge_cutoff="June 2026",
         approx_chars_per_token=2.38,
+        inputs=frozenset({"text", "image", "pdf"}),
         context=_limits(),
         prices=_prices(
             _card(
@@ -433,6 +434,10 @@ _PRICING: Final = "https://platform.claude.com/docs/en/about-claude/pricing"
 
 _SOURCES: Final[Mapping[Fact, Source]] = MappingProxyType(
     {
+        "inputs": Source(
+            "https://platform.claude.com/docs/en/build-with-claude/vision",
+            date(2026, 10, 3),
+        ),
         "limits": Source("https://docs.anthropic.com/en/docs/about-claude/models"),
         "prices": Source(_PRICING, date(2026, 10, 3)),
         "thinking": Source(
@@ -485,6 +490,7 @@ def api() -> ModelCapability:
 
     """
     return ModelCapability(
+        inputs=frozenset({"text", "image", "pdf"}),
         thinking=ThinkingCapability(
             effort=frozenset({"none", "min", "low", "medium", "high", "xhigh", "max"}),
             budget=frozenset({"none", "auto", "fixed"}),
@@ -514,6 +520,7 @@ def cli() -> ModelCapability:
 
     """
     return ModelCapability(
+        inputs=frozenset({"text", "image"}),
         thinking=ThinkingCapability(
             effort=frozenset(),
             budget=frozenset({"none", "auto", "fixed"}),

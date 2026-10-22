@@ -20,13 +20,14 @@ from collections.abc import (
 )
 from dataclasses import dataclass, field, fields, replace
 from types import MappingProxyType
-from typing import Literal, Self, TypeAliasType, cast, get_args, override
+from typing import Final, Literal, Self, TypeAliasType, cast, get_args, override
 
 from sagent.types.cost import PriceCatalog, ServiceTier
 
 
 __all__ = [
     "ContextTag",
+    "InputModality",
     "LimitCondition",
     "LimitOverlay",
     "ModelCapability",
@@ -39,6 +40,7 @@ __all__ = [
     "ThinkingControl",
     "ThinkingEffort",
     "ThinkingOutput",
+    "format_modalities",
 ]
 
 
@@ -60,6 +62,19 @@ type ThinkingOutput = Literal["none", "text", "redacted"]
 type ThinkingControl = Literal["none", "budget", "effort", "always"]
 
 type ContextTag = Literal["", "+200k", "+272k", "+1m"]
+
+type InputModality = Literal["text", "image", "pdf", "audio", "video"]
+"""Semantic input families a model can accept."""
+
+# Derived from the alias, not restated: a member added above without a
+# validation entry would be unrepresentable in a source table while
+# type-checking clean.
+_MODALITY_LADDER: Final[tuple[InputModality, ...]] = cast(
+    tuple[InputModality, ...],
+    get_args(cast(object, InputModality.__value__)),
+)
+
+_MODALITIES: Final[frozenset[str]] = frozenset(_MODALITY_LADDER)
 
 type SummaryKind = Literal["none", "auto", "concise", "detailed"]
 
@@ -181,6 +196,13 @@ class ModelCapability:
     approx_chars_per_token: float = 4.0
     """Measured text-token estimate for this model's tokenizer."""
 
+    inputs: frozenset[InputModality] = frozenset({"text"})
+    """Input modality families the model accepts.
+
+    This is a model fact, not a MIME allow-list. The transport meets it with
+    the modalities its wire encoder can actually send.
+    """
+
     context: Mapping[ContextTag, ModelLimits] = field(
         default_factory=lambda: MappingProxyType({"": ModelLimits()}),
     )
@@ -237,6 +259,14 @@ class ModelCapability:
         """Reject the sentinel as an effective provider level."""
         if self.default_effort == "default":
             raise ValueError("default_effort must name the effective provider level")
+        # An empty set is the meet's absorbing element: one transport declaring
+        # nothing would silently strip every modality from every row it serves,
+        # so the mistake would only surface as attachments vanishing.
+        if not self.inputs:
+            raise ValueError("inputs must state at least one modality family")
+        unknown = sorted(self.inputs - _MODALITIES)
+        if unknown:
+            raise ValueError(f"unknown input modality: {', '.join(unknown)}")
         seen: set[LimitCondition] = set()
         for overlay in self.limit_overlays:
             if overlay.when in seen:
@@ -288,6 +318,7 @@ class ModelCapability:
         # or what it costs.
         return replace(
             self,
+            inputs=self.inputs & other.inputs,
             thinking=self.thinking & other.thinking,
             service_tier=self.service_tier & other.service_tier,
             manage_context_server_side=(
@@ -306,6 +337,7 @@ class ModelCapability:
                 self.model_id,
                 self.knowledge_cutoff,
                 self.approx_chars_per_token,
+                self.inputs,
                 frozenset(self.context.items()),
                 self.limit_overlays,
                 frozenset(self.prices.items()),
@@ -552,6 +584,24 @@ class ModelSettings:
                 return self.thinking_budget != "none"
             case "effort":
                 return self.effective_thinking_effort != "none"
+
+
+def format_modalities(inputs: frozenset[InputModality]) -> str:
+    """Render a modality set in declaration order, then any unrecognized member.
+
+    Declaration order is the ladder a reader reads ("text, image, pdf");
+    ``sorted`` would scramble it into ``audio, image, pdf, text, video`` and
+    bury the one member every row has.
+
+    Args:
+      inputs: The set to render.
+
+    Returns:
+      text: Comma-separated members, or ``"(none)"`` for the empty set.
+
+    """
+    known = [name for name in _MODALITY_LADDER if name in inputs]
+    return ", ".join([*known, *sorted(inputs - _MODALITIES)]) or "(none)"
 
 
 def _condition_matches(

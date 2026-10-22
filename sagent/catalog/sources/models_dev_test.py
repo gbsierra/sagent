@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import date
 from types import MappingProxyType
+from typing import cast
 
 import httpx2
 import pytest
@@ -12,7 +13,7 @@ import pytest
 from sagent.catalog.provenance import Source
 from sagent.catalog.sources import models_dev
 from sagent.catalog.table import ModelTable
-from sagent.types.capability import ModelCapability, ModelLimits
+from sagent.types.capability import InputModality, ModelCapability, ModelLimits
 from sagent.types.cost import PriceCatalog, PriceKey, TokenPrice
 
 
@@ -24,9 +25,15 @@ type Serve = Callable[
 _LIMITS = Source("https://example.com/models", date(2026, 10, 3))
 
 
-def _table(model_id: str = "m", *, output: int = 64_000) -> ModelTable:
+def _table(
+    model_id: str = "m",
+    *,
+    output: int = 64_000,
+    inputs: frozenset[str] = frozenset({"text"}),
+) -> ModelTable:
     row = ModelCapability(
         model_id=model_id,
+        inputs=cast(frozenset[InputModality], inputs),
         context=MappingProxyType(
             {"": ModelLimits(max_request_tokens=200_000, max_response_tokens=output)},
         ),
@@ -80,14 +87,70 @@ def test_rows_upstream_lacks_and_fields_it_omits_are_skipped() -> None:
     assert models_dev.compare("p", _table(), {"m": {"limit": {}}}) == []
 
 
+def test_a_modality_disagreement_names_both_sets_in_ladder_order() -> None:
+    upstream = {"m": {"modalities": {"input": ["image", "pdf", "text"]}}}
+    (drift,) = models_dev.compare("p", _table(), upstream)
+    assert drift == models_dev.Drift(
+        provider="p",
+        model_id="m",
+        field="modalities.input",
+        ours="text",
+        theirs="text, image, pdf",
+        source=None,
+    )
+
+
+def test_modalities_match_as_sets_not_as_lists() -> None:
+    """models.dev's list order is its own; the same members are not drift."""
+    upstream = {"m": {"modalities": {"input": ["text"]}}}
+    assert models_dev.compare("p", _table(), upstream) == []
+    reordered = {"m": {"modalities": {"input": ["image", "text"]}}}
+    assert (
+        models_dev.compare("p", _table(inputs=frozenset({"image", "text"})), reordered)
+        == []
+    )
+
+
+def test_an_upstream_row_that_states_no_modalities_is_skipped() -> None:
+    assert models_dev.compare("p", _table(), {"m": {"modalities": {}}}) == []
+    assert (
+        models_dev.compare("p", _table(), {"m": {"modalities": {"input": "text"}}})
+        == []
+    )
+
+
+def test_a_modality_triage_holds_only_for_the_set_it_was_pinned_to(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pinned: Mapping[tuple[str, str], tuple[float | str, str]] = {
+        ("m", "modalities.input"): ("text, image", "the model page lists both"),
+    }
+    monkeypatch.setattr(models_dev, "ACCEPTED", pinned)
+    (drift,) = models_dev.compare(
+        "p",
+        _table(),
+        {"m": {"modalities": {"input": ["text", "image"]}}},
+    )
+    assert drift.accepted == "the model page lists both"
+    (moved,) = models_dev.compare(
+        "p",
+        _table(),
+        {"m": {"modalities": {"input": ["text", "image", "pdf"]}}},
+    )
+    assert moved.accepted == ""
+
+
 def test_triage_holds_only_for_the_value_it_was_pinned_to() -> None:
     (mid, field), (pinned, reason) = next(iter(models_dev.ACCEPTED.items()))
     assert field == "limit.input"
+    # ``ACCEPTED`` holds modality sets too, whose pins are rendered strings;
+    # this entry is the numeric one the assertion above selects.
+    amount = cast(float, pinned)
     table = _table(mid)
-    upstream = {mid: {"limit": {"input": pinned}}}
+    upstream = {mid: {"limit": {"input": amount}}}
     (drift,) = models_dev.compare("p", table, upstream)
     assert drift.accepted == reason
-    (moved,) = models_dev.compare("p", table, {mid: {"limit": {"input": pinned - 1}}})
+    (moved,) = models_dev.compare("p", table, {mid: {"limit": {"input": amount - 1}}})
     assert moved.accepted == ""
 
 

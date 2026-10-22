@@ -1,6 +1,7 @@
 """Google (Gemini) model catalog, expressed as ``ModelCapability`` rows.
 
-Sources: limits, prices, and thinking per ``_SOURCES``.
+Sources: limits, prices, and thinking per ``_SOURCES``; also
+  https://ai.google.dev/gemini-api/docs/file-input-methods
 
 :func:`models` is the API-key view. Other transports narrow it with ``&``
 (see :func:`cli`), which can only remove.
@@ -73,6 +74,7 @@ def source_models() -> ModelTable:
     pro = ModelCapability(
         model_id="gemini-3.1-pro-preview",
         knowledge_cutoff="January 2025",
+        inputs=frozenset({"text", "image", "audio", "video", "pdf"}),
         context=_limits(),
         prices=_prices(
             _card(request=2.0, response=12.0, cache_read=0.2),
@@ -195,6 +197,10 @@ def models() -> ModelTable:
 
 _SOURCES: Final[Mapping[Fact, Source]] = MappingProxyType(
     {
+        "inputs": Source(
+            "https://ai.google.dev/gemini-api/docs/file-input-methods",
+            date(2026, 10, 7),
+        ),
         "limits": Source("https://ai.google.dev/gemini-api/docs/models"),
         "prices": Source("https://ai.google.dev/gemini-api/docs/pricing"),
         "thinking": Source(
@@ -222,6 +228,7 @@ def api() -> ModelCapability:
     # Every axis stated: ``&`` can only remove, and a defaulted axis is the
     # narrow value, so an omitted one would strip the model's real capability.
     return ModelCapability(
+        inputs=frozenset({"text", "image", "pdf"}),
         thinking=ThinkingCapability(
             effort=frozenset({"none", "min", "low", "medium", "high", "xhigh", "max"}),
             budget=frozenset({"none", "auto", "fixed"}),
@@ -244,6 +251,7 @@ def cli() -> ModelCapability:
 
     """
     return ModelCapability(
+        inputs=frozenset({"text", "image"}),
         thinking=ThinkingCapability(
             effort=frozenset({"none"}),
             budget=frozenset({"none", "auto", "fixed"}),
@@ -268,6 +276,7 @@ def subscription() -> ModelCapability:
 
     """
     return ModelCapability(
+        inputs=frozenset({"text", "image", "pdf"}),
         thinking=ThinkingCapability(
             effort=frozenset({"none", "min", "low", "medium", "high", "xhigh", "max"}),
             budget=frozenset({"none", "auto", "fixed"}),

@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import date
+from typing import Final
 
 import pytest
 
 from sagent.catalog import openai
 from sagent.types.capability import (
+    InputModality,
     ModelCapability,
     ModelLimits,
     ThinkingCapability,
@@ -24,11 +26,22 @@ _TRANSPORT_THINKING = ThinkingCapability(
     output=frozenset({"none", "text", "redacted"}),
 )
 
+_RESPONSES_INPUTS: Final[frozenset[InputModality]] = frozenset({"text", "image"})
+"""What the Responses wire encodes today: ``input_text`` and ``input_image``.
+
+PDF is withheld rather than skipped: ``_build_user_item`` logs the descriptor
+and drops the payload, so a row that accepts ``pdf`` still cannot receive one
+over this transport. Declaring it here would claim a channel that does not
+exist.
+"""
+
+_CHAT_INPUTS: Final[frozenset[InputModality]] = frozenset({"text", "image"})
+"""Chat Completions parts: ``text`` and ``image_url``; no PDF channel."""
+
 
 @pytest.fixture(autouse=True)
 def rebuild_catalog() -> None:
-    """Build rows per test; a cached catalog hides edits to its row helpers."""
-    openai.models.cache_clear()
+    """Drop the cached subscription view; ``models`` is a module constant."""
     openai.subscription_models.cache_clear()
 
 
@@ -141,6 +154,7 @@ def test_no_openai_row_offers_min() -> None:
 
 def test_subscription_offers_only_auto_and_priority_over_account_auth() -> None:
     assert openai.subscription() == ModelCapability(
+        inputs=_RESPONSES_INPUTS,
         thinking=_TRANSPORT_THINKING,
         service_tier=frozenset({"auto", "priority"}),
         account_auth=True,
@@ -149,6 +163,7 @@ def test_subscription_offers_only_auto_and_priority_over_account_auth() -> None:
 
 def test_compatible_offers_only_the_standard_tier_without_server_context() -> None:
     assert openai.compatible() == ModelCapability(
+        inputs=_CHAT_INPUTS,
         thinking=_TRANSPORT_THINKING,
         service_tier=frozenset({"auto"}),
         manage_context_server_side=frozenset({False}),
@@ -174,6 +189,7 @@ def test_cards_carry_every_published_column() -> None:
 
 def test_api_offers_every_tier_over_key_auth() -> None:
     assert openai.api() == ModelCapability(
+        inputs=_RESPONSES_INPUTS,
         thinking=_TRANSPORT_THINKING,
         service_tier=frozenset({"auto", "default", "flex", "priority", "ultrafast"}),
     )
