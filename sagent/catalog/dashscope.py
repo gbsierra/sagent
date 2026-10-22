@@ -230,6 +230,26 @@ def source_models() -> ModelTable:
             thinking=hybrid,
         ),
     )
+    inputs = {
+        "qwen3.8-max": frozenset({"text", "image", "video", "pdf"}),
+        "qwen3.8-flash": frozenset({"text", "image", "video"}),
+        "qwen3.8-27b": frozenset({"text", "image", "video"}),
+        "qwen3.8-2.4t-a95b": frozenset({"text"}),
+        "qwen3.7-max": frozenset({"text"}),
+        "qwen3.7-plus": frozenset({"text", "image", "video"}),
+        "qwen3.7-flash": frozenset({"text", "image", "video"}),
+        "qwen3.6-max-preview": frozenset({"text"}),
+        "qwen3.6-plus": frozenset({"text", "image", "video"}),
+        "qwen3.6-flash": frozenset({"text", "image", "video"}),
+        "qwen3-235b-a22b-instruct-2507": frozenset({"text"}),
+        "qwen3-235b-a22b-thinking-2507": frozenset({"text"}),
+        "qwen3-30b-a3b-instruct-2507": frozenset({"text"}),
+        "qwen3-32b": frozenset({"text"}),
+        "qwen3-coder-480b-a35b-instruct": frozenset({"text"}),
+        "qwen-plus": frozenset({"text"}),
+        "qwen-turbo": frozenset({"text"}),
+    }
+    rows = tuple(replace(row, inputs=inputs[row.model_id]) for row in rows)
     # Qwen 3.8 publishes xhigh when reasoning_effort is omitted. Older rows
     # publish a dynamic/default token budget rather than a named effort.
     # https://help.aliyun.com/en/model-studio/qwen-api-via-openai-responses
@@ -289,6 +309,10 @@ _DOCS: Final = "https://www.alibabacloud.com/help/en/model-studio"
 
 _SOURCES: Final[Mapping[Fact, Source]] = MappingProxyType(
     {
+        "inputs": Source(
+            "https://www.alibabacloud.com/help/en/model-studio/vision",
+            date(2026, 10, 20),
+        ),
         "limits": Source(f"{_DOCS}/text-generation-model", date(2026, 10, 3)),
         "prices": Source(f"{_DOCS}/model-pricing", date(2026, 10, 3)),
         "thinking": Source(f"{_DOCS}/deep-thinking", date(2026, 10, 3)),

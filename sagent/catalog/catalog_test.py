@@ -52,7 +52,7 @@ def _transports() -> tuple[list[_Case], list[str]]:
     ids: list[str] = []
     for module in _VENDORS:
         vendor = module.__name__.rsplit(".", 1)[-1]
-        for name in ("api", "cli", "subscription", "chat"):
+        for name in ("api", "cli", "subscription", "compatible"):
             if not hasattr(module, name):
                 continue
             factory = cast(Callable[[], ModelCapability], getattr(module, name))
@@ -207,6 +207,29 @@ def test_every_offered_tier_prices_every_prompt_size(row: ModelCapability) -> No
             )
 
 
+@pytest.mark.parametrize("row", _ROWS)
+def test_every_row_states_its_input_modalities(row: ModelCapability) -> None:
+    """Text is the one modality every model here reads; a row must say so.
+
+    ``inputs`` defaults to ``{"text"}``, and ``&`` can only remove, so a row
+    that forgot to widen its set is indistinguishable from a text-only model
+    -- and the request boundary would then withhold a screenshot the model
+    accepts and tell the model nothing was attached.
+    """
+    assert "text" in row.inputs, row.model_id
+
+
+@pytest.mark.parametrize(("models", "transport"), _TRANSPORTS, ids=_TRANSPORT_IDS)
+def test_every_transport_accepts_text(
+    models: Mapping[str, ModelCapability],
+    transport: ModelCapability,
+) -> None:
+    """Every wire here encodes a text block, so none may narrow text away."""
+    assert "text" in transport.inputs
+    for row in models.values():
+        assert "text" in (row & transport).inputs, row.model_id
+
+
 @pytest.mark.parametrize(("models", "transport"), _TRANSPORTS, ids=_TRANSPORT_IDS)
 def test_a_transport_only_removes(
     models: Mapping[str, ModelCapability],
@@ -214,6 +237,7 @@ def test_a_transport_only_removes(
 ) -> None:
     for row in models.values():
         met = row & transport
+        assert met.inputs <= row.inputs
         assert met.thinking.effort <= row.thinking.effort
         assert met.thinking.budget <= row.thinking.budget
         assert met.thinking.output <= row.thinking.output

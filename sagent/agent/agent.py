@@ -2413,6 +2413,10 @@ class Agent:
         """Estimate the token size of the request about to be sent."""
         anchor = self._last_measured_history
         budget = self.tool_results.message_budget_tokens
+        # ``inputs`` matches the send below. An attachment this model cannot
+        # receive is withheld before it ships, so an estimate that counted it
+        # would overstate the request and fire a compaction with nothing to shed.
+        inputs = model.capability.inputs
         if self._last_input_tokens > 0 and tuple(history[: len(anchor)]) == anchor:
             since = history[len(anchor) :]
             if not since:
@@ -2421,6 +2425,7 @@ class Agent:
                 materialize_request(
                     ModelRequest(messages=list(since)),
                     tool_result_budget_tokens=budget,
+                    inputs=inputs,
                 ),
             )
         # Estimated against ``live_tools()`` (``BackgroundAwareTool`` wrappers
@@ -2434,6 +2439,7 @@ class Agent:
                     tools=self.live_tools(),
                 ),
                 tool_result_budget_tokens=budget,
+                inputs=inputs,
             ),
         )
 
@@ -2446,7 +2452,8 @@ class Agent:
     # tool's rendered-byte cap.
     #
     # Measured over the materialized prefix so attachments on tool results that
-    # ``materialize_request`` drops are not counted, and via
+    # ``materialize_request`` drops are not counted -- including the ones the
+    # model's own modalities withhold, hence the ``inputs`` -- and via
     # :func:`_wire_attachment_bytes` so the estimate matches the base64, post-resize
     # payload that actually ships.
     def _compactable_wire_bytes(
@@ -2462,6 +2469,7 @@ class Agent:
         materialized = materialize_request(
             ModelRequest(messages=list(prefix)),
             tool_result_budget_tokens=self.tool_results.message_budget_tokens,
+            inputs=model.capability.inputs,
         )
         return _wire_attachment_bytes(
             materialized.messages,
@@ -3092,9 +3100,13 @@ class _AgentModel:
         # still hits the reactive 413.
         max_request_bytes = self._inner.limits.max_request_bytes
         if max_request_bytes > 0:
+            # Same ``inputs`` as the send below: an attachment the model cannot
+            # take is not a wire byte, so a guard that counted it would reject
+            # a request the send would have shrunk to fit.
             guard_messages = materialize_request(
                 ModelRequest(messages=list(history)),
                 tool_result_budget_tokens=self._agent.tool_results.message_budget_tokens,
+                inputs=self._inner.capability.inputs,
             ).messages
             wire_bytes = _wire_request_bytes(
                 guard_messages,
@@ -3127,6 +3139,10 @@ class _AgentModel:
         observed_model = ObservedModel(self._inner, self._agent.record_response)
 
         for attempt in range(MAX_OVERFLOW_RECOVERY + 1):
+            # ``inputs`` withholds attachments this model/transport pair cannot
+            # receive and leaves a notice in their place, so a PDF pasted into a
+            # text-only model is answered with "I cannot read that" rather than
+            # silently shipping nothing.
             request = materialize_request(
                 ModelRequest(
                     messages=list(history),
@@ -3135,6 +3151,7 @@ class _AgentModel:
                     max_response_tokens=self._agent.max_response_tokens,
                 ),
                 tool_result_budget_tokens=self._agent.tool_results.message_budget_tokens,
+                inputs=self._inner.capability.inputs,
             )
             # Hand the one-shot resume wait to THIS attempt only, then clear it
             # unconditionally -- before the send can raise. ``send_with_retry``
@@ -3616,6 +3633,7 @@ class _AgentCompactor:
                         tools=cached_tools,
                     ),
                     tool_result_budget_tokens=self._agent.tool_results.message_budget_tokens,
+                    inputs=self._agent.model.capability.inputs,
                 ),
             )
         except Exception as exc:  # noqa: BLE001 -- The estimator invokes provider classification during recovery, so failures route to warning or exception handling.
@@ -3679,6 +3697,7 @@ class _AgentCompactor:
                         tool_result_budget_tokens=(
                             self._agent.tool_results.message_budget_tokens
                         ),
+                        inputs=self._agent.model.capability.inputs,
                     ),
                 )
             except Exception as exc:  # noqa: BLE001 -- The estimator invokes provider classification during recovery.
@@ -3740,6 +3759,7 @@ class _AgentCompactor:
                         tools=cached_tools,
                     ),
                     tool_result_budget_tokens=self._agent.tool_results.message_budget_tokens,
+                    inputs=self._agent.model.capability.inputs,
                 ),
             )
             would_retrigger = self._inner.should_compact(

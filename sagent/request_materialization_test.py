@@ -16,6 +16,7 @@ from sagent.types.model import ModelRequest
 from sagent.types.runtime import (
     AgentSendMessage,
     AssistantMessage,
+    BytesMessage,
     ToolCall,
     ToolResult,
     UserMessage,
@@ -656,6 +657,95 @@ def test_user_with_agent_send_merge_does_not_re_attribute_user_text() -> None:
         assert merged.source != "alice" or "user said" not in merged.text
     assert "user said" in merged.text
     assert "alice said" in merged.text
+
+
+def test_a_withheld_pdf_leaves_a_notice_in_the_entry_that_carried_it() -> None:
+    """A text-only model must be told the payload existed and was dropped."""
+    out = materialize_request(
+        ModelRequest(
+            messages=[
+                UserMessage(
+                    text="summarize this",
+                    attachments=(
+                        BytesMessage(data=b"%PDF-1.4", descriptor="application/pdf"),
+                    ),
+                ),
+            ],
+        ),
+        inputs=frozenset({"text"}),
+    )
+    (entry,) = out.messages
+    assert isinstance(entry, UserMessage)
+    assert entry.attachments == ()
+    assert entry.text.startswith("summarize this")
+    assert "application/pdf not accepted by this model" in entry.text
+    assert "supported inputs: text" in entry.text
+
+
+def test_an_accepted_attachment_ships_and_only_the_rest_is_named() -> None:
+    out = materialize_request(
+        ModelRequest(
+            messages=[
+                UserMessage(
+                    text="look",
+                    attachments=(
+                        BytesMessage(data=b"png", descriptor="image/png"),
+                        BytesMessage(data=b"%PDF", descriptor="application/pdf"),
+                    ),
+                ),
+            ],
+        ),
+        inputs=frozenset({"text", "image"}),
+    )
+    (entry,) = out.messages
+    assert isinstance(entry, UserMessage)
+    assert [att.descriptor for att in entry.attachments] == ["image/png"]
+    assert "application/pdf not accepted" in entry.text
+
+
+def test_an_unclassifiable_descriptor_reaches_the_encoder_unfiltered() -> None:
+    """Modality families, not MIME types: the wire decides an exotic type."""
+    attachment = BytesMessage(data=b"x", descriptor="application/octet-stream")
+    out = materialize_request(
+        ModelRequest(messages=[UserMessage(text="hi", attachments=(attachment,))]),
+        inputs=frozenset({"text"}),
+    )
+    (entry,) = out.messages
+    assert isinstance(entry, UserMessage)
+    assert entry.attachments == (attachment,)
+    assert entry.text == "hi"
+
+
+def test_a_withheld_tool_result_attachment_is_noticed_in_its_content() -> None:
+    out = materialize_request(
+        ModelRequest(
+            messages=[
+                ToolResult(
+                    call_id="call_1",
+                    content="read the page",
+                    attachments=(BytesMessage(data=b"png", descriptor="image/png"),),
+                ),
+            ],
+        ),
+        inputs=frozenset({"text"}),
+    )
+    (entry,) = out.messages
+    assert isinstance(entry, ToolResult)
+    assert entry.attachments == ()
+    assert entry.content.startswith("read the page")
+    assert "image/png not accepted by this model" in entry.content
+
+
+def test_materializing_without_inputs_leaves_attachments_alone() -> None:
+    """Measurement callers opt out: an unfiltered request must stay intact."""
+    attachment = BytesMessage(data=b"%PDF", descriptor="application/pdf")
+    out = materialize_request(
+        ModelRequest(messages=[UserMessage(text="hi", attachments=(attachment,))]),
+    )
+    (entry,) = out.messages
+    assert isinstance(entry, UserMessage)
+    assert entry.attachments == (attachment,)
+    assert entry.text == "hi"
 
 
 if __name__ == "__main__":

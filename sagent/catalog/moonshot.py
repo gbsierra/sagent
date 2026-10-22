@@ -58,6 +58,7 @@ def source_models() -> ModelTable:
     )
     code = ModelCapability(
         model_id="kimi-k2.7-code",
+        inputs=frozenset({"text", "image", "video"}),
         context=_limits(),
         prices=_prices(_card(request=0.95, response=4.0, cache_read=0.19)),
         thinking=always_thinks,
@@ -65,6 +66,7 @@ def source_models() -> ModelTable:
     rows = (
         ModelCapability(
             model_id="kimi-k3",
+            inputs=frozenset({"text", "image", "video"}),
             # "max_completion_tokens defaults to 131072 and can be set up to
             # 1048576".
             context=_limits(max_tokens=1_048_576, output_tokens=1_048_576),
@@ -85,6 +87,7 @@ def source_models() -> ModelTable:
         ),
         ModelCapability(
             model_id="kimi-k2.6",
+            inputs=frozenset({"text", "image", "video"}),
             context=_limits(),
             prices=_prices(_card(request=0.95, response=4.0, cache_read=0.16)),
             thinking=replace(
@@ -131,6 +134,10 @@ def models() -> ModelTable:
 
 _SOURCES: Final[Mapping[Fact, Source]] = MappingProxyType(
     {
+        "inputs": Source(
+            "https://platform.kimi.ai/docs/guide/kimi-k3-quickstart",
+            date(2026, 10, 3),
+        ),
         "limits": Source("https://platform.kimi.ai/docs/models", date(2026, 10, 3)),
         "prices": Source(
             "https://platform.kimi.ai/docs/pricing/chat",

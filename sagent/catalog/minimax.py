@@ -71,6 +71,7 @@ def source_models() -> ModelTable:
     )
     m2 = ModelCapability(
         model_id="MiniMax-M2.7",
+        inputs=frozenset({"text"}),
         context=_limits(max_tokens=204_800, output_tokens=204_800),
         prices=_prices(_m2_card(request=0.3, response=1.2, cache_read=0.06)),
         thinking=always_thinks,
@@ -81,6 +82,7 @@ def source_models() -> ModelTable:
     rows = (
         ModelCapability(
             model_id="MiniMax-M3",
+            inputs=frozenset({"text", "image", "video"}),
             # Image input: "images can be up to 10 MB, and the request body
             # can be up to 64 MB".
             context=_limits(
@@ -157,6 +159,10 @@ _DOCS: Final = "https://platform.minimax.io/docs"
 
 _SOURCES: Final[Mapping[Fact, Source]] = MappingProxyType(
     {
+        "inputs": Source(
+            f"{_DOCS}/guides/models-intro",
+            date(2026, 10, 18),
+        ),
         # The ``max_completion_tokens`` ceilings (524,288 for M3, 204,800 for
         # the rest); models-intro's "Maximum Output: 128k" for M2 disagrees.
         "limits": Source(

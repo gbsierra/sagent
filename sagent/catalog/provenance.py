@@ -16,7 +16,7 @@ from typing import Final, Literal, cast, get_args
 __all__ = ["FACTS", "Fact", "Source"]
 
 
-type Fact = Literal["limits", "prices", "thinking"]
+type Fact = Literal["inputs", "limits", "prices", "thinking"]
 """A group of row fields that one vendor page states together."""
 
 FACTS: Final[tuple[Fact, ...]] = cast(

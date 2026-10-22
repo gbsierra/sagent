@@ -2,10 +2,17 @@
 
 Source: n/a -- self-hosted
 
-A row carries only what the MODEL can do; caching, retry, and auth mode
-are transport facts declared by ``openai.compatible()``. A llama.cpp server
+A row carries only what the MODEL can do; caching, retry, and auth mode are
+transport facts declared by ``openai.compatible()``. A llama.cpp server
 publishes no image pixel or byte ceiling and preprocesses images itself,
 so ``ModelLimits`` carries only the two token windows.
+
+Every row states ``inputs={"text"}``. The rows name specific text checkpoints,
+and a llama.cpp server only accepts image bytes when it was loaded with a
+matching ``--mmproj`` projector, which no catalog row can observe. Declaring
+``text`` keeps a pasted screenshot from being posted as opaque base64 that the
+server would decode as prompt text; the request boundary replaces it with a
+notice naming what was dropped.
 """
 
 from __future__ import annotations
@@ -41,6 +48,7 @@ def models() -> ModelTable:
     # A local server bills nothing, but a missing price row would raise.
     default = ModelCapability(
         model_id="qwen3.6-27b-12gb",
+        inputs=frozenset({"text"}),
         context=_limits(),
         prices=PriceCatalog(
             {
