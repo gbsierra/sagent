@@ -1,18 +1,26 @@
-"""Subscription authentication, request restrictions, and credential I/O tests."""
+"""Subscription authentication (SIWC), request restrictions, credential I/O tests."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import parse_qs, urlparse
 
 import base64
 import contextlib
 import io
 import json
+import re
 import threading
 import time
 
+from cryptography.hazmat.primitives.asymmetric import rsa
+from jwt.algorithms import (
+    RSAAlgorithm,  # ty: ignore[possibly-missing-import] -- pyjwt hides RSAAlgorithm behind its optional cryptography extra.
+)
+
 import httpx2
+import jwt
 import openai
 import pytest
 
@@ -24,10 +32,9 @@ from sagent.providers.lib.errors import (
     find_response_not_read,
 )
 from sagent.providers.lib.oauth import credentials_path
-from sagent.providers.openai import sub
+from sagent.providers.openai import siwc, sub
 from sagent.providers.openai.sub import (
     OpenAISubscription,
-    _jwt_claim,
     _jwt_exp,
     _jwt_payload,
 )
@@ -54,13 +61,12 @@ if TYPE_CHECKING:
 
 
 @pytest.fixture(autouse=True)
-def isolate_codex_home(
+def isolate_data_home(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> None:
-    """Keep the default ``~/.codex/auth.json`` off the operator's real file."""
-    monkeypatch.delenv("CODEX_HOME", raising=False)
-    monkeypatch.setenv("HOME", str(tmp_path_factory.mktemp("home")))
+    """Keep sagent's own credential store inside a temp XDG data home."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path_factory.mktemp("xdg")))
 
 
 def test_subscription_context_clamps_request_tokens() -> None:
@@ -93,70 +99,151 @@ def test_subscription_context_inherits_size_caps_from_parent() -> None:
     assert clamped.max_request_bytes == api.max_request_bytes
 
 
-# 1×1 transparent PNG -- smallest valid PNG ``image_lib.resize`` will accept.
+# 1x1 transparent PNG -- smallest valid PNG ``image_lib.resize`` will accept.
 
 
 def _make_jwt(payload: dict[str, object]) -> str:
+    """Build an unsigned JWT; the provider only reads expiry claims leniently."""
     header_b = base64.urlsafe_b64encode(b'{"alg":"none"}').rstrip(b"=")
     body_b = base64.urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b"=")
     return f"{header_b.decode()}.{body_b.decode()}.sig"
 
 
-def test_login_manual_advertises_localhost_redirect_uri(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Manual login must send the ``localhost`` redirect_uri Hydra allow-lists.
+# -- SIWC ID-token fixtures -------------------------------------------------
 
-    ``127.0.0.1`` is rejected with ``authorize_hydra_invalid_request``.
-    """
-    monkeypatch.setattr(sub, "DEFAULT_CREDENTIALS_PATH", tmp_path / "auth.json")
-    access = _make_jwt(
-        {
-            "exp": time.time() + 3600,
-            "https://api.openai.com/auth": {
-                "chatgpt_account_id": "acct-123",
-                "chatgpt_plan_type": "pro",
-            },
-        },
-    )
-    token_resp = MagicMock()
-    token_resp.status_code = 200
-    token_resp.json.return_value = {
-        "access_token": access,
-        "refresh_token": "refresh-xyz",
-        "expires_in": 3600,
+_RSA_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+
+def _jwks() -> dict[str, object]:
+    key = RSAAlgorithm.to_jwk(_RSA_KEY.public_key(), as_dict=True)
+    key["kid"] = "test-key"
+    key["alg"] = "RS256"
+    key["use"] = "sig"
+    return {"keys": [key]}
+
+
+def _id_claims(**overrides: object) -> dict[str, object]:
+    now = int(time.time())
+    claims: dict[str, object] = {
+        "iss": siwc.ISSUER,
+        "aud": _CLIENT_ID,
+        "sub": "user-test",
+        "exp": now + 3600,
+        "iat": now,
+        "email": "agent@example.com",
+        "nonce": "nonce-1",
     }
-    captured: dict[str, object] = {}
+    claims.update(overrides)
+    return claims
 
-    def _post(url: str, *, data: dict[str, str], **_kw: object) -> MagicMock:
-        del url
-        captured["redirect_uri"] = data["redirect_uri"]
-        return token_resp
 
-    http_client = MagicMock()
-    http_context = cast(MagicMock, http_client.__enter__.return_value)
-    http_context.post.side_effect = _post
+def _id_token(claims: dict[str, object]) -> str:
+    return jwt.encode(claims, _RSA_KEY, algorithm="RS256", headers={"kid": "test-key"})
 
+
+# -- Login ------------------------------------------------------------------
+
+
+def _printed_authorize_params(out: io.StringIO) -> dict[str, list[str]]:
+    """Return the query params of the authorize URL in the login output.
+
+    The login preamble also prints a Terms of Use URL, so a bare
+    ``https://`` search is not enough -- match the SIWC authorize URL.
+    """
+    for match in re.finditer(r"https://\S+", out.getvalue()):
+        url = match.group(0)
+        if url.startswith(siwc.AUTHORIZE_URL):
+            return parse_qs(urlparse(url).query)
+    msg = "no SIWC authorize URL in the login output"
+    raise AssertionError(msg)
+
+
+def _manual_login_input(out: io.StringIO) -> str:
+    """Answer the paste prompt with a callback matching the printed URL."""
+    params = _printed_authorize_params(out)
+    return (
+        f"http://127.0.0.1:{siwc.MANUAL_CALLBACK_PORT}{siwc.REDIRECT_PATH}"
+        f"?code=the-code&state={params['state'][0]}&client_id={_CLIENT_ID}"
+    )
+
+
+def _login_http(out: io.StringIO, *, scope: str) -> httpx2.Client:
+    """Mock token endpoint whose ID token matches the printed login nonce."""
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        if request.method == "GET":
+            return httpx2.Response(200, json=_jwks())
+        nonce = _printed_authorize_params(out)["nonce"][0]
+        return httpx2.Response(
+            200,
+            json={
+                "access_token": _make_jwt({"exp": time.time() + 3600}),
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "refresh_token": _FRESH_REFRESH,
+                "id_token": _id_token(_id_claims(nonce=nonce)),
+                "scope": scope,
+            },
+        )
+
+    return httpx2.Client(transport=httpx2.MockTransport(handler))
+
+
+def test_login_manual_first_sign_in_saves_the_siwc_record() -> None:
+    """Manual first sign-in: dynamic registration, verified ID token, record."""
     out = io.StringIO()
+    http = _login_http(out, scope=siwc.SCOPES)
+
+    def fake_input(_prompt: object = "") -> str:
+        return _manual_login_input(out)
+
     with (
         patch(
             "sagent.providers.openai.sub.httpx2.Client",
-            return_value=http_client,
+            return_value=http,
         ),
-        patch.object(
-            sub,
-            "parse_manual_auth_code",
-            return_value="the-code",
+        patch("builtins.input", fake_input),
+    ):
+        record = OpenAISubscription.login(out, manual=True)
+
+    printed = out.getvalue()
+    params = _printed_authorize_params(out)
+    assert params["redirect_uri"] == [
+        f"http://127.0.0.1:{siwc.MANUAL_CALLBACK_PORT}{siwc.REDIRECT_PATH}",
+    ]
+    assert siwc.DYNAMIC_CLIENT_ID in printed
+    assert "Authenticated as agent@example.com (plan usage enabled)." in printed
+    assert record["client_id"] == _CLIENT_ID
+    assert record.get("subject") == "user-test"
+    on_disk = siwc.load_record(sub._default_credentials_path())
+    assert on_disk.get("refresh_token") == _FRESH_REFRESH
+    assert on_disk["scopes"] == siwc.SCOPES.split()
+
+
+def test_login_without_plan_usage_saves_but_refuses_inference() -> None:
+    """A declined plan-usage grant is retained, then reported (re-consent)."""
+    out = io.StringIO()
+    http = _login_http(out, scope="openid profile email offline_access")
+
+    def fake_input(_prompt: object = "") -> str:
+        return _manual_login_input(out)
+
+    with (
+        patch(
+            "sagent.providers.openai.sub.httpx2.Client",
+            return_value=http,
         ),
-        patch("builtins.input", return_value="the-code#state"),
+        patch("builtins.input", fake_input),
+        pytest.raises(siwc.PlanUsageNotGrantedError, match="plan usage"),
     ):
         OpenAISubscription.login(out, manual=True)
 
-    printed = out.getvalue()
-    assert "localhost" in printed
-    assert "127.0.0.1" not in printed
-    assert captured["redirect_uri"] == "http://localhost:1455/auth/callback"
+    retained = siwc.load_record(sub._default_credentials_path())
+    assert not siwc.plan_usage_enabled(retained)
+    assert retained["client_id"] == _CLIENT_ID
+
+
+# -- JWT helpers (lenient, unverified) --------------------------------------
 
 
 def test_jwt_payload_round_trip() -> None:
@@ -184,20 +271,6 @@ def test_jwt_exp_missing_returns_zero() -> None:
     assert _jwt_exp(token) == 0.0
 
 
-def test_jwt_claim_nested_value() -> None:
-    token = _make_jwt(
-        {"https://api.openai.com/auth": {"chatgpt_account_id": "acc-123"}},
-    )
-    assert _jwt_claim(token, "https://api.openai.com/auth", "chatgpt_account_id") == (
-        "acc-123"
-    )
-
-
-def test_jwt_claim_namespace_missing_returns_empty() -> None:
-    token = _make_jwt({})
-    assert _jwt_claim(token, "ns", "key") == ""
-
-
 def _jwt_with_raw_payload(payload: object) -> str:
     body = base64.urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b"=")
     return f"h.{body.decode()}.s"
@@ -208,104 +281,117 @@ def test_jwt_helpers_tolerate_a_non_object_payload(payload: object) -> None:
     token = _jwt_with_raw_payload(payload)
     assert _jwt_payload(token) == {}
     assert _jwt_exp(token) == 0.0
-    assert _jwt_claim(token, "ns", "key") == ""
 
 
-@pytest.mark.parametrize(
-    "payload",
-    [{"exp": "soon"}, {"exp": [1]}, {"ns": "flat"}, {"ns": {"key": 7}}],
-)
+@pytest.mark.parametrize("payload", [{"exp": "soon"}, {"exp": [1]}])
 def test_jwt_helpers_tolerate_mistyped_claims(payload: dict[str, object]) -> None:
-    token = _make_jwt(payload)
-    assert _jwt_exp(token) == 0.0
-    assert _jwt_claim(token, "ns", "key") == ""
+    assert _jwt_exp(_make_jwt(payload)) == 0.0
 
 
 def test_load_with_a_non_object_jwt_payload_keeps_the_value_error_contract(
     tmp_path: Path,
 ) -> None:
-    """``load`` documents ``ValueError``/``FileNotFoundError`` only."""
+    """A junk access-token payload reads as "no expiry", never a crash."""
     target = tmp_path / "auth.json"
-    _write_creds_file(
-        target,
-        {
-            "tokens": {
-                "access_token": _jwt_with_raw_payload([]),
-                "refresh_token": _FAKE_REFRESH,
-                "account_id": _FAKE_ACCOUNT,
-            },
-        },
-    )
-    assert OpenAISubscription.load(path=target)["expires_at"] == 0.0
+    record = _make_record(_jwt_with_raw_payload([]))
+    # With neither a readable ``exp`` nor a ``saved_at`` + ``expires_in``
+    # fallback, the record's expiry is "unknown" (0.0 -> refresh on use).
+    record.pop("saved_at")
+    record.pop("expires_in")
+    OpenAISubscription.save(record, path=target)
+    loaded = OpenAISubscription.load(path=target)
+    assert sub._record_expiry(loaded) == 0.0
 
 
-def test_default_credentials_path_is_the_vendor_fixed_home_path(
+def test_default_credentials_path_lives_under_the_data_dir(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Codex reads ``~/.codex``; an XDG config root must not relocate it."""
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg" / "cfg"))
-    assert sub._default_credentials_path() == tmp_path / "home" / ".codex" / "auth.json"
-
-
-def _write_creds_file(path: Path, payload: dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload), encoding="utf-8")
-
-
-def _make_creds(
-    access: str,
-    *,
-    expires_at: float = 0.0,
-) -> OpenAISubscription.Credentials:
-    return OpenAISubscription.Credentials(
-        access_token=access,
-        refresh_token=_FAKE_REFRESH,
-        account_id=_FAKE_ACCOUNT,
-        expires_at=expires_at,
+    """SIWC records live in sagent's own store, not a vendor's directory."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    assert (
+        sub._default_credentials_path()
+        == tmp_path / "xdg" / "rekursiv-ai" / "sagent" / "auth" / "openai.json"
     )
+
+
+# -- Credential records ------------------------------------------------------
+
+# Test-only token values; not credentials. Held in module variables so the
+# bandit-style S105/S106 rules don't fire on inline literals at constructor
+# call sites.
+_FAKE_ACCESS = ""
+_FAKE_REFRESH = "rt-test"
+_FRESH_REFRESH = "rt-fresh"
+_STALE_REFRESH = "rt-stale"
+_CLIENT_ID = "oaiapp_test"
+_HOST_ID = "urn:uuid:test-host-id"
+
+
+def _scopes() -> list[str]:
+    """Return the protocol scope string as an ordinary string list."""
+    return [str(scope) for scope in siwc.SCOPES.split()]
+
+
+def _make_record(
+    access: str,
+    **overrides: object,
+) -> siwc.SIWCCredentials:
+    record: siwc.SIWCCredentials = {
+        "issuer": siwc.ISSUER,
+        "client_id": _CLIENT_ID,
+        "ext_agent_host_id": _HOST_ID,
+        "scopes": _scopes(),
+        "subject": "user-test",
+        "access_token": access,
+        "refresh_token": _FAKE_REFRESH,
+        "expires_in": 3600.0,
+        "saved_at": siwc.record_saved_at(),
+    }
+    record.update(cast(Any, overrides))
+    return record
+
+
+def _make_tombstone() -> siwc.SIWCCredentials:
+    """Build the tokenless record used by sign-out tests."""
+    return {
+        "issuer": siwc.ISSUER,
+        "client_id": _CLIENT_ID,
+        "ext_agent_host_id": _HOST_ID,
+        "scopes": _scopes(),
+        "signed_out": True,
+    }
 
 
 def test_save_and_load_round_trip(tmp_path: Path) -> None:
-    access = _make_jwt({"exp": 1700.0})
+    access = _make_jwt({"exp": time.time() + 3600})
     target = tmp_path / "auth.json"
-    OpenAISubscription.save(_make_creds(access, expires_at=1700.0), path=target)
+    OpenAISubscription.save(
+        _make_record(access, email="agent@example.com"),
+        path=target,
+    )
     loaded = OpenAISubscription.load(path=target)
-    assert loaded["access_token"] == access
-    assert loaded["refresh_token"] == _FAKE_REFRESH
-    assert loaded["account_id"] == _FAKE_ACCOUNT
-    # ``expires_at`` is recomputed from the JWT exp claim on load.
-    assert loaded["expires_at"] == 1700.0
+    assert loaded.get("access_token") == access
+    assert loaded.get("refresh_token") == _FAKE_REFRESH
+    assert loaded["client_id"] == _CLIENT_ID
+    assert loaded["scopes"] == siwc.SCOPES.split()
+    assert loaded.get("email") == "agent@example.com"
 
 
-def test_default_credential_io_honors_codex_home(
+def test_default_credential_io_honors_xdg_data_home(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Sagent follows the same relocated auth file as the Codex CLI."""
-    codex_home = tmp_path / "custom-codex-home"
-    monkeypatch.setenv("CODEX_HOME", str(codex_home))
-    access = _make_jwt({"exp": 1700.0})
+    """The unnamed slot lives under ``XDG_DATA_HOME``."""
+    xdg = tmp_path / "custom-xdg"
+    monkeypatch.setenv("XDG_DATA_HOME", str(xdg))
+    access = _make_jwt({"exp": time.time() + 3600})
 
-    OpenAISubscription.save(_make_creds(access, expires_at=1700.0))
+    OpenAISubscription.save(_make_record(access))
     loaded = OpenAISubscription.load()
 
-    assert (codex_home / "auth.json").exists()
-    assert loaded["access_token"] == access
-
-
-def test_save_preserves_existing_fields(tmp_path: Path) -> None:
-    target = tmp_path / "auth.json"
-    _write_creds_file(target, {"keep_me": True, "tokens": {"old": "x"}})
-    creds = _make_creds(_make_jwt({"exp": 0.0}))
-    OpenAISubscription.save(creds, path=target)
-    on_disk = json.loads(target.read_text(encoding="utf-8"))
-    assert on_disk["keep_me"] is True
-    assert on_disk["auth_mode"] == "chatgpt"
-    assert on_disk["tokens"]["access_token"] == creds["access_token"]
-    # Old fields under ``tokens`` survive.
-    assert on_disk["tokens"]["old"] == "x"
+    assert (xdg / "rekursiv-ai" / "sagent" / "auth" / "openai.json").exists()
+    assert loaded.get("access_token") == access
 
 
 def test_load_missing_file_raises(tmp_path: Path) -> None:
@@ -313,20 +399,10 @@ def test_load_missing_file_raises(tmp_path: Path) -> None:
         OpenAISubscription.load(path=tmp_path / "nope.json")
 
 
-def test_load_api_key_mode_file_raises_actionable_error(tmp_path: Path) -> None:
+def test_load_record_without_client_id_raises_value_error(tmp_path: Path) -> None:
     target = tmp_path / "auth.json"
-    _write_creds_file(
-        target,
-        {"auth_mode": "apikey", "OPENAI_API_KEY": "test-api-key"},
-    )
-    with pytest.raises(ValueError, match=r"API-key.*OpenAI.*env"):
-        OpenAISubscription.load(path=target)
-
-
-def test_load_incomplete_oauth_file_raises_value_error(tmp_path: Path) -> None:
-    target = tmp_path / "auth.json"
-    _write_creds_file(target, {"auth_mode": "chatgpt", "tokens": {}})
-    with pytest.raises(ValueError, match="missing required OAuth fields"):
+    target.write_text(json.dumps({"scopes": ["openid"]}), encoding="utf-8")
+    with pytest.raises(ValueError, match="client_id"):
         OpenAISubscription.load(path=target)
 
 
@@ -341,34 +417,136 @@ def test_load_non_object_json_raises_value_error(
         OpenAISubscription.load(path=target)
 
 
-def test_save_writes_id_token_when_present(tmp_path: Path) -> None:
+def test_save_and_load_preserve_the_id_token(tmp_path: Path) -> None:
     target = tmp_path / "auth.json"
-    creds = _make_creds(_make_jwt({"exp": 0.0}))
-    sentinel = "fake-jwt-marker"
-    creds["id_token"] = sentinel
-    OpenAISubscription.save(creds, path=target)
-    on_disk = json.loads(target.read_text(encoding="utf-8"))
-    assert on_disk["tokens"]["id_token"] == sentinel
+    record = _make_record(_make_jwt({"exp": time.time() + 3600}))
+    record["id_token"] = _id_token(_id_claims())
+    OpenAISubscription.save(record, path=target)
+    assert OpenAISubscription.load(path=target).get("id_token") == record.get(
+        "id_token"
+    )
 
 
-# Test-only token values; not credentials. Held in module variables so the
-# bandit-style S105/S106 rules don't fire on inline literals at constructor
-# call sites.
-_FAKE_ACCESS = ""
-_FAKE_REFRESH = "rt-test"
-_FAKE_ACCOUNT = "acc"
-_FRESH_REFRESH = "rt-fresh"
-_STALE_REFRESH = "rt-stale"
-_DISK_ID_JWT = "id-disk"
+def test_load_signed_out_record_raises(tmp_path: Path) -> None:
+    target = tmp_path / "auth.json"
+    siwc.save_record(_make_tombstone(), target)
+    with pytest.raises(ValueError, match="signed-out"):
+        OpenAISubscription.load(path=target)
+
+
+class TestFromCredentials:
+    def test_missing_record_raises_file_not_found(self) -> None:
+        with pytest.raises(FileNotFoundError):
+            OpenAISubscription.from_credentials()
+
+    def test_signed_out_record_is_rejected(self) -> None:
+        siwc.save_record(_make_tombstone(), sub._default_credentials_path())
+        with pytest.raises(ValueError, match="signed-out"):
+            OpenAISubscription.from_credentials()
+
+    def test_a_record_without_plan_usage_is_rejected(self) -> None:
+        access = _make_jwt({"exp": time.time() + 3600})
+        OpenAISubscription.save(
+            _make_record(
+                access,
+                scopes=["openid", "profile", "email", "offline_access"],
+            ),
+        )
+        with pytest.raises(siwc.PlanUsageNotGrantedError, match="plan usage"):
+            OpenAISubscription.from_credentials()
+
+    def test_a_complete_record_builds_a_ready_provider(self) -> None:
+        access = _make_jwt({"exp": time.time() + 3600})
+        OpenAISubscription.save(_make_record(access, email="agent@example.com"))
+        provider = OpenAISubscription.from_credentials()
+        assert provider._client_id == _CLIENT_ID
+        assert provider._subject == "user-test"
+        assert provider._email == "agent@example.com"
+        assert not provider.expired
+
+
+class TestLogout:
+    @pytest.mark.anyio
+    async def test_logout_revokes_and_leaves_a_tombstone(self) -> None:
+        OpenAISubscription.save(_make_record(_make_jwt({"exp": time.time() + 3600})))
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            if request.method == "GET":
+                return httpx2.Response(
+                    200,
+                    json={
+                        "issuer": siwc.ISSUER,
+                        "revocation_endpoint": f"{siwc.ISSUER}/oauth/revoke",
+                    },
+                )
+            return httpx2.Response(200)
+
+        http = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+        out = io.StringIO()
+        with patch(
+            "sagent.providers.openai.sub.httpx2.AsyncClient",
+            return_value=http,
+        ):
+            await OpenAISubscription.logout(output=out)
+
+        tombstone = siwc.load_record(sub._default_credentials_path())
+        assert siwc.is_signed_out(tombstone)
+        assert tombstone["client_id"] == _CLIENT_ID
+        assert "access_token" not in tombstone
+        assert "Signed out" in out.getvalue()
+
+    @pytest.mark.anyio
+    async def test_logout_without_a_record_reports_nothing_to_do(self) -> None:
+        out = io.StringIO()
+        await OpenAISubscription.logout(output=out)
+        assert "No saved sign-in" in out.getvalue()
+
+    @pytest.mark.anyio
+    async def test_an_unconfirmed_revocation_still_clears_local_tokens(
+        self,
+    ) -> None:
+        OpenAISubscription.save(_make_record(_make_jwt({"exp": time.time() + 3600})))
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            if request.method == "GET":
+                return httpx2.Response(
+                    200,
+                    json={
+                        "issuer": siwc.ISSUER,
+                        "revocation_endpoint": f"{siwc.ISSUER}/oauth/revoke",
+                    },
+                )
+            return httpx2.Response(400, text="bad request")
+
+        http = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+        out = io.StringIO()
+        with patch(
+            "sagent.providers.openai.sub.httpx2.AsyncClient",
+            return_value=http,
+        ):
+            await OpenAISubscription.logout(output=out)
+
+        assert "Warning" in out.getvalue()
+        assert siwc.is_signed_out(siwc.load_record(sub._default_credentials_path()))
+
+
+# -- Provider fixtures -------------------------------------------------------
 
 
 def _make_provider(*, expires_at: float = 9999.0) -> OpenAISubscription:
     return OpenAISubscription(
         access_token=_FAKE_ACCESS or _make_jwt({"exp": expires_at}),
         refresh_token=_FAKE_REFRESH,
-        account_id=_FAKE_ACCOUNT,
+        client_id=_CLIENT_ID,
         expires_at=expires_at,
+        scopes=_scopes(),
+        subject="user-test",
     )
+
+
+def _patch_cred_path(path: Path) -> Any:  # noqa: ANN401 -- unittest.mock patchers are dynamically typed.
+    """Route the unnamed credential slot at ``path``."""
+    return patch.object(sub, "_default_credentials_path", lambda: path)
 
 
 def test_subscription_from_key_returns_plain_openai() -> None:
@@ -698,24 +876,16 @@ class TestHandleAuthError:
         cred_file = tmp_path / "auth.json"
         fresh_access = _make_jwt({"exp": time.time() + 3600})
         OpenAISubscription.save(
-            OpenAISubscription.Credentials(
-                access_token=fresh_access,
-                refresh_token=_FRESH_REFRESH,
-                account_id=_FAKE_ACCOUNT,
-                expires_at=time.time() + 3600,
-            ),
+            _make_record(fresh_access, refresh_token=_FRESH_REFRESH),
             path=cred_file,
         )
         provider = OpenAISubscription(
             access_token=_make_jwt({"exp": 0.0}),
             refresh_token=_STALE_REFRESH,
-            account_id=_FAKE_ACCOUNT,
+            client_id=_CLIENT_ID,
             expires_at=0.0,
         )
-        with patch(
-            "sagent.providers.openai.sub.DEFAULT_CREDENTIALS_PATH",
-            cred_file,
-        ):
+        with _patch_cred_path(cred_file):
             await provider.handle_auth_error()
         assert provider._access_token == fresh_access
         assert provider._refresh_token == _FRESH_REFRESH
@@ -736,18 +906,13 @@ class TestHandleAuthError:
         cred_file = tmp_path / "auth.json"
         expired_disk = _make_jwt({"exp": time.time() - 50})
         OpenAISubscription.save(
-            OpenAISubscription.Credentials(
-                access_token=expired_disk,
-                refresh_token=_FRESH_REFRESH,
-                account_id=_FAKE_ACCOUNT,
-                expires_at=time.time() - 50,
-            ),
+            _make_record(expired_disk, refresh_token=_FRESH_REFRESH),
             path=cred_file,
         )
         provider = OpenAISubscription(
             access_token=_make_jwt({"exp": 0.0}),
             refresh_token=_STALE_REFRESH,
-            account_id=_FAKE_ACCOUNT,
+            client_id=_CLIENT_ID,
             expires_at=time.time() - 100,
         )
         refreshed: list[bool] = []
@@ -759,10 +924,7 @@ class TestHandleAuthError:
 
         with (
             patch.object(provider, "_refresh", _fake_refresh),
-            patch(
-                "sagent.providers.openai.sub.DEFAULT_CREDENTIALS_PATH",
-                cred_file,
-            ),
+            _patch_cred_path(cred_file),
         ):
             await provider.handle_auth_error()
 
@@ -787,18 +949,13 @@ class TestHandleAuthError:
         # `exp` far in the future means ``self.expired`` is False, yet the server 401'd.
         clock_valid = _make_jwt({"exp": time.time() + 3600})
         OpenAISubscription.save(
-            OpenAISubscription.Credentials(
-                access_token=clock_valid,
-                refresh_token=_STALE_REFRESH,
-                account_id=_FAKE_ACCOUNT,
-                expires_at=time.time() + 3600,
-            ),
+            _make_record(clock_valid),
             path=cred_file,
         )
         provider = OpenAISubscription(
             access_token=clock_valid,  # SAME as disk.
             refresh_token=_STALE_REFRESH,
-            account_id=_FAKE_ACCOUNT,
+            client_id=_CLIENT_ID,
             expires_at=time.time() + 3600,
         )
         refreshed: list[bool] = []
@@ -809,10 +966,7 @@ class TestHandleAuthError:
 
         with (
             patch.object(provider, "_refresh", _fake_refresh),
-            patch(
-                "sagent.providers.openai.sub.DEFAULT_CREDENTIALS_PATH",
-                cred_file,
-            ),
+            _patch_cred_path(cred_file),
         ):
             await provider.handle_auth_error()
 
@@ -826,43 +980,23 @@ class TestHandleAuthError:
         in_memory_access = _make_jwt({"exp": 0.0})
         cred_file = tmp_path / "auth.json"
         OpenAISubscription.save(
-            OpenAISubscription.Credentials(
-                access_token=in_memory_access,
-                refresh_token=_STALE_REFRESH,
-                account_id=_FAKE_ACCOUNT,
-                expires_at=0.0,
-            ),
+            _make_record(in_memory_access),
             path=cred_file,
         )
         provider = OpenAISubscription(
             access_token=in_memory_access,
             refresh_token=_STALE_REFRESH,
-            account_id=_FAKE_ACCOUNT,
+            client_id=_CLIENT_ID,
             expires_at=0.0,
         )
         refreshed_access = _make_jwt({"exp": time.time() + 3600})
-        mock_resp = MagicMock()
-        mock_resp.json = MagicMock(
-            return_value={
-                "access_token": refreshed_access,
-                "refresh_token": _FRESH_REFRESH,
-                "expires_in": 3600,
-            },
-        )
-        mock_resp.status_code = 200
-        mock_http = AsyncMock()
-        mock_http.post = AsyncMock(return_value=mock_resp)
-        mock_http.__aenter__ = AsyncMock(return_value=mock_http)
-        mock_http.__aexit__ = AsyncMock(return_value=False)
+        http = _token_endpoint(refreshed_access)
         with (
             patch(
                 "sagent.providers.openai.sub.httpx2.AsyncClient",
-                return_value=mock_http,
+                return_value=http,
             ),
-            patch(
-                "sagent.providers.openai.sub.DEFAULT_CREDENTIALS_PATH",
-                cred_file,
-            ),
+            _patch_cred_path(cred_file),
         ):
             await provider.handle_auth_error()
         assert provider._access_token == refreshed_access
@@ -874,32 +1008,17 @@ class TestHandleAuthError:
         provider = OpenAISubscription(
             access_token=_make_jwt({"exp": 0.0}),
             refresh_token=_STALE_REFRESH,
-            account_id=_FAKE_ACCOUNT,
+            client_id=_CLIENT_ID,
             expires_at=0.0,
         )
         refreshed_access = _make_jwt({"exp": time.time() + 3600})
-        mock_resp = MagicMock()
-        mock_resp.json = MagicMock(
-            return_value={
-                "access_token": refreshed_access,
-                "refresh_token": _FRESH_REFRESH,
-                "expires_in": 3600,
-            },
-        )
-        mock_resp.status_code = 200
-        mock_http = AsyncMock()
-        mock_http.post = AsyncMock(return_value=mock_resp)
-        mock_http.__aenter__ = AsyncMock(return_value=mock_http)
-        mock_http.__aexit__ = AsyncMock(return_value=False)
+        http = _token_endpoint(refreshed_access)
         with (
             patch(
                 "sagent.providers.openai.sub.httpx2.AsyncClient",
-                return_value=mock_http,
+                return_value=http,
             ),
-            patch(
-                "sagent.providers.openai.sub.DEFAULT_CREDENTIALS_PATH",
-                tmp_path / "does_not_exist.json",
-            ),
+            _patch_cred_path(tmp_path / "does_not_exist.json"),
         ):
             await provider.handle_auth_error()
         assert provider._access_token == refreshed_access
@@ -927,18 +1046,13 @@ class TestEnsureValidRace:
         cred_file = tmp_path / "auth.json"
         fresh_access = _make_jwt({"exp": time.time() + 3600})
         OpenAISubscription.save(
-            OpenAISubscription.Credentials(
-                access_token=fresh_access,
-                refresh_token=_FRESH_REFRESH,
-                account_id=_FAKE_ACCOUNT,
-                expires_at=time.time() + 3600,
-            ),
+            _make_record(fresh_access, refresh_token=_FRESH_REFRESH),
             path=cred_file,
         )
         provider = OpenAISubscription(
             access_token=_make_jwt({"exp": 0.0}),
             refresh_token=_STALE_REFRESH,
-            account_id=_FAKE_ACCOUNT,
+            client_id=_CLIENT_ID,
             expires_at=time.time() - 100,
         )
 
@@ -958,10 +1072,7 @@ class TestEnsureValidRace:
                 "sagent.providers.openai.sub.httpx2.AsyncClient",
                 return_value=mock_http,
             ),
-            patch(
-                "sagent.providers.openai.sub.DEFAULT_CREDENTIALS_PATH",
-                cred_file,
-            ),
+            _patch_cred_path(cred_file),
         ):
             token = await provider._ensure_valid()
 
@@ -981,18 +1092,13 @@ class TestEnsureValidRace:
         cred_file = tmp_path / "auth.json"
         expired_disk = _make_jwt({"exp": time.time() - 50})
         OpenAISubscription.save(
-            OpenAISubscription.Credentials(
-                access_token=expired_disk,
-                refresh_token=_FRESH_REFRESH,
-                account_id=_FAKE_ACCOUNT,
-                expires_at=time.time() - 50,
-            ),
+            _make_record(expired_disk, refresh_token=_FRESH_REFRESH),
             path=cred_file,
         )
         provider = OpenAISubscription(
             access_token=_make_jwt({"exp": 0.0}),
             refresh_token=_STALE_REFRESH,
-            account_id=_FAKE_ACCOUNT,
+            client_id=_CLIENT_ID,
             expires_at=time.time() - 100,
         )
         refreshed: list[bool] = []
@@ -1004,10 +1110,7 @@ class TestEnsureValidRace:
 
         with (
             patch.object(provider, "_refresh", _fake_refresh),
-            patch(
-                "sagent.providers.openai.sub.DEFAULT_CREDENTIALS_PATH",
-                cred_file,
-            ),
+            _patch_cred_path(cred_file),
         ):
             token = await provider._ensure_valid()
 
@@ -1027,18 +1130,13 @@ class TestEnsureValidRace:
         cred_file = tmp_path / "auth.json"
         fresh_access = _make_jwt({"exp": time.time() + 3600})
         OpenAISubscription.save(
-            OpenAISubscription.Credentials(
-                access_token=fresh_access,
-                refresh_token=_FRESH_REFRESH,
-                account_id=_FAKE_ACCOUNT,
-                expires_at=time.time() + 3600,
-            ),
+            _make_record(fresh_access, refresh_token=_FRESH_REFRESH),
             path=cred_file,
         )
         provider = OpenAISubscription(
             access_token=_make_jwt({"exp": 0.0}),  # `expired` -> triggers adopt.
             refresh_token=_STALE_REFRESH,
-            account_id=_FAKE_ACCOUNT,
+            client_id=_CLIENT_ID,
             expires_at=0.0,
         )
         closed: list[bool] = []
@@ -1048,10 +1146,7 @@ class TestEnsureValidRace:
             (cast(openai.AsyncOpenAI, stale_sdk), _make_jwt({"exp": 0.0})),
         )
 
-        with patch(
-            "sagent.providers.openai.sub.DEFAULT_CREDENTIALS_PATH",
-            cred_file,
-        ):
+        with _patch_cred_path(cred_file):
             token = await provider._ensure_valid()
 
         assert token == fresh_access
@@ -1066,6 +1161,7 @@ def _token_endpoint(access_token: str, *, expires_in: int = 3600) -> AsyncMock:
     response.json = MagicMock(
         return_value={
             "access_token": access_token,
+            "token_type": "Bearer",
             "refresh_token": _FRESH_REFRESH,
             "expires_in": expires_in,
         },
@@ -1119,51 +1215,53 @@ class TestRefreshLifecycle:
         provider = _make_provider(expires_at=0.0)
         loop_thread = threading.get_ident()
         io_threads: list[int] = []
-        load = OpenAISubscription.load
-        save = OpenAISubscription.save
+        real_load = siwc.load_record
+        real_save = siwc.save_record
 
-        def _load(*, account: str | None) -> OpenAISubscription.Credentials:
+        def _load(path: Path) -> siwc.SIWCCredentials:
             io_threads.append(threading.get_ident())
-            return load(account=account)
+            return real_load(path)
 
-        def _save(
-            creds: OpenAISubscription.Credentials,
-            *,
-            account: str | None,
-        ) -> None:
+        def _save(record: siwc.SIWCCredentials, path: Path) -> None:
             io_threads.append(threading.get_ident())
-            save(creds, account=account)
+            real_save(record, path)
 
         with (
             patch(
                 "sagent.providers.openai.sub.httpx2.AsyncClient",
                 return_value=_token_endpoint(_make_jwt({"exp": time.time() + 3600})),
             ),
-            patch.object(OpenAISubscription, "load", _load),
-            patch.object(OpenAISubscription, "save", _save),
+            patch.object(siwc, "load_record", _load),
+            patch.object(siwc, "save_record", _save),
         ):
             await provider._refresh()
 
-        assert len(io_threads) == 2
+        assert io_threads, "the refresh should have touched the record on disk"
         assert loop_thread not in io_threads
 
     @pytest.mark.anyio
     async def test_refresh_posts_the_grant_and_persists_into_the_account_slot(
         self,
     ) -> None:
-        """The grant is the Codex wire contract; the write keeps disk-only fields."""
+        """The grant is the SIWC wire contract; the write keeps disk-only fields."""
         provider = OpenAISubscription(
             access_token=_make_jwt({"exp": 0.0}),
             refresh_token=_STALE_REFRESH,
-            account_id="acc-memory",
+            client_id=_CLIENT_ID,
             expires_at=0.0,
+            scopes=_scopes(),
+            subject="user-test",
             account="work",
         )
         slot = credentials_path(sub._default_credentials_path(), "work")
-        on_disk = _make_creds(_make_jwt({"exp": 0.0}))
-        on_disk["account_id"] = "acc-disk"
-        on_disk["id_token"] = _DISK_ID_JWT
-        OpenAISubscription.save(on_disk, path=slot)
+        OpenAISubscription.save(
+            _make_record(
+                _make_jwt({"exp": 0.0}),
+                refresh_token=_STALE_REFRESH,
+                email="disk@example.com",
+            ),
+            path=slot,
+        )
         fresh = _make_jwt({"exp": time.time() + 3600})
         http = _token_endpoint(fresh)
         with patch(
@@ -1173,22 +1271,25 @@ class TestRefreshLifecycle:
             await provider._refresh()
 
         http.post.assert_awaited_once_with(
-            sub._TOKEN_URL,
-            json={
+            siwc.TOKEN_URL,
+            data={
                 "grant_type": "refresh_token",
                 "refresh_token": _STALE_REFRESH,
-                "client_id": sub._CLIENT_ID,
+                "client_id": _CLIENT_ID,
+                "resource": siwc.RESOURCE,
             },
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+            },
             timeout=15.0,
         )
-        tokens = json.loads(slot.read_text(encoding="utf-8"))["tokens"]
-        assert tokens == {
-            "access_token": fresh,
-            "refresh_token": _FRESH_REFRESH,
-            "account_id": "acc-disk",
-            "id_token": _DISK_ID_JWT,
-        }
+        record = siwc.load_record(slot)
+        assert record.get("access_token") == fresh
+        assert record.get("refresh_token") == _FRESH_REFRESH
+        # Identity fields only present on disk survive the merge.
+        assert record.get("email") == "disk@example.com"
+        assert record.get("subject") == "user-test"
 
     @pytest.mark.anyio
     @pytest.mark.parametrize("corrupt", [False, True])
@@ -1202,13 +1303,15 @@ class TestRefreshLifecycle:
         provider = OpenAISubscription(
             access_token=_make_jwt({"exp": 0.0}),
             refresh_token=_FAKE_REFRESH,
-            account_id=_FAKE_ACCOUNT,
+            client_id=_CLIENT_ID,
             expires_at=0.0,
+            scopes=_scopes(),
             account=account,
         )
         slot = credentials_path(sub._default_credentials_path(), account)
         if corrupt:
-            _write_creds_file(slot, {"tokens": {}})
+            slot.parent.mkdir(parents=True, exist_ok=True)
+            slot.write_text('{"tokens": {}}', encoding="utf-8")
         fresh = _make_jwt({"exp": time.time() + 3600})
         with (
             patch(
@@ -1219,22 +1322,13 @@ class TestRefreshLifecycle:
         ):
             await provider._refresh()
 
-        assert json.loads(slot.read_text(encoding="utf-8"))["tokens"] == {
-            "access_token": fresh,
-            "refresh_token": _FRESH_REFRESH,
-            "account_id": _FAKE_ACCOUNT,
-        }
+        record = siwc.load_record(slot)
+        assert record.get("access_token") == fresh
+        assert record.get("refresh_token") == _FRESH_REFRESH
         warned = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
-        assert warned == (
-            [
-                (
-                    f"OpenAI creds file at {slot} was unreadable; overwriting with "
-                    "refreshed tokens"
-                ),
-            ]
-            if corrupt
-            else []
-        )
+        assert warned == [
+            f"SIWC record at {slot} was unreadable; rewriting from memory",
+        ]
 
     @pytest.mark.anyio
     async def test_a_token_without_exp_takes_its_expiry_from_expires_in(
@@ -1263,9 +1357,70 @@ class TestRefreshLifecycle:
                 "sagent.providers.openai.sub.httpx2.AsyncClient",
                 return_value=http,
             ),
-            pytest.raises(AuthRefreshError, match="expiry"),
+            pytest.raises(AuthRefreshError, match="invalid token response"),
         ):
             await provider._refresh()
+
+
+class TestPlanUsageErrors:
+    """Documented SIWC plan-usage codes map to polished recovery text."""
+
+    def _failing_sdk(self, error: Exception) -> MagicMock:
+        sdk = MagicMock()
+        sdk.responses = MagicMock()
+        sdk.responses.with_raw_response.create = AsyncMock(side_effect=error)
+        return sdk
+
+    @pytest.mark.anyio
+    async def test_documented_code_maps_to_subscription_usage_error(self) -> None:
+        provider = _make_provider(expires_at=time.time() + 3600)
+        request = httpx2.Request("POST", "https://api.openai.com/v1/responses")
+        response = httpx2.Response(429, request=request)
+        err = openai.RateLimitError(
+            "Rate limited: subscription_sharing_usage_limit_exceeded",
+            response=response,
+            body=None,
+        )
+        with patch.object(
+            provider,
+            "get_sdk",
+            AsyncMock(return_value=self._failing_sdk(err)),
+        ):
+            model = provider.model("gpt-5.5")
+            with pytest.raises(siwc.SubscriptionUsageError, match="usage limit"):
+                await model.stream(ModelRequest(messages=[UserMessage(text="hi")]))
+
+    @pytest.mark.anyio
+    async def test_an_unmapped_status_error_passes_through(self) -> None:
+        provider = _make_provider(expires_at=time.time() + 3600)
+        request = httpx2.Request("POST", "https://api.openai.com/v1/responses")
+        response = httpx2.Response(400, request=request)
+        err = openai.BadRequestError(
+            "Some unrelated 400 failure",
+            response=response,
+            body=None,
+        )
+        with patch.object(
+            provider,
+            "get_sdk",
+            AsyncMock(return_value=self._failing_sdk(err)),
+        ):
+            model = provider.model("gpt-5.5")
+            with pytest.raises(openai.BadRequestError):
+                await model.stream(ModelRequest(messages=[UserMessage(text="hi")]))
+
+
+class TestSdkClient:
+    @pytest.mark.anyio
+    async def test_get_sdk_targets_the_siwc_inference_endpoint(self) -> None:
+        """Bearer-only against the documented endpoint; Codex headers are gone."""
+        provider = _make_provider(expires_at=time.time() + 3600)
+        sdk = await provider.get_sdk()
+        try:
+            assert str(sdk.base_url) == siwc.RESOURCE + "/"
+            assert sdk.api_key == provider._access_token
+        finally:
+            await provider.close_sdk()
 
 
 class TestStreamResponseNotRead:
@@ -1325,7 +1480,7 @@ class TestStreamAuthRetry:
     @pytest.mark.anyio
     async def test_auth_error_triggers_reload_and_retries_once(self) -> None:
         provider = _make_provider(expires_at=time.time() + 3600)
-        request = httpx2.Request("POST", "https://chatgpt.com/backend-api/codex")
+        request = httpx2.Request("POST", "https://api.openai.com/v1/responses")
         response = httpx2.Response(401, request=request)
         auth_err = openai.AuthenticationError(
             "Unauthorized",
@@ -1361,7 +1516,7 @@ class TestStreamAuthRetry:
 class TestRefreshErrors:
     """``_refresh`` must surface auth failures as :class:`AuthRefreshError`.
 
-    Codex's ``auth.openai.com/oauth/token`` endpoint returns 400/401 when
+    SIWC's ``/api/accounts/oauth/token`` endpoint returns 400/401 when
     the refresh token has been rotated, revoked, or expired. The raw
     ``httpx2.HTTPStatusError`` is useless to the user -- it leaks the
     OAuth URL into the terminal. Convert it into a typed, user-facing
@@ -1374,7 +1529,7 @@ class TestRefreshErrors:
     async def test_refresh_4xx_raises_auth_refresh_error(self, status: int) -> None:
         """400/401 on the token endpoint -> :class:`AuthRefreshError`."""
         provider = _make_provider(expires_at=0.0)
-        request = httpx2.Request("POST", "https://auth.openai.com/oauth/token")
+        request = httpx2.Request("POST", siwc.TOKEN_URL)
         response = httpx2.Response(status, request=request, text="invalid_grant")
         mock_http = AsyncMock()
         mock_http.post = AsyncMock(return_value=response)
@@ -1390,7 +1545,7 @@ class TestRefreshErrors:
             await provider._refresh()
 
         assert str(excinfo.value) == (
-            "OpenAI Codex subscription session expired or revoked. Run /login to "
+            "OpenAI subscription session expired or revoked. Run /login to "
             "re-authenticate, or /model to switch providers."
         )
 
@@ -1401,44 +1556,28 @@ class TestRefreshErrors:
     ) -> None:
         """A creds file with valid JSON but missing fields must not crash refresh.
 
-        ``load`` indexes ``raw["tokens"]["refresh_token"]`` etc., raising
-        ``KeyError`` on ``{"tokens": {}}``. ``_refresh`` already holds fresh
-        tokens by then and is meant to overwrite the corrupt file, so the
-        load-recovery must catch ``KeyError`` like the other adopt sites do, not
-        propagate it.
+        ``siwc.load_record`` raises ``ValueError`` on ``{"tokens": {}}``.
+        ``_refresh`` already holds fresh tokens by then and is meant to
+        rewrite the corrupt file from memory, so the load failure is
+        caught and logged, not propagated.
         """
         cred_file = tmp_path / "auth.json"
         cred_file.write_text('{"tokens": {}}', encoding="utf-8")
         provider = _make_provider(expires_at=0.0)
         refreshed_access = _make_jwt({"exp": time.time() + 3600})
-        mock_resp = MagicMock()
-        mock_resp.json = MagicMock(
-            return_value={
-                "access_token": refreshed_access,
-                "refresh_token": _FRESH_REFRESH,
-                "expires_in": 3600,
-            },
-        )
-        mock_resp.status_code = 200
-        mock_http = AsyncMock()
-        mock_http.post = AsyncMock(return_value=mock_resp)
-        mock_http.__aenter__ = AsyncMock(return_value=mock_http)
-        mock_http.__aexit__ = AsyncMock(return_value=False)
+        http = _token_endpoint(refreshed_access)
         with (
             patch(
                 "sagent.providers.openai.sub.httpx2.AsyncClient",
-                return_value=mock_http,
+                return_value=http,
             ),
-            patch(
-                "sagent.providers.openai.sub.DEFAULT_CREDENTIALS_PATH",
-                cred_file,
-            ),
+            _patch_cred_path(cred_file),
         ):
-            await provider._refresh()  # Must not raise KeyError.
+            await provider._refresh()  # Must not raise ValueError.
         assert provider._access_token == refreshed_access
-        # The corrupt file was overwritten with a well-formed token set.
+        # The corrupt file was overwritten with a well-formed record.
         reloaded = OpenAISubscription.load(path=cred_file)
-        assert reloaded["access_token"] == refreshed_access
+        assert reloaded.get("access_token") == refreshed_access
 
     @pytest.mark.anyio
     @pytest.mark.parametrize("status", [500, 502, 503])
@@ -1448,7 +1587,7 @@ class TestRefreshErrors:
     ) -> None:
         """Server-side failures bubble as plain ``httpx2.HTTPStatusError``."""
         provider = _make_provider(expires_at=0.0)
-        request = httpx2.Request("POST", "https://auth.openai.com/oauth/token")
+        request = httpx2.Request("POST", siwc.TOKEN_URL)
         response = httpx2.Response(status, request=request, text="upstream down")
         mock_http = AsyncMock()
         mock_http.post = AsyncMock(return_value=response)

@@ -64,16 +64,18 @@ class Provider(Protocol):
 
 @runtime_checkable
 class AuthReloadable(Protocol):
-    """Provider that can hot-reload OAuth credentials after a re-login.
+    """Provider that can recover its live token state after re-authentication.
 
-    Implementations re-read the credential file from disk and refresh
-    any in-memory token state. The contract is reused by the auth-error
-    retry path (mid-call 401) and by ``Agent.relogin`` (explicit user-
-    triggered re-auth), since both need the same "freshen the running
-    provider's tokens" semantic.
+    Implementations re-read credentials and refresh in-memory token state,
+    or otherwise force the next request to obtain fresh credentials. The
+    contract is reused by the auth-error retry path (mid-call 401) and by
+    ``Agent.relogin`` (explicit user-triggered re-auth), since both need
+    the same "freshen the running provider's tokens" semantic.
 
-    Anthropic-family and Google-family Subscription providers satisfy
-    this Protocol today; API-key providers don't (no tokens to refresh).
+    This is separate from a provider exposing a ``login`` command. CLI
+    wrappers delegate auth to the vendor process and do not need this hook;
+    API-key providers generally do not implement it because they have no
+    token state to refresh.
     """
 
     async def handle_auth_error(self) -> None:

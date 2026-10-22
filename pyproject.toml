@@ -72,6 +72,11 @@ dependencies = [
     "bashlex>=0.18",
     # gitignore-aware tree walks: the `ignore` crate behind ripgrep and fd
     "rignore>=0.8.1",
+    # RS256 ID-token verification for Sign in with ChatGPT (siwc.py); OpenAI's
+    # registration guide requires JWKS signature checks via a maintained JWT
+    # library. Already in the tree transitively (mcp, sigstore); 2.15.1 is the
+    # version the lockfile resolved.
+    "pyjwt[crypto]>=2.15.1",
 ]
 
 [project.optional-dependencies]

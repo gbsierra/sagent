@@ -38,13 +38,13 @@ from sagent.catalog.anthropic import cli, models
 from sagent.catalog.table import ModelCatalog
 from sagent.lib.atomic_file import atomic_write_bytes
 from sagent.lib.codec import MutablePlainTree, PlainTree, ReadError, from_plain, loads
+from sagent.lib.userdirs import data_dir
 from sagent.providers.anthropic.api import Anthropic
 from sagent.providers.lib.cli_respawn import (
     CLISubprocessModel,
     empty_turn_response,
     hash_system,
     merge_user_input,
-    populated_tmpdir,
 )
 from sagent.providers.lib.errors import (
     error_status_code,
@@ -333,8 +333,8 @@ class AnthropicCLI:
     """Provider that drives the user's installed ``claude`` CLI subprocess.
 
     Shares the Anthropic model catalog. The default account uses the CLI's native login
-    (including macOS Keychain storage); named accounts use the file variant
-    produced by ``providers.lib.oauth.credentials_path``.
+    (including macOS Keychain storage); named accounts use a sagent-owned
+    ``CLAUDE_CONFIG_DIR`` with the same credentials-file format as Claude Code.
     Cost figures are computed from the per-turn ``modelUsage`` summary
     the CLI emits on the terminal ``result`` event.
     """
@@ -387,9 +387,11 @@ class AnthropicCLI:
         """Build a provider that uses the local ``claude`` CLI login.
 
         Args:
-          account: Named credential slot. ``None`` reads the legacy
-              native CLI login, including the macOS Keychain. Named accounts
-              use Sagent's legacy file-based credential slots.
+          account: Named credential slot. ``None`` reads the native CLI
+              login, including the macOS Keychain. Named accounts use
+              their own sagent-owned ``CLAUDE_CONFIG_DIR``; a legacy
+              renamed credentials file (``~/.claude/.credentials-<name>.json``)
+              is migrated into it on first use.
 
         Returns:
           provider: Configured CLI-wrapping provider.
@@ -406,24 +408,38 @@ class AnthropicCLI:
                 "AnthropicCLI: `claude` is not on PATH; install the Claude CLI.",
             )
         account_name = resolve_account(account)
-        is_default_account = account_name == "default"
-        if is_default_account:
-            logged_in = _claude_auth_status(binary)
-            if logged_in is True:
-                return cls(account=None)
-            if logged_in is False:
+        config_dir = _account_config_dir(account)
+        if config_dir is not None:
+            path = config_dir / _CREDS_PATH.name
+            if not path.exists():
+                # One-time migration from the legacy renamed-file slots
+                # (``~/.claude/.credentials-<account>.json``) into the
+                # account's own ``CLAUDE_CONFIG_DIR``.
+                legacy = credentials_path(_CREDS_PATH.expanduser(), account)
+                if _load_cli_credentials_file(legacy) is not None:
+                    config_dir.mkdir(parents=True, exist_ok=True)
+                    atomic_write_bytes(
+                        path,
+                        legacy.read_bytes(),
+                        file_mode=0o600,
+                    )
+            if _load_cli_credentials_file(path) is None:
                 raise FileNotFoundError(
-                    "AnthropicCLI: Claude CLI has no active Claude.ai "
-                    "subscription login; run `claude auth login --claudeai`.",
+                    f"AnthropicCLI: no login for account {account_name!r}; run "
+                    f"`sagent --provider AnthropicCLI --account "
+                    f"{account_name} login`.",
                 )
-        path = credentials_path(_CREDS_PATH.expanduser(), account)
+            return cls(account=account)
+        logged_in = _claude_auth_status(binary)
+        if logged_in is True:
+            return cls(account=None)
+        if logged_in is False:
+            raise FileNotFoundError(
+                "AnthropicCLI: Claude CLI has no active Claude.ai "
+                "subscription login; run `claude auth login --claudeai`.",
+            )
+        path = _CREDS_PATH.expanduser()
         if not path.exists():
-            if not is_default_account:
-                raise FileNotFoundError(
-                    f"AnthropicCLI: no named-account credentials at {path}; "
-                    "named accounts require a legacy Claude credentials file "
-                    "at that path.",
-                )
             raise FileNotFoundError(
                 f"AnthropicCLI: no credentials at {path}; run "
                 "`claude auth login --claudeai`.",
@@ -434,27 +450,24 @@ class AnthropicCLI:
 
     @classmethod
     def login(cls, *, account: str | None = None) -> None:
-        """Run Claude Code's native Claude.ai login for the default account.
+        """Run Claude Code's native Claude.ai login for an account.
 
-        Named AnthropicCLI accounts are legacy file-backed slots and cannot be
-        targeted by Claude Code's interactive login command.
+        The default account logs in to the operator's own claude
+        configuration. A named account logs in to its sagent-owned
+        ``CLAUDE_CONFIG_DIR`` (claude docs, "Log in with multiple
+        accounts": each config directory has its own login).
 
         Args:
-          account: Account slot. ``None`` or ``"default"`` selects the native
-              Claude Code account.
+          account: Account slot. ``None`` or ``"default"`` selects the
+              native Claude Code account.
 
         Raises:
-          RuntimeError: If the Claude CLI is missing, its login command fails,
-              or the resulting Claude.ai login cannot be verified.
-          ValueError: If a named account is requested.
+          RuntimeError: If the Claude CLI is missing, its login command
+              fails, or the resulting Claude.ai login cannot be verified.
 
         """
         account_name = resolve_account(account)
-        if account_name != "default":
-            raise ValueError(
-                "AnthropicCLI named accounts use legacy credential files and "
-                "do not support interactive login.",
-            )
+        config_dir = _account_config_dir(account)
         binary = shutil.which("claude")
         if binary is None:
             raise RuntimeError(
@@ -465,6 +478,9 @@ class AnthropicCLI:
             for key, value in os.environ.items()
             if key not in _NON_SUBSCRIPTION_AUTH_ENV
         }
+        if config_dir is not None:
+            config_dir.mkdir(parents=True, exist_ok=True)
+            env["CLAUDE_CONFIG_DIR"] = str(config_dir)
         proc = subprocess.run(  # noqa: S603 -- The CLI argv is built from fixed provider options and a resolved binary.
             [binary, "auth", "login", "--claudeai"],
             env=env,
@@ -474,7 +490,13 @@ class AnthropicCLI:
             raise RuntimeError(
                 f"Claude CLI login failed with exit code {proc.returncode}.",
             )
-        if _claude_auth_status(binary) is not True:
+        if config_dir is not None:
+            if _load_cli_credentials_file(config_dir / _CREDS_PATH.name) is None:
+                raise RuntimeError(
+                    f"Claude CLI login completed but no credentials for "
+                    f"account {account_name!r} could be verified.",
+                )
+        elif _claude_auth_status(binary) is not True:
             raise RuntimeError(
                 "Claude CLI login completed but no active Claude.ai "
                 "subscription login could be verified.",
@@ -552,7 +574,7 @@ class AnthropicCLI:
 
     @property
     def account(self) -> str | None:
-        """Per-account credentials slot, ``None`` for the legacy file."""
+        """Named account slot, ``None`` for the operator's native login."""
         return self._account
 
 
@@ -619,58 +641,21 @@ class _AnthropicCLIModel(CLISubprocessModel, ModelDefaults):
         # so the on-disk file stays a cache derived from the request.
         self._session_on_disk = False
         self._unanswered: UserMessage | AgentSendMessage | None = None
+        # Per-account auth isolation rides ``CLAUDE_CONFIG_DIR``, never a
+        # staged ``HOME``: current Claude Code keeps each config
+        # directory's credentials (and its macOS Keychain entry) separate
+        # (claude docs, "Log in with multiple accounts"), so the old
+        # hermetic-tmpdir workaround is gone. ``None`` for the default
+        # account -- the subprocess inherits the operator's own config,
+        # Keychain login, and native-tool config (``gh``, ``git``, ssh).
+        self._config_dir = _account_config_dir(self._provider.account)
         if session_id is None:
             self._hot_spare: HotSpare | None = HotSpare(
                 self._spawn_spare_initialized,
                 close_partial=self._close_warming_proc,
             )
-            # Stateless named accounts mint an isolated HOME per spawn.
-            # The default account inherits real HOME so current macOS
-            # Claude Code can read its Keychain-backed login.
-            self._persistent_tmpdir: Path | None = None
         else:
             self._hot_spare = None
-            # Session-persistence mode tradeoff on the ``HOME`` env var:
-            #
-            # If we override HOME to a hermetic tmpdir (as stateless
-            # mode does for credential isolation), then claude's
-            # NATIVE tools -- ``Bash``, ``Read``, ``Write``, etc. --
-            # run with that hermetic HOME inside the ``claude --print``
-            # subprocess. They lose visibility into the operator's
-            # ``~/.config/gh/hosts.yml``, ``~/.gitconfig``, ssh keys,
-            # etc. This shows up as ``gh auth status`` reporting "not
-            # authenticated" even though the operator IS authenticated
-            # on the host. (In stateless mode the same tools were
-            # mounted via sagent's HTTP bridge, so their handler ran
-            # IN THE SAGENT SERVER PROCESS with the operator's real
-            # HOME -- mooting the issue.)
-            #
-            # In session-persistence mode + single-account
-            # (``provider.account is None``), we drop the HOME
-            # override entirely. ``claude`` reads its credentials
-            # from the operator's real ``~/.claude/.credentials.json``,
-            # native tools find ``~/.config/gh/``, and session
-            # JSONLs land at the operator's real
-            # ``~/.claude/projects/-<encoded-cwd>/<uuid>.jsonl``,
-            # which survives ``serve.py`` restarts -- so re-running
-            # the server now ``--resume``s the prior conversation
-            # transcripts cleanly.
-            #
-            # For per-account use (``provider.account is not None``)
-            # we still mint a tmpdir + populate the renamed
-            # credentials file, because ``claude``'s creds path is
-            # hardcoded to ``$HOME/.claude/.credentials.json`` --
-            # there's no env var to redirect it. That case keeps the
-            # stateless-mode HOME-override behaviour.
-            account = self._provider.account
-            self._persistent_tmpdir = (
-                None
-                if account is None
-                else populated_tmpdir(
-                    "sagent-anthropic-cli-resume-",
-                    lambda tmpdir: _populate_anthropic_tmpdir(tmpdir, account),
-                )
-            )
         self._active_proc: Subproc | None = None
         # Set by ``stream`` before ``_spawn_initialized`` reads them.
         self._pending_system: str = ""
@@ -952,9 +937,6 @@ class _AnthropicCLIModel(CLISubprocessModel, ModelDefaults):
         if self._tools_bridge is not None:
             await self._tools_bridge.stop()
             self._tools_bridge = None
-        if self._persistent_tmpdir is not None and self._persistent_tmpdir.exists():
-            shutil.rmtree(self._persistent_tmpdir, ignore_errors=True)
-            self._persistent_tmpdir = None
         self._mcp_baseline_by_proc.clear()
 
     def _should_respawn(self, request: ModelRequest) -> bool:
@@ -1198,32 +1180,6 @@ class _AnthropicCLIModel(CLISubprocessModel, ModelDefaults):
         # ``_pending_tools`` empty (a no-op refresh).
         if self._pending_tools:
             self._tools_bridge.update_tools(list(self._pending_tools))
-        spawn_owned_tmpdir: Path | None
-        tmpdir: Path | None
-        if self._persistent_tmpdir is not None:
-            # Session-persistence + per-account: reuse the
-            # construction-time tmpdir so the renamed credentials
-            # file is found by claude (its creds path is hardcoded
-            # to $HOME/.claude/.credentials.json).
-            tmpdir = self._persistent_tmpdir
-            spawn_owned_tmpdir = None
-        elif self._provider.account is None:
-            # Default account, stateless or persistent: NO HOME override.
-            # On macOS the Claude CLI stores its subscription login in the
-            # Keychain rather than ``~/.claude/.credentials.json``. Inheriting
-            # HOME lets the CLI use that native login and also keeps native
-            # tools (``gh``, ``git``, ssh) on the operator's normal config.
-            tmpdir = None
-            spawn_owned_tmpdir = None
-        else:
-            # Named-account stateless mode: hermetic per-spawn HOME holding
-            # the selected legacy file credential. Subproc deletes it on close.
-            account = self._provider.account
-            tmpdir = populated_tmpdir(
-                "sagent-anthropic-cli-",
-                lambda path: _populate_anthropic_tmpdir(path, account),
-            )
-            spawn_owned_tmpdir = tmpdir
         argv = _build_anthropic_argv(
             model_id=self.capability.model_id,
             system_prompt=self._pending_system,
@@ -1234,7 +1190,7 @@ class _AnthropicCLIModel(CLISubprocessModel, ModelDefaults):
             resume_existing=self._session_on_disk,
         )
         env = _anthropic_subprocess_env(
-            tmpdir,
+            self._config_dir,
             persist_session=self._session_id is not None,
         )
         # ``None`` defers to ``Subproc``'s own default (60s); an explicit
@@ -1248,7 +1204,6 @@ class _AnthropicCLIModel(CLISubprocessModel, ModelDefaults):
         proc = Subproc(
             argv,
             env=env,
-            tmpdir=spawn_owned_tmpdir,
             read_timeout_sec=read_timeout,
             # ``claude --print --output-format stream-json`` emits ONE
             # NDJSON record per content block; a single Read of a large
@@ -1379,9 +1334,10 @@ class _AnthropicCLIModel(CLISubprocessModel, ModelDefaults):
             )
 
     # ``None`` in stateless mode. Resolves the config dir the way the spawn does
-    # (per-account tmpdir, else the operator's ``CLAUDE_CONFIG_DIR`` or ``~/.claude``)
-    # and the cwd the way claude encodes it (canonicalized, non-alnum -> ``-``), so the
-    # path the provider computes is the path claude reads/writes.
+    # (the account's ``CLAUDE_CONFIG_DIR``, else the operator's ``CLAUDE_CONFIG_DIR``
+    # or ``~/.claude``) and the cwd the way claude encodes it (canonicalized,
+    # non-alnum -> ``-``), so the path the provider computes is the path claude
+    # reads/writes.
     def _session_jsonl_path(self) -> Path | None:
         """On-disk session-file path for this uuid under the spawn cwd."""
         if self._session_id is None:
@@ -1390,11 +1346,7 @@ class _AnthropicCLIModel(CLISubprocessModel, ModelDefaults):
             cwd = Path.cwd()
         except OSError:
             return None
-        config_dir = (
-            self._persistent_tmpdir / ".claude"
-            if self._persistent_tmpdir is not None
-            else _claude_config_dir()
-        )
+        config_dir = self._config_dir or _claude_config_dir()
         return _session_jsonl_path(self._session_id, cwd=cwd, config_dir=config_dir)
 
 
@@ -1455,6 +1407,23 @@ def _load_cli_credentials_file(path: Path) -> AnthropicCLICredentials | None:
     return _parse_cli_credentials(raw)
 
 
+def _account_config_dir(account: str | None) -> Path | None:
+    """Return a named account's own ``CLAUDE_CONFIG_DIR`` (sagent-owned).
+
+    ``None`` for the default account: the subprocess then inherits the
+    operator's own claude configuration (``~/.claude`` or their
+    ``CLAUDE_CONFIG_DIR``), including the macOS Keychain login. Current
+    Claude Code keeps each config directory's ``.credentials.json`` --
+    and on macOS its Keychain entry -- separate per directory (claude
+    docs, "Credential management"), so a directory per account is the
+    documented multi-account mechanism and no ``HOME`` staging remains.
+    """
+    name = resolve_account(account)
+    if name == "default":
+        return None
+    return data_dir() / "rekursiv-ai" / "sagent" / "claude" / name
+
+
 # ``CLAUDE_CONFIG_DIR`` names claude's config dir itself (whatever it is called), and
 # claude keeps ``projects/`` directly under it; unset, the dir is ``~/.claude``.
 def _claude_config_dir() -> Path:
@@ -1485,27 +1454,16 @@ def _session_jsonl_path(session_id: str, *, cwd: Path, config_dir: Path) -> Path
     return config_dir / "projects" / encoded / f"{session_id}.jsonl"
 
 
-def _populate_anthropic_tmpdir(tmpdir: Path, account: str | None) -> None:
-    """Copy the user's credentials into a hermetic ``HOME`` for the CLI."""
-    dot_claude = tmpdir / ".claude"
-    dot_claude.mkdir(parents=True, exist_ok=True)
-    source = credentials_path(_CREDS_PATH.expanduser(), account)
-    if _load_cli_credentials_file(source) is None:
-        raise ValueError(f"Invalid credentials file: {source}")
-    target = dot_claude / _CREDS_PATH.name
-    atomic_write_bytes(target, source.read_bytes(), file_mode=0o600)
-
-
 # When ``persist_session=True`` we keep ``CLAUDE_CODE_SKIP_PROMPT_HISTORY`` unset --
 # that env var (verified by bisect 2026-06-02) causes the CLI to skip writing its
 # session JSONL even when ``--session-id`` / ``--resume`` are passed, which makes
 # session-persistence mode silently no-op and the next ``--resume`` fails with "No
 # conversation found".
 #
-# When ``tmpdir is None`` we don't override ``HOME`` -- the subprocess inherits the
-# operator's real HOME so Claude finds macOS Keychain auth, project session JSONLs, and
-# native-tool config. This is the default-account path in both stateless and persistent
-# modes. Named accounts use ``tmpdir`` because the CLI has no credential-file override.
+# ``HOME`` is never overridden: the subprocess inherits the operator's real HOME so
+# native tools (``gh``, ``git``, ssh) find their config. Per-account auth isolation
+# rides ``CLAUDE_CONFIG_DIR`` alone (claude docs, "Credential management": the
+# directory holds that account's credentials, settings, and session history).
 #
 # Auto-compact is always disabled: sagent owns history in both modes (stateless re-feeds
 # it each turn; session mode rebuilds the on-disk file from the tape on the first turn
@@ -1513,7 +1471,7 @@ def _populate_anthropic_tmpdir(tmpdir: Path, account: str | None) -> None:
 # ``system/compact_boundary`` to a file sagent overwrites next turn, so sagent's own
 # ``SummaryCompactor`` is the sole compaction authority.
 def _anthropic_subprocess_env(
-    tmpdir: Path | None,
+    config_dir: Path | None,
     *,
     persist_session: bool = False,
 ) -> dict[str, str]:
@@ -1523,10 +1481,8 @@ def _anthropic_subprocess_env(
         for key, value in os.environ.items()
         if key not in _NON_SUBSCRIPTION_AUTH_ENV
     }
-    if tmpdir is not None:
-        env["HOME"] = str(tmpdir)
-        env["USERPROFILE"] = str(tmpdir)
-        env["CLAUDE_CONFIG_DIR"] = str(tmpdir / ".claude")
+    if config_dir is not None:
+        env["CLAUDE_CONFIG_DIR"] = str(config_dir)
     env.update(
         {
             "DISABLE_TELEMETRY": "1",

@@ -16,36 +16,26 @@ The terminal ACP event for each user turn is the JSON-RPC response to
 from __future__ import annotations
 
 from pathlib import Path
-from typing import (
-    TYPE_CHECKING,
-    Final,
-    NotRequired,
-    TypedDict,
-    cast,
-    override,
-)
+from typing import TYPE_CHECKING, cast, override
 
 import asyncio
 import base64
-import contextlib
 import dataclasses
 import json
-import logging
 import os
 import shutil
-
-import fastjsonschema
+import subprocess
+import tempfile
 
 from sagent.catalog.google import cli, models
 from sagent.catalog.table import ModelCatalog
-from sagent.lib.atomic_file import atomic_write_bytes
-from sagent.lib.codec import MutablePlainTree, PlainTree, from_plain
+from sagent.lib.codec import MutablePlainTree, from_plain
+from sagent.lib.userdirs import data_dir
 from sagent.providers.google.api import Google, gemini_image_tokens
 from sagent.providers.lib.cli_respawn import (
     CLISubprocessModel,
     empty_turn_response,
     hash_system,
-    populated_tmpdir,
 )
 from sagent.providers.lib.errors import (
     error_status_code,
@@ -55,10 +45,7 @@ from sagent.providers.lib.errors import (
 from sagent.providers.lib.hotspare import HotSpare
 from sagent.providers.lib.mcp_bridge import ToolsBridge
 from sagent.providers.lib.model_base import ModelDefaults
-from sagent.providers.lib.oauth import (
-    credential_file_lock,
-    credentials_path,
-)
+from sagent.providers.lib.oauth import resolve_account
 from sagent.providers.lib.stop_reason import normalize_stop_reason
 from sagent.providers.lib.subproc import (
     Subproc,
@@ -80,7 +67,7 @@ from sagent.types.runtime import (
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Callable
 
     from sagent.lib import image
     from sagent.types.capability import ModelCapability, ModelSettings
@@ -90,39 +77,25 @@ else:
     image = lazy_import("sagent.lib.image")
 
 
-logger = logging.getLogger(__name__)
+def _gemini_cli_home(account: str | None) -> Path | None:
+    """Return the native Gemini CLI home for an account.
 
-
-_GEMINI_DIR = Path("~/.gemini")
-_CREDS_PATH = _GEMINI_DIR / "oauth_creds.json"
-_CREDENTIALS_SCHEMA: Final[Mapping[str, PlainTree]] = {
-    "type": "object",
-    "required": ["access_token", "refresh_token", "expiry_date"],
-    "properties": {
-        "access_token": {"type": "string"},
-        "refresh_token": {"type": "string"},
-        "expiry_date": {"type": "number"},
-    },
-}
-_CREDENTIALS_VALIDATOR = fastjsonschema.compile(_CREDENTIALS_SCHEMA)
-
-
-class GoogleCLICredentials(TypedDict):
-    """OAuth credentials from the Gemini CLI credentials file."""
-
-    access_token: str
-    refresh_token: str
-    expiry_date: float
-    project_id: NotRequired[str]
-    scope: NotRequired[str]
-    token_type: NotRequired[str]
+    The default account leaves ``GEMINI_CLI_HOME`` untouched so the CLI uses
+    the operator's existing login. Named accounts get persistent sagent-owned
+    homes, which lets the Gemini CLI own the OAuth files and refresh lifecycle.
+    """
+    name = resolve_account(account)
+    if name == "default":
+        return None
+    return data_dir() / "rekursiv-ai" / "sagent" / "gemini" / name
 
 
 class GoogleCLI:
     """Provider that drives the user's installed ``gemini`` CLI subprocess.
 
-    Shares the Gemini model catalog. Auth is the CLI's own OAuth credentials at
-    ``~/.gemini/oauth_creds.json`` (or the named-account variant).
+    Shares the Gemini model catalog. Auth is owned by the Gemini CLI. The default
+    account uses the operator's native CLI configuration; named accounts use a
+    sagent-owned ``GEMINI_CLI_HOME``.
     Cost figures are estimated from public per-token pricing since ACP
     does not surface per-turn usage on ``session/prompt`` responses.
     """
@@ -150,32 +123,52 @@ class GoogleCLI:
 
     @classmethod
     def from_credentials(cls, *, account: str | None = None) -> GoogleCLI:
-        """Build a provider that uses the local ``gemini`` CLI's credentials.
+        """Build a provider that uses the local ``gemini`` CLI's login.
 
         Args:
-          account: Named credential slot. ``None`` reads the legacy
-              unnamed credentials file.
+          account: Named account slot. ``None`` uses the native CLI account.
 
         Returns:
           provider: Configured CLI-wrapping provider.
 
         Raises:
-          FileNotFoundError: If the resolved credentials file is absent.
           RuntimeError: If ``gemini`` is not on ``PATH``.
 
         """
-        path = credentials_path(_CREDS_PATH.expanduser(), account)
-        if not path.exists():
-            raise FileNotFoundError(
-                f"GoogleCLI: no credentials at {path}; run `gemini` and authenticate.",
-            )
-        if _load_cli_credentials_file(path) is None:
-            raise ValueError(f"Invalid credentials file: {path}")
+        _gemini_cli_home(account)
         if shutil.which("gemini") is None:
             raise RuntimeError(
                 "GoogleCLI: `gemini` is not on PATH; install the Gemini CLI.",
             )
         return cls(account=account)
+
+    @classmethod
+    def login(cls, *, account: str | None = None) -> None:
+        """Run the Gemini CLI's native login command for an account.
+
+        Args:
+          account: Account slot. ``None`` uses the operator's native CLI
+              configuration; named accounts get an isolated
+              ``GEMINI_CLI_HOME``.
+
+        Raises:
+          RuntimeError: If the CLI is missing or login fails.
+
+        """
+        binary = shutil.which("gemini")
+        if binary is None:
+            raise RuntimeError(
+                "GoogleCLI: `gemini` is not on PATH; install the Gemini CLI.",
+            )
+        proc = subprocess.run(  # noqa: S603 -- The CLI argv uses a resolved binary and fixed subcommand.
+            [binary, "login"],
+            env=_google_subprocess_env(_gemini_cli_home(account)),
+            check=False,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"Gemini CLI login failed with exit code {proc.returncode}.",
+            )
 
     def model(
         self,
@@ -206,7 +199,7 @@ class GoogleCLI:
 
     @property
     def account(self) -> str | None:
-        """Per-account credentials slot, ``None`` for the legacy file."""
+        """Named account slot, ``None`` for the operator's native login."""
         return self._account
 
 
@@ -220,68 +213,13 @@ class _GoogleCLIProcState:
     system_hash: str
 
 
-def save_cli_credentials_file(path: Path, creds: GoogleCLICredentials) -> None:
-    """Persist credentials in Gemini CLI-compatible format.
-
-    Args:
-      path: Credentials file to update.
-      creds: OAuth credentials to persist.
-
-    """
-    existing: dict[str, MutablePlainTree] = {}
-    if path.exists():
-        with contextlib.suppress(json.JSONDecodeError, OSError):
-            raw = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(raw, dict):
-                existing = cast(dict[str, MutablePlainTree], raw)
-    existing["access_token"] = creds["access_token"]
-    existing["refresh_token"] = creds["refresh_token"]
-    existing["expiry_date"] = creds["expiry_date"]
-    for opt_key in ("project_id", "scope", "token_type"):
-        value = creds.get(opt_key)
-        if isinstance(value, str) and value:
-            existing[opt_key] = value
-    atomic_write_bytes(path, json.dumps(existing).encode(), file_mode=0o600)
-
-
-def _read_expiry(path: Path) -> float:
-    """Return the ``expiry_date`` (JS millis) in ``path``, or ``0`` on any error."""
-    with contextlib.suppress(OSError, json.JSONDecodeError, KeyError, ValueError):
-        return float(json.loads(path.read_text(encoding="utf-8"))["expiry_date"])
-    return 0.0
-
-
-def _populate_google_tmpdir(
-    tmpdir: Path,
-    account: str | None,
-    system_prompt: str,
-) -> None:
-    """Lay out the hermetic ``HOME`` the spawn recipe (§3.1) expects."""
-    dot_gemini = tmpdir / ".gemini"
-    workdir = tmpdir / "workdir"
-    dot_gemini.mkdir(parents=True, exist_ok=True)
-    workdir.mkdir(parents=True, exist_ok=True)
-    creds_src = credentials_path(_CREDS_PATH.expanduser(), account)
-    if _load_cli_credentials_file(creds_src) is None:
-        raise ValueError(f"Invalid credentials file: {creds_src}")
-    creds_dst = dot_gemini / "oauth_creds.json"
-    shutil.copyfile(creds_src, creds_dst)
-    creds_dst.chmod(
-        0o600,
-    )  # house-ignore[mkdir-mode] -- Credential copy into a hermetic tmp HOME for the vendor CLI.
-    for name in ("google_accounts.json", "installation_id"):
-        src = _GEMINI_DIR.expanduser() / name
-        if src.exists():
-            shutil.copyfile(src, dot_gemini / name)
-    (dot_gemini / "settings.json").write_text(
-        json.dumps(_GEMINI_SETTINGS),
-        encoding="utf-8",
-    )
-    (tmpdir / "system.md").write_text(system_prompt, encoding="utf-8")
-
-
-def _google_subprocess_env(tmpdir: Path) -> dict[str, str]:
-    """Build the env for the ``gemini`` subprocess (hermetic + telemetry off)."""
+def _google_subprocess_env(
+    config_home: Path | None,
+    *,
+    system_path: Path | None = None,
+    settings_path: Path | None = None,
+) -> dict[str, str]:
+    """Build the env for ``gemini`` without copying or parsing OAuth files."""
     drop = {
         "GEMINI_API_KEY",
         "GOOGLE_API_KEY",
@@ -293,9 +231,6 @@ def _google_subprocess_env(tmpdir: Path) -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if k not in drop}
     env.update(
         {
-            "HOME": str(tmpdir),
-            "USERPROFILE": str(tmpdir),
-            "GEMINI_SYSTEM_MD": str(tmpdir / "system.md"),
             "GEMINI_DEFAULT_AUTH_TYPE": "oauth-personal",
             "GEMINI_FORCE_FILE_STORAGE": "true",
             "GEMINI_YOLO_MODE": "true",
@@ -305,6 +240,12 @@ def _google_subprocess_env(tmpdir: Path) -> dict[str, str]:
             "GEMINI_STRICT_TELEMETRY_LIMITS": "true",
         },
     )
+    if config_home is not None:
+        env["GEMINI_CLI_HOME"] = str(config_home)
+    if system_path is not None:
+        env["GEMINI_SYSTEM_MD"] = str(system_path)
+    if settings_path is not None:
+        env["GEMINI_CLI_SYSTEM_SETTINGS_PATH"] = str(settings_path)
     return env
 
 
@@ -483,12 +424,10 @@ class _GoogleCLIModel(CLISubprocessModel, ModelDefaults):
         self._tools_bridge: ToolsBridge | None = None
         self._next_rpc_id = 1
         self._session_id: str = ""
-        self._tmpdir: Path | None = None
         self._hot_spare = HotSpare(
             self._spawn_initialized_proc,
             close_partial=self._close_warming_proc,
         )
-        self._writeback_lock = asyncio.Lock()
         self._pending_system: str = ""
 
     @property
@@ -577,10 +516,6 @@ class _GoogleCLIModel(CLISubprocessModel, ModelDefaults):
             raise
         self._hot_spare.record_success()
         self._turn_count += 1
-        try:
-            await self._writeback_credentials()
-        except Exception:
-            logger.exception("GoogleCLI: credential writeback failed.")
         return response
 
     @override
@@ -613,7 +548,6 @@ class _GoogleCLIModel(CLISubprocessModel, ModelDefaults):
             return
         self._session_id = state.session_id
         self._system_hash = state.system_hash
-        self._tmpdir = state.tmpdir
 
     @classmethod
     def _attach_proc_state(cls, state: _GoogleCLIProcState) -> None:
@@ -738,16 +672,26 @@ class _GoogleCLIModel(CLISubprocessModel, ModelDefaults):
             await self._tools_bridge.start()
         system = self._pending_system
         account = self._provider.account
-        tmpdir = populated_tmpdir(
-            "sagent-google-cli-",
-            lambda path: _populate_google_tmpdir(path, account, system),
-        )
-        system_hash = hash_system(system)
+        tmpdir = Path(tempfile.mkdtemp(prefix="sagent-google-cli-"))
         workdir = tmpdir / "workdir"
+        system_path = tmpdir / "system.md"
+        settings_path = tmpdir / "settings.json"
+        try:
+            workdir.mkdir()
+            system_path.write_text(system, encoding="utf-8")
+            settings_path.write_text(json.dumps(_GEMINI_SETTINGS), encoding="utf-8")
+        except BaseException:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            raise
+        system_hash = hash_system(system)
         model_id = self.capability.model_id
         proc = Subproc(
             ["gemini", "--experimental-acp", "--model", model_id],
-            env=_google_subprocess_env(tmpdir),
+            env=_google_subprocess_env(
+                _gemini_cli_home(account),
+                system_path=system_path,
+                settings_path=settings_path,
+            ),
             tmpdir=tmpdir,
             cwd=workdir,
         )
@@ -812,58 +756,3 @@ class _GoogleCLIModel(CLISubprocessModel, ModelDefaults):
         rid = self._next_rpc_id
         self._next_rpc_id += 1
         return rid
-
-    # Skipped if the user's copy is newer than the tmpdir's, so stale in-flight
-    # refreshes never clobber a fresher token from a sibling process or an interactive
-    # ``/login``. Holds the cross-process credential lock around the read-expiry →
-    # compare → write so a concurrent sagent can't read the same stale target and both
-    # race to write back conflicting tokens.
-    async def _writeback_credentials(self) -> None:
-        """Copy refreshed tmpdir creds back to the user's home (newer-wins)."""
-        if self._tmpdir is None:
-            return
-        async with self._writeback_lock:
-            src = self._tmpdir / ".gemini" / "oauth_creds.json"
-            if not src.exists():
-                return
-            target = credentials_path(_CREDS_PATH.expanduser(), self._provider.account)
-            async with credential_file_lock(target):
-                # Re-check expiry under the cross-process lock so a sibling
-                # that just wrote a fresher token won't get clobbered.
-                tmpdir_expiry = _read_expiry(src)
-                user_expiry = _read_expiry(target) if target.exists() else 0.0
-                if tmpdir_expiry <= user_expiry:
-                    return
-                atomic_write_bytes(target, src.read_bytes(), file_mode=0o600)
-
-
-def _parse_cli_credentials(raw: dict[str, MutablePlainTree]) -> GoogleCLICredentials:
-    """Extract access/refresh/expiry from Gemini CLI credential JSON."""
-    creds = GoogleCLICredentials(
-        access_token=str(raw["access_token"]),
-        refresh_token=str(raw["refresh_token"]),
-        expiry_date=from_plain(raw["expiry_date"], float),
-    )
-    for opt_key in ("project_id", "scope", "token_type"):
-        value = raw.get(opt_key)
-        if isinstance(value, str) and value:
-            creds[opt_key] = value
-    return creds
-
-
-def _load_cli_credentials_file(path: Path) -> GoogleCLICredentials | None:
-    """Read credentials from a Gemini CLI-format JSON file."""
-    if not path.exists():
-        return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    raw = cast(dict[str, MutablePlainTree], data)
-    try:
-        _CREDENTIALS_VALIDATOR(raw)
-    except fastjsonschema.JsonSchemaValueException:
-        return None
-    return _parse_cli_credentials(raw)

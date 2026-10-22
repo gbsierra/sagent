@@ -15,13 +15,13 @@ Usage::
     # Anthropic API key (reads ANTHROPIC_API_KEY)
     ./cli.py --provider Anthropic
 
-    # Claude subscription (reuses `claude auth login --claudeai`)
+    # Claude subscription (uses the native Claude CLI login)
     ./cli.py --provider AnthropicCLI
 
     # OpenAI
     ./cli.py --provider OpenAI --model gpt-6.1-sol
 
-    # ChatGPT subscription (reuses `codex login`)
+    # ChatGPT subscription (Sign in with ChatGPT)
     ./cli.py --provider OpenAISubscription --model gpt-5.6-sol
 
     # Google
@@ -620,6 +620,21 @@ def _do_login(args: argparse.Namespace) -> None:
         sys.exit(1)
     login_fn = getattr(cls, "login", None)
     save_fn = getattr(cls, "save", None)
+    if args.provider in {"AnthropicCLI", "GoogleCLI"}:
+        if login_fn is None:
+            sys.stderr.write(
+                f"Error: {args.provider} does not expose a native CLI login command.\n",
+            )
+            sys.exit(1)
+        account = args.account or "default"
+        sys.stderr.write(f"[login] provider={args.provider} account={account!r}\n")
+        try:
+            login_fn(account=args.account)
+        except RuntimeError as exc:
+            sys.stderr.write(f"Error: {exc}\n")
+            sys.exit(1)
+        sys.stderr.write(f"[login] {args.provider} login completed for '{account}'.\n")
+        return
     if login_fn is None or save_fn is None:
         if args.provider == "AnthropicCLI":
             if args.account not in (None, "default"):
@@ -1137,18 +1152,20 @@ def _credential_setup_commands(
         "" if account_name == "default" else f" --account {shlex.quote(account_name)}"
     )
     if provider_name == "AnthropicCLI":
-        if account_args:
-            # Native Claude login writes only its default credential store;
-            # named AnthropicCLI accounts are legacy file slots and the
-            # provider error names their required path.
-            return ()
-        return ("claude auth login --claudeai", "sagent --provider AnthropicCLI")
+        login = f"sagent --provider AnthropicCLI{account_args} login"
+        run = f"sagent --provider AnthropicCLI{account_args}"
+        return (login, run)
     if provider_name == "OpenAISubscription":
+        # Sign in with ChatGPT: sagent is its own OAuth client; the legacy
+        # suggestion to run the vendor CLI's login is gone with the flow
+        # that borrowed its credentials.
         login = f"sagent --provider OpenAISubscription{account_args} login"
         run = f"sagent --provider OpenAISubscription{account_args}"
-        if account_args:
-            return (login, run)
-        return ("codex login", login, run)
+        return (login, run)
+    if provider_name == "GoogleCLI":
+        login = f"sagent --provider GoogleCLI{account_args} login"
+        run = f"sagent --provider GoogleCLI{account_args}"
+        return (login, run)
     cls = getattr(providers, provider_name, None)
     env_var = {
         "Anthropic": "ANTHROPIC_API_KEY",

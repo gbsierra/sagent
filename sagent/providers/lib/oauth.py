@@ -23,6 +23,7 @@ import asyncio
 import base64
 import fcntl
 import hashlib
+import hmac
 import http.server as http_server
 import logging
 import os
@@ -175,12 +176,21 @@ class AuthCodeHandler(http_server.BaseHTTPRequestHandler):
             return
         listener = cast(AuthCodeServer, self.server).listener
         params = parse.parse_qs(parsed.query)
+        # Capture the whole query (first value per key) so callers can read
+        # protocol-specific callback extras -- SIWC registrations return the
+        # issued ``client_id`` alongside the code -- without subclassing.
+        listener._params = {  # noqa: SLF001 -- The handler IS the listener's callback transport.
+            key: values[0] for key, values in params.items() if values
+        }
         state = (params.get("state") or [""])[0]
         code = (params.get("code") or [""])[0]
         err = (params.get("error") or [""])[0]
         if err:
             listener._error = err  # noqa: SLF001 -- The test reaches the private OAuth seam under test.
-        elif state != listener._expected_state:  # noqa: SLF001 -- The test reaches the private OAuth seam under test.
+        elif not hmac.compare_digest(
+            state.encode(),
+            listener._expected_state.encode(),  # noqa: SLF001 -- The test reaches the private OAuth seam under test.
+        ):
             listener._error = "state mismatch"  # noqa: SLF001 -- The test reaches the private OAuth seam under test.
         elif not code:
             # Matching state with no code is not a success: the flow has
@@ -207,7 +217,13 @@ class AuthCodeHandler(http_server.BaseHTTPRequestHandler):
 
 
 class AuthCodeListener:
-    """Tiny localhost HTTP callback for OAuth authorization_code flow."""
+    """Tiny localhost HTTP callback for OAuth authorization_code flow.
+
+    The handler captures the callback's full query string (first value per
+    key), so protocol-specific callback extras -- SIWC registrations return
+    the issued ``client_id`` alongside the code -- are readable via
+    :meth:`query_param` without subclassing.
+    """
 
     def __init__(
         self,
@@ -223,6 +239,7 @@ class AuthCodeListener:
         self._thread: threading.Thread | None = None
         self._code = ""
         self._error = ""
+        self._params: dict[str, str] = {}
         self._done = threading.Event()
 
     @property
@@ -265,6 +282,19 @@ class AuthCodeListener:
             raise ValueError("Expected self._server is not None.")
         port = self._server.server_address[1]
         return f"http://{host}:{port}{self.callback_path}"
+
+    def query_param(self, name: str) -> str:
+        """Return the callback's first value of query parameter ``name``.
+
+        Args:
+          name: Query parameter name.
+
+        Returns:
+          value: The first value from the OAuth callback, or ``""`` when
+            the parameter was absent or no callback arrived yet.
+
+        """
+        return self._params.get(name, "")
 
     def start(self) -> None:
         """Start the localhost HTTP server in a background thread."""

@@ -89,7 +89,7 @@ def test_openai_subscription_sdk_is_not_shared_across_loops() -> None:
     provider = OpenAISubscription(
         access_token="t",  # noqa: S106 -- The safety test uses sentinel credentials to exercise rejection paths..
         refresh_token="r",  # noqa: S106 -- The safety test uses sentinel credentials to exercise rejection paths..
-        account_id="a",
+        client_id="oaiapp_test",
         expires_at=time.time() + 9_999,
     )
     seen: list[object] = []
