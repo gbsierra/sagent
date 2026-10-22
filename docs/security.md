@@ -79,6 +79,24 @@ LINEAR_API_KEY=...
 Do not pass literal API keys through `--auth`; it names a `from_<auth>` factory.
 Use `--auth env` so secrets stay out of shell history and process listings.
 
+### Vendor CLI credentials
+
+`AnthropicCLI` and `GoogleCLI` delegate subscription authentication to the
+installed `claude` and `gemini` CLIs. Sagent does not log or refresh their
+live OAuth tokens. The default account uses the vendor's native
+configuration. Named accounts use separate `CLAUDE_CONFIG_DIR` or
+`GEMINI_CLI_HOME` directories under Sagent's data directory. GoogleCLI never
+copies OAuth files; AnthropicCLI only reads and validates a preexisting
+legacy file when migrating an older named account.
+
+### ChatGPT sign-in records
+
+`OpenAISubscription` signs in with OpenAI's "Sign in with ChatGPT" flow.
+Sagent registers its own client, verifies the identity token OpenAI
+returns, and stores one record per account in its data directory with
+owner-only file permissions. Sagent never reads or copies another tool's
+ChatGPT login.
+
 ## Shell and filesystem safety
 
 `Skill` loads local/project-authored instruction files into the model context. Treat skill directories as trusted prompt sources, not user-upload locations.

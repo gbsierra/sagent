@@ -12,7 +12,6 @@ import json
 import operator
 import os
 import re
-import tempfile
 
 import pytest
 
@@ -183,25 +182,44 @@ def test_from_cli_treats_explicit_default_account_as_native_login(
     assert provider.account is None
 
 
-def test_from_cli_missing_named_account_does_not_suggest_native_login(
+def test_from_cli_missing_named_account_points_at_named_login(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Native login cannot create Sagent's legacy named credential file."""
-    monkeypatch.setattr(
-        "sagent.providers.anthropic.cli._CREDS_PATH",
-        tmp_path / ".credentials.json",
-    )
+    """A named account without a login is told how to create one."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
     monkeypatch.setattr(
         "sagent.providers.anthropic.cli.shutil.which",
         _which_claude_stub,
     )
 
-    with pytest.raises(FileNotFoundError) as exc:
+    with pytest.raises(FileNotFoundError, match=r"account 'work'.*login"):
         AnthropicCLI.from_credentials(account="work")
 
-    assert "named-account credentials" in str(exc.value)
-    assert "claude auth login" not in str(exc.value)
+
+def test_from_cli_named_account_migrates_a_legacy_credentials_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Legacy ``~/.claude/.credentials-<name>.json`` slots move to the account dir."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    legacy = tmp_path / ".claude" / ".credentials-work.json"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text(json.dumps(_CRED_PAYLOAD), encoding="utf-8")
+    monkeypatch.setattr(
+        "sagent.providers.anthropic.cli.shutil.which",
+        _which_claude_stub,
+    )
+
+    provider = AnthropicCLI.from_credentials(account="work")
+
+    assert provider.account == "work"
+    config_dir = cli._account_config_dir("work")
+    assert config_dir is not None
+    migrated = config_dir / ".credentials.json"
+    assert (migrated.stat().st_mode & 0o777) == 0o600
+    assert "claudeAiOauth" in json.loads(migrated.read_text(encoding="utf-8"))
 
 
 def test_from_cli_rejects_native_logged_out_state_even_with_stale_file(
@@ -372,9 +390,39 @@ def test_login_runs_native_claudeai_flow_with_scrubbed_env(
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
 
 
-def test_login_rejects_named_anthropic_account() -> None:
-    with pytest.raises(ValueError, match="named accounts"):
-        AnthropicCLI.login(account="work")
+def test_login_named_account_uses_its_own_config_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Named-account login runs the native flow inside the account's config dir."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    captured: dict[str, object] = {}
+
+    def fake_run(*args: object, **kwargs: object) -> object:
+        captured["args"] = args
+        captured["env"] = kwargs["env"]
+        config_dir = cli._account_config_dir("work")
+        assert config_dir is not None
+        creds = config_dir / ".credentials.json"
+        creds.write_text(json.dumps(_CRED_PAYLOAD), encoding="utf-8")
+        return MagicMock(returncode=0)
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "secret-test-key")
+    monkeypatch.setattr(
+        "sagent.providers.anthropic.cli.shutil.which",
+        _which_claude_stub,
+    )
+    monkeypatch.setattr(
+        "sagent.providers.anthropic.cli.subprocess.run",
+        fake_run,
+    )
+
+    AnthropicCLI.login(account="work")
+
+    assert captured["args"] == (["/usr/bin/claude", "auth", "login", "--claudeai"],)
+    env = cast(dict[str, str], captured["env"])
+    assert env["CLAUDE_CONFIG_DIR"] == str(cli._account_config_dir("work"))
+    assert "ANTHROPIC_API_KEY" not in env
 
 
 def test_login_reports_native_cli_failure(
@@ -734,21 +782,21 @@ def test_user_line_text_only() -> None:
     assert line == {"type": "user", "message": {"role": "user", "content": "hello"}}
 
 
-def test_anthropic_subprocess_env_overrides_home_when_tmpdir_set(
+def test_anthropic_subprocess_env_sets_named_config_dir_without_home_override(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Stateless mode (or session-persistent + per-account): tmpdir
-    becomes HOME so the renamed credentials file is found.
-    """
+    """Named auth isolation uses ``CLAUDE_CONFIG_DIR``, not a staged HOME."""
     monkeypatch.setenv(
         "CLAUDE_CONFIG_DIR",
         "/operator/.claude",
     )
-    env = _anthropic_subprocess_env(tmp_path)
-    assert env["HOME"] == str(tmp_path)
-    assert env["USERPROFILE"] == str(tmp_path)
-    assert env["CLAUDE_CONFIG_DIR"] == str(tmp_path / ".claude")
+    operator_home = str(tmp_path / "operator-home")
+    monkeypatch.setenv("HOME", operator_home)
+    config_dir = tmp_path / "sagent-claude-work"
+    env = _anthropic_subprocess_env(config_dir)
+    assert env["HOME"] == operator_home
+    assert env["CLAUDE_CONFIG_DIR"] == str(config_dir)
     # Stateless default has CLAUDE_CODE_SKIP_PROMPT_HISTORY set.
     assert env["CLAUDE_CODE_SKIP_PROMPT_HISTORY"] == "1"
 
@@ -848,28 +896,19 @@ async def test_stateless_default_account_inherits_native_home(
 
     env = cast(dict[str, str], captured["env"])
     assert env["HOME"] == str(operator_home)
-    assert captured["tmpdir"] is None
+    assert "CLAUDE_CONFIG_DIR" not in env
+    assert "tmpdir" not in captured
 
 
 @pytest.mark.asyncio
-async def test_stateless_named_account_uses_isolated_file_home(
+async def test_stateless_named_account_uses_isolated_config_dir(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Named accounts retain the explicit file-isolation behavior."""
-    base = tmp_path / ".credentials.json"
-    named = tmp_path / ".credentials-work.json"
-    named.write_text(json.dumps(_CRED_PAYLOAD), encoding="utf-8")
-    isolated = tmp_path / "isolated-home"
-    monkeypatch.setattr(
-        "sagent.providers.anthropic.cli._CREDS_PATH",
-        base,
-    )
-
-    def fake_mkdtemp(**_kwargs: object) -> str:
-        return str(isolated)
-
-    monkeypatch.setattr(tempfile, "mkdtemp", fake_mkdtemp)
+    """Named accounts isolate Claude state without changing native tool HOME."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    operator_home = tmp_path / "operator-home"
+    monkeypatch.setenv("HOME", str(operator_home))
     captured: dict[str, object] = {}
 
     class _CaptureSubproc:
@@ -894,33 +933,9 @@ async def test_stateless_named_account_uses_isolated_file_home(
     await model._spawn_initialized()
 
     env = cast(dict[str, str], captured["env"])
-    assert env["HOME"] == str(isolated)
-    assert captured["tmpdir"] == isolated
-    assert (isolated / ".claude" / ".credentials.json").exists()
-
-
-def test_named_account_tmpdir_removed_when_population_fails(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """A credential copy that fails must not strand the mkdtemp dir."""
-    monkeypatch.setattr(
-        "sagent.providers.anthropic.cli._CREDS_PATH",
-        tmp_path / ".credentials.json",
-    )
-    made: list[Path] = []
-    real_mkdtemp = tempfile.mkdtemp
-
-    def _tracking_mkdtemp(**kwargs: str) -> str:
-        path = real_mkdtemp(dir=tmp_path, **kwargs)
-        made.append(Path(path))
-        return path
-
-    monkeypatch.setattr(tempfile, "mkdtemp", _tracking_mkdtemp)
-    with pytest.raises(ValueError, match="Invalid credentials"):
-        AnthropicCLI(account="work").model("claude-haiku-4-5", session_id="s")
-    assert made
-    assert not any(path.exists() for path in made)
+    assert env["HOME"] == str(operator_home)
+    assert env["CLAUDE_CONFIG_DIR"] == str(cli._account_config_dir("work"))
+    assert "tmpdir" not in captured
 
 
 def test_build_model_response_normalizes_input_to_last_round() -> None:

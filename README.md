@@ -190,7 +190,7 @@ See [API](https://github.com/rekursiv-ai/sagent/blob/main/docs/api.md), [Tutoria
 
 ## Provider setup
 
-Sagent ships API-key providers for Anthropic, OpenAI, OpenAISubscription, Google, Moonshot, DashScope, MiniMax, and generic OpenAI-compatible endpoints, a subscription-backed `AnthropicCLI` that rides your installed `claude` login, plus a managed local `LlamaCpp` provider. Set the key (or run the login) for the provider you plan to use:
+Sagent ships API-key providers for Anthropic, OpenAI, Google, Moonshot, DashScope, MiniMax, and generic OpenAI-compatible endpoints, a login-based `OpenAISubscription` provider that signs in with your ChatGPT account, subscription-backed `AnthropicCLI` and `GoogleCLI` providers that ride their installed vendor CLIs, plus a managed local `LlamaCpp` provider. Set the key (or run the login) for the provider you plan to use:
 
 ```bash
 export ANTHROPIC_API_KEY=...
@@ -212,8 +212,10 @@ to set the default value of the `--provider` flag.
 | Provider | Environment variable | Example model |
 | --- | --- | --- |
 | `Anthropic` | `ANTHROPIC_API_KEY` | `fable-5.1` |
-| `AnthropicCLI` | none (`claude auth login --claudeai`) | `fable-5.1` |
+| `AnthropicCLI` | none (`sagent --provider AnthropicCLI login`) | `fable-5.1` |
 | `OpenAI` | `OPENAI_API_KEY` | `sol-6.1` |
+| `OpenAISubscription` | none (`sagent --provider OpenAISubscription login`) | `sol-6.1` |
+| `GoogleCLI` | none (`sagent --provider GoogleCLI login`) | `gemini-pro-3.1` |
 | `Google` | `GOOGLE_API_KEY` | `gemini-pro-3.1` |
 | `Moonshot` | `MOONSHOT_API_KEY` | `kimi-2.6` |
 | `DashScope` | `DASHSCOPE_API_KEY` | `qwen-plus-3.7` |

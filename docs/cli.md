@@ -42,7 +42,7 @@ sagent --provider SelfHosted --model /opt/models/qwen3.6-27b+bfloat16+cuda
 | --- | --- |
 | `--provider NAME` | Provider class from `sagent.providers`, such as `Anthropic` or `Google`. |
 | `--auth METHOD` | Calls `Provider.from_<METHOD>()`; an explicit API-key provider defaults to `env`, while subscription providers default to `credentials`. |
-| `--account NAME` | Optional named credential slot for providers that support one. |
+| `--account NAME` | Optional named account slot for providers that support one. |
 | `--model ID` | Catalog model ID. Bare IDs select the largest context window. Models with smaller profiles accept `+200k` or `+272k`; an explicit `+1m` remains valid when the bare profile is already at least one million tokens. SelfHosted IDs may include `+cuda`, `+bfloat16`, or `+compile`. |
 | `--system TEXT` | Extra system prompt instructions appended to Sagent's default prompt. |
 | `--effort LEVEL` | Reasoning effort: `none`, `min`, `low`, `medium`, `high`, `xhigh`, or `max`. Each model accepts a subset (GPT-5.6 takes all seven; GPT-6 Astra has no `none`), and an unsupported value raises. |
@@ -51,6 +51,31 @@ sagent --provider SelfHosted --model /opt/models/qwen3.6-27b+bfloat16+cuda
 
 If no `from_<auth>` factory exists, Sagent reports an error. Use `--auth env`
 for API keys so secrets do not land in shell history.
+
+Subscription-backed CLI providers use their vendor's native login flow:
+
+```bash
+sagent --provider AnthropicCLI login
+sagent --provider GoogleCLI login
+sagent --provider AnthropicCLI --account work login
+sagent --provider GoogleCLI --account work login
+```
+
+The default account keeps the vendor CLI's native configuration. Named
+`AnthropicCLI` accounts use a separate `CLAUDE_CONFIG_DIR`; named `GoogleCLI`
+accounts use a separate `GEMINI_CLI_HOME`. Sagent does not copy or refresh
+the vendors' OAuth files.
+
+`OpenAISubscription` signs in with OpenAI's "Sign in with ChatGPT" flow:
+
+```bash
+sagent --provider OpenAISubscription login
+sagent --provider OpenAISubscription --account work login
+```
+
+Sagent registers its own client with OpenAI and stores one sign-in record
+per account. It prints a sign-in URL and waits for the browser redirect;
+add `--headless` to paste the final URL back by hand instead.
 
 For self-hosted HuggingFace models, `SelfHosted` defaults to
 `Qwen/Qwen3.6-27B` and treats `--model` as a repo ID or local snapshot path with

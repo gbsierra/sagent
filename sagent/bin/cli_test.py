@@ -18,7 +18,7 @@ import sys
 
 import pytest
 
-from sagent import sessions
+from sagent import providers, sessions
 from sagent.agent import Agent
 from sagent.agent.session_io import (
     PersistentAgentRecord,
@@ -673,15 +673,15 @@ def test_credential_fallback_candidates_are_allowed_and_subscription_only() -> N
     )
 
 
-def test_anthropic_cli_error_names_real_login_command() -> None:
+def test_anthropic_cli_error_names_sagent_login_command() -> None:
     message = _credential_error_message(
         "AnthropicCLI",
         FileNotFoundError("logged out"),
         allow_providers=("AnthropicCLI",),
     )
 
-    assert "claude auth login" in message
-    assert "sagent --provider AnthropicCLI login" not in message
+    assert "sagent --provider AnthropicCLI login" in message
+    assert "claude auth login" not in message
 
 
 def test_anthropic_api_error_names_required_environment_variable() -> None:
@@ -711,8 +711,8 @@ def test_openai_subscription_error_names_direct_sagent_login() -> None:
         allow_providers=("OpenAISubscription",),
     )
 
-    assert "codex login" in message
     assert "sagent --provider OpenAISubscription login" in message
+    assert "codex login" not in message
 
 
 def test_named_account_setup_commands_target_that_account() -> None:
@@ -731,42 +731,99 @@ def test_named_account_setup_commands_target_that_account() -> None:
         allow_providers=("AnthropicCLI",),
         account="work",
     )
-    assert "Try one of:" not in anthropic_message
+    assert "sagent --provider AnthropicCLI --account work login" in anthropic_message
     assert "claude auth login" not in anthropic_message
 
 
-def test_anthropic_cli_login_command_points_to_native_cli(
+def test_anthropic_cli_login_delegates_to_native_cli(
+    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    calls: list[str | None] = []
+
+    def fake_login(*, account: str | None) -> None:
+        calls.append(account)
+
+    monkeypatch.setattr(
+        providers.AnthropicCLI,
+        "login",
+        staticmethod(fake_login),
+    )
     args = argparse.Namespace(
         provider="AnthropicCLI",
         account=None,
         headless=False,
     )
 
-    with pytest.raises(SystemExit) as exc:
-        _do_login(args)
+    _do_login(args)
 
-    assert exc.value.code == 1
-    assert "claude auth login" in capsys.readouterr().err
+    assert calls == [None]
+    output = capsys.readouterr().err
+    assert "[login] AnthropicCLI login completed" in output
 
 
-def test_anthropic_cli_named_account_login_does_not_target_default(
+def test_anthropic_cli_named_account_login_targets_that_account(
+    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    calls: list[str | None] = []
+
+    def fake_login(*, account: str | None) -> None:
+        calls.append(account)
+
+    monkeypatch.setattr(
+        providers.AnthropicCLI,
+        "login",
+        staticmethod(fake_login),
+    )
     args = argparse.Namespace(
         provider="AnthropicCLI",
         account="work",
         headless=False,
     )
 
-    with pytest.raises(SystemExit) as exc:
-        _do_login(args)
+    _do_login(args)
 
-    assert exc.value.code == 1
-    error = capsys.readouterr().err
-    assert "named accounts" in error
-    assert "claude auth login" not in error
+    assert calls == ["work"]
+    assert "[login] AnthropicCLI login completed" in capsys.readouterr().err
+
+
+def test_google_cli_login_delegates_to_gemini(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[str | None] = []
+
+    def fake_login(*, account: str | None) -> None:
+        calls.append(account)
+
+    monkeypatch.setattr(
+        providers.GoogleCLI,
+        "login",
+        staticmethod(fake_login),
+    )
+    args = argparse.Namespace(
+        provider="GoogleCLI",
+        account="work",
+        headless=False,
+    )
+
+    _do_login(args)
+
+    assert calls == ["work"]
+    output = capsys.readouterr().err
+    assert "[login] GoogleCLI login completed" in output
+
+
+def test_google_cli_setup_commands_target_that_account() -> None:
+    message = _credential_error_message(
+        "GoogleCLI",
+        FileNotFoundError("missing"),
+        allow_providers=("GoogleCLI",),
+        account="work",
+    )
+
+    assert "sagent --provider GoogleCLI --account work login" in message
 
 
 def test_parse_cli_args_session_paths() -> None:

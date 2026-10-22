@@ -1,9 +1,13 @@
-"""OpenAI subscription provider (OAuth + Codex CLI billing).
+"""OpenAI subscription provider (Sign in with ChatGPT + Responses API).
 
-Loads OAuth credentials from ``$CODEX_HOME/auth.json`` (or
-``~/.codex/auth.json`` when unset), as written by ``codex login``, and uses
-the OpenAI Responses API via the official Python SDK. Subscription billing
-flows through the user's ChatGPT plan.
+Authenticates through OpenAI's official ``Sign in with ChatGPT`` flow for
+open-source clients: sagent registers as its own OAuth client, gets its
+own issued ``client_id``, stores credentials in its own protected store
+under the user data dir, and calls the public Responses API on the user's
+ChatGPT plan. The protocol (registration, PKCE, token exchange, ID-token
+verification, refresh, revocation, the credential-record format) lives in
+:mod:`sagent.providers.openai.siwc`; this module owns paths, account
+slots, the interactive login UX, and the SDK client.
 
 Usage::
 
@@ -16,57 +20,42 @@ Usage::
 NOTICE -- Provenance and Terms of Use
 -------------------------------------
 
-The OAuth client_id, scopes, endpoints, and protocol details used
-below are taken from OpenAI's open-source Codex CLI (Apache-2.0):
+The protocol implemented here is OpenAI's documented "Sign in with
+ChatGPT" flow for open-source clients (fetched 2026-10-21):
 
-    https://github.com/openai/codex
-        codex-rs/login/src/auth/manager.rs:921   -- CLIENT_ID
-        codex-rs/login/src/auth/manager.rs:94    -- REFRESH_TOKEN_URL
-        codex-rs/login/src/server.rs:51          -- DEFAULT_ISSUER
-        codex-rs/login/src/server.rs:480-509     -- authorize URL (scope,
-                                                    PKCE params, originator)
-        codex-rs/model-provider-info/src/lib.rs:237
-                                                 -- chatgpt.com/backend-api/codex
+    https://developers.openai.com/siwc/token-sharing-open-source/sign-in
 
-This module re-implements that documented protocol in Python against
-the same ``chatgpt.com/backend-api/codex`` endpoint, using the user's
-own credentials produced by ``codex login``. Subscription billing
-flows through the caller's ChatGPT plan exactly as it does via the
-official Codex CLI; cost figures are computed from public per-token
-API pricing as a "what would this session cost at API rates" metric --
-the user is not billed per-token for subscription auth.
+Cross-checked against OpenAI's reference implementation,
+openai/sign-in-with-chatgpt-devkit (``packages/local/src/oauth.ts``).
+The legacy flow this replaces re-used the Codex CLI's OAuth client and
+credential file; that path is deliberately not imported or migrated --
+existing Codex tokens do not carry SIWC grants, so users sign in once
+with sagent's own client.
 
 Use of the ChatGPT subscription is governed by OpenAI's Terms of Use:
 
     https://openai.com/policies/row-terms-of-use/  (rest of world)
     https://openai.com/policies/terms-of-use/      (US)
 
-Users are responsible for ensuring their own usage complies with
-those terms. No representation is made that any particular usage is
-authorized by OpenAI; users uncomfortable with that uncertainty
-should prefer the API-key path (``OpenAI.from_key``).
+Users are responsible for ensuring their own usage complies with those
+terms. Cost figures are computed from public per-token API pricing as a
+"what would this session cost at API rates" metric -- the user is not
+billed per-token for subscription auth.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
+from datetime import datetime
 from typing import (
     IO,
     TYPE_CHECKING,
-    Final,
-    NotRequired,
-    TypedDict,
-    cast,
     override,
 )
-from urllib.parse import quote_plus
 
 import asyncio
 import base64
 import contextlib
-import json
 import logging
-import os
 import secrets
 import sys
 import time
@@ -74,6 +63,7 @@ import time
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from pathlib import Path
 
     from openai.types.responses.response_create_params import (
         ResponseCreateParamsStreaming,
@@ -98,94 +88,82 @@ else:
 
 from sagent.catalog.openai import subscription, subscription_models
 from sagent.catalog.table import ModelCatalog
-from sagent.lib.atomic_file import atomic_write_bytes
-from sagent.lib.codec import MutablePlainTree, ReadError, from_plain, loads
+from sagent.lib.codec import ReadError, from_plain, loads
+from sagent.lib.userdirs import data_dir
 from sagent.providers.lib.oauth import (
     AuthCodeListener,
     credential_file_lock,
     credentials_path,
-    parse_manual_auth_code,
     pkce_pair,
 )
 from sagent.providers.lib.perloop import PerLoop
+from sagent.providers.openai import siwc
 from sagent.providers.openai.api import OpenAI
 from sagent.providers.openai.responses import _OpenAIResponsesModel
-from sagent.types.exceptions import (
-    AuthRefreshError,
-)
+from sagent.types.exceptions import AuthRefreshError
 
 
 logger = logging.getLogger(__name__)
 
-# OAuth/protocol constants below mirror OpenAI's open-source Codex CLI
-# (Apache-2.0); see this module's NOTICE block for full citations.
-#   CLIENT_ID:   codex-rs/login/src/auth/manager.rs:921
-#   token URL:   codex-rs/login/src/auth/manager.rs:94
-#   issuer:      codex-rs/login/src/server.rs:51
-#   scope:       codex-rs/login/src/server.rs:493 (verbatim match)
-#   base URL:    codex-rs/model-provider-info/src/lib.rs:237.
-_CLIENT_ID: Final = "app_EMoamEEZ73f0CkXaXp7hrann"
-_TOKEN_URL: Final = "https://auth.openai.com/oauth/token"  # noqa: S105 -- This literal is a public OAuth endpoint, not a credential.
-DEFAULT_CREDENTIALS_PATH = Path(".codex") / "auth.json"
-_SCOPES: Final = (
-    "openid profile email offline_access api.connectors.read api.connectors.invoke"
-)
 DEFAULT_REFRESH_BUFFER_SEC = (
     300.0  # house-ignore[globals] -- OAuth refresh lead time, user-retunable.
 )
-# OAuth-registered redirect URI port. Not user-tunable: the OAuth app
-# fingerprinted as Codex CLI has this port baked into its allowed
-# redirects on OpenAI's side.
-_CALLBACK_PORT: Final = 1455
+
+
+def _auth_dir() -> Path:
+    """Return sagent's own auth directory under the user data dir.
+
+    The SIWC credential records live here, one file per account slot,
+    alongside the per-host ``ext_agent_host_id`` file shared by every
+    account. Vendor-owned paths (the legacy flow read the Codex CLI's
+    ``~/.codex/auth.json``) are no longer involved.
+    """
+    return data_dir() / "rekursiv-ai" / "sagent" / "auth"
 
 
 def _default_credentials_path() -> Path:
-    """Return the active Codex auth file, honoring ``CODEX_HOME``."""
-    codex_home = os.environ.get("CODEX_HOME", "")
-    if codex_home:
-        return Path(codex_home).expanduser() / "auth.json"
-    return Path.home() / DEFAULT_CREDENTIALS_PATH  # noqa: TID251 -- The Codex CLI reads this fixed vendor path (AGENTS.md rule 3); an XDG root must not relocate it.  # house-ignore[xdg-literal] -- The Codex CLI reads this fixed vendor path (AGENTS.md rule 3).
+    """Return the SIWC record path for the unnamed account slot."""
+    return _auth_dir() / "openai.json"
 
 
 class _CredentialFileError(ValueError):
-    """Stored credentials do not match the subscription OAuth schema."""
+    """Stored credentials do not match the SIWC record schema or state."""
 
 
 class OpenAISubscription:
-    """OpenAI provider -- OAuth + ChatGPT subscription billing.
+    """OpenAI provider -- SIWC OAuth + ChatGPT subscription billing.
 
     Uses the OpenAI catalog with token limits clamped to the subscription
-    wire contract.
-    Cost tracking uses standard API per-token pricing even though
-    subscription users pay a flat fee. This is intentional: it gives
+    wire contract. Cost tracking uses standard API per-token pricing even
+    though subscription users pay a flat fee. This is intentional: it gives
     a consistent "what would this session cost at API rates" metric
     regardless of auth mode.
     """
 
     catalog = ModelCatalog(models=subscription_models(), transport=subscription())
 
-    class Credentials(TypedDict):
-        """OAuth credentials for an OpenAI ChatGPT subscription."""
-
-        access_token: str
-        refresh_token: str
-        account_id: str
-        expires_at: float
-        id_token: NotRequired[str]
+    #: The SIWC credential record (see :mod:`sagent.providers.openai.siwc`).
+    Credentials = siwc.SIWCCredentials
 
     def __init__(
         self,
         *,
         access_token: str,
         refresh_token: str,
-        account_id: str,
+        client_id: str,
         expires_at: float,
+        scopes: tuple[str, ...] | list[str] = (),
+        subject: str = "",
+        email: str = "",
         account: str | None = None,
         refresh_buffer_sec: float = DEFAULT_REFRESH_BUFFER_SEC,
     ) -> None:
         self._access_token = access_token
         self._refresh_token = refresh_token
-        self._account_id = account_id  # ChatGPT account id (from JWT)
+        self._client_id = client_id  # SIWC registration (issued client id).
+        self._scopes = list(scopes)
+        self._subject = subject  # Verified ID-token identity, display only.
+        self._email = email  # Verified ID-token email, display only.
         self._account = account  # Local credential slot name.
         self._expires_at = expires_at
         self._refresh_buffer_sec = refresh_buffer_sec
@@ -198,6 +176,10 @@ class OpenAISubscription:
             lambda: None,
         )
         self._lock: PerLoop[asyncio.Lock] = PerLoop(asyncio.Lock)
+
+    def _cred_path(self) -> Path:
+        """Return this account slot's SIWC record path."""
+        return credentials_path(_default_credentials_path(), self._account)
 
     @classmethod
     def from_key(
@@ -229,26 +211,62 @@ class OpenAISubscription:
         account: str | None = None,
         refresh_buffer_sec: float = DEFAULT_REFRESH_BUFFER_SEC,
     ) -> OpenAISubscription:
-        """Create provider from OAuth credentials.
+        """Create a provider from SIWC credentials.
 
         Args:
-          creds: Pre-loaded credentials, or ``None`` to auto-load from disk.
-          account: Named credential slot. ``None`` uses the active Codex
-            ``auth.json`` under ``$CODEX_HOME`` or ``~/.codex``.
+          creds: Pre-loaded SIWC record, or ``None`` to auto-load from
+            sagent's own credential store.
+          account: Named credential slot.
           refresh_buffer_sec: Seconds before token expiry to trigger
               proactive refresh.
 
         Returns:
           provider: Subscription provider instance.
 
+        Raises:
+          FileNotFoundError: No record on disk; the caller should point the
+            user at the login command.
+          _CredentialFileError: The record is a signed-out tombstone or
+            lacks tokens.
+          siwc.PlanUsageNotGrantedError: The retained sign-in was saved
+            without the ChatGPT-plan-usage scope and must not drive
+            inference.
+
         """
         if creds is None:
             creds = cls.load(account=account)
+        access_token = creds.get("access_token")
+        refresh_token = creds.get("refresh_token")
+        if (
+            access_token is None
+            or access_token == ""
+            or refresh_token is None
+            or refresh_token == ""
+        ):
+            raise _CredentialFileError(
+                "The saved sign-in is missing tokens. Run `sagent "
+                "--provider OpenAISubscription login` to sign in again.",
+            )
+        if siwc.is_signed_out(creds):
+            raise _CredentialFileError(
+                "This account is signed out. Run `sagent --provider "
+                "OpenAISubscription login` to sign in again.",
+            )
+        if not siwc.plan_usage_enabled(creds):
+            raise siwc.PlanUsageNotGrantedError(
+                "The saved sign-in does not include ChatGPT plan usage "
+                "(its consent screen declined it). Run `sagent --provider "
+                "OpenAISubscription login` again to re-consent, or switch "
+                "to the API-key path: --provider OpenAI --auth env.",
+            )
         return cls(
-            access_token=creds["access_token"],
-            refresh_token=creds["refresh_token"],
-            account_id=creds["account_id"],
-            expires_at=creds["expires_at"],
+            access_token=access_token,
+            refresh_token=refresh_token,
+            client_id=creds["client_id"],
+            expires_at=_record_expiry(creds),
+            scopes=creds["scopes"],
+            subject=creds.get("subject", ""),
+            email=creds.get("email", ""),
             account=account,
             refresh_buffer_sec=refresh_buffer_sec,
         )
@@ -262,126 +280,231 @@ class OpenAISubscription:
         account: str | None = None,
         manual: bool = False,
     ) -> OpenAISubscription.Credentials:
-        """Perform interactive OAuth login via browser PKCE flow.
+        """Run the interactive Sign in with ChatGPT flow (SIWC).
+
+        A first sign-in registers sagent dynamically and saves the issued
+        client id; later sign-ins reuse it. The callback's code is
+        exchanged for tokens, the ID token is verified against OpenAI's
+        JWKS (with this attempt's nonce), and the documented record is
+        stored under sagent's own auth directory before returning.
 
         Args:
           output: Stream for user-facing messages. ``None`` uses stdout.
           listener_timeout_sec: Seconds to wait for the browser callback.
-          account: Named credential slot. ``None`` writes to the active Codex
-            ``auth.json`` under ``$CODEX_HOME`` or ``~/.codex``.
-          manual: Print a URL and prompt for a pasted code without waiting for
-            a browser callback.
+          account: Named credential slot.
+          manual: Print a URL and prompt for a pasted callback without
+            waiting for a browser callback (headless).
 
         Returns:
-          creds: Fresh OAuth credentials.
+          creds: The stored SIWC credential record.
 
         Raises:
-          RuntimeError: If the callback listener fails to start or token exchange fails.
-          AuthRefreshError: The issued access token carries no expiry.
+          RuntimeError: The callback listener failed to start or timed out.
+          siwc.OAuthTokenError: OpenAI rejected the registration or the
+            code exchange.
+          siwc.IDTokenVerificationError: The ID token failed verification.
+          siwc.PlanUsageNotGrantedError: The sign-in is retained but does
+            not authorize ChatGPT plan usage.
 
         """
         out = output or sys.stdout
+        cred_path = credentials_path(_default_credentials_path(), account)
+        host = siwc.host_id(cred_path.parent)
+
+        # An existing record makes this a RETURNING sign-in: reuse the
+        # issued client id, omit agent_name_hint, and pre-select the
+        # account by email. A record without plan usage re-shows the
+        # consent screen (errors and recovery: prompt=consent).
+        saved: OpenAISubscription.Credentials | None = None
+        with contextlib.suppress(FileNotFoundError, ValueError):
+            saved = cls.load(account=account)
+        reconsent = saved is not None and not siwc.plan_usage_enabled(saved)
+
         verifier, challenge = pkce_pair()
         state = secrets.token_urlsafe(32)
+        nonce = secrets.token_urlsafe(32)
 
         listener: AuthCodeListener | None = None
-        # Hydra (OpenAI's OAuth server) matches redirect_uri against a
-        # registered allow-list by exact string; that list holds the
-        # ``localhost`` form, so ``127.0.0.1`` is rejected with
-        # ``authorize_hydra_invalid_request``. Advertise ``localhost``
-        # while the listener still binds IPv4 loopback.
-        redirect_uri = f"http://localhost:{_CALLBACK_PORT}/auth/callback"
-        if not manual:
+        if manual:
+            # Headless: no listener runs, so the redirect URI must be
+            # predictable before the browser opens. The user copies the
+            # landed-on URL back into the terminal.
+            redirect_uri = (
+                f"http://127.0.0.1:{siwc.MANUAL_CALLBACK_PORT}{siwc.REDIRECT_PATH}"
+            )
+        else:
             listener = AuthCodeListener(
                 state,
-                port=_CALLBACK_PORT,
-                callback_path="/auth/callback",
+                port=0,
+                callback_path=siwc.REDIRECT_PATH,
             )
             try:
                 listener.start()
-                redirect_uri = listener.redirect_uri_for_host("localhost")
             except OSError as e:
                 raise RuntimeError(f"Failed to start callback listener: {e}") from e
+            redirect_uri = listener.redirect_uri
 
-        url = (
-            "https://auth.openai.com/oauth/authorize"
-            f"?client_id={quote_plus(_CLIENT_ID)}"
-            f"&response_type=code"
-            f"&redirect_uri={quote_plus(redirect_uri)}"
-            f"&scope={quote_plus(_SCOPES)}"
-            f"&code_challenge={quote_plus(challenge)}"
-            f"&code_challenge_method=S256"
-            f"&state={quote_plus(state)}"
-            f"&codex_cli_simplified_flow=true"
-            f"&id_token_add_organizations=true"
-            f"&originator=codex_cli_rs"
+        url = siwc.authorize_url(
+            client_id=saved["client_id"] if saved else siwc.DYNAMIC_CLIENT_ID,
+            redirect_uri=redirect_uri,
+            state=state,
+            nonce=nonce,
+            code_challenge=challenge,
+            ext_agent_host_id=host,
+            agent_name_hint=None if saved else siwc.AGENT_NAME_HINT,
+            login_hint=saved.get("email") if saved else None,
+            prompt="consent" if reconsent else None,
         )
         out.write(
-            "Starting OpenAI ChatGPT (Codex) OAuth login.\n"
-            "This reuses the OAuth flow from openai/codex (Apache-2.0).\n"
-            "Subscription use is governed by OpenAI's Terms of Use:\n"
+            "Starting Sign in with ChatGPT for sagent.\n"
+            "OpenAI registers sagent as its own client; subscription use "
+            "is governed by OpenAI's Terms of Use:\n"
             "  https://openai.com/policies/row-terms-of-use/\n\n"
             f"Open this URL in any browser to authenticate:\n\n  {url}\n\n",
         )
         out.flush()
 
         if listener is None:
-            auth_code = parse_manual_auth_code(
-                input("Paste the authorization code or redirected URL here: "),
+            code, callback_client_id = siwc.parse_manual_callback(
+                input("Paste the redirected URL (or code#state) here: "),
                 state,
             )
         else:
             try:
-                auth_code = listener.wait(listener_timeout_sec)
+                code = listener.wait(listener_timeout_sec)
             finally:
                 listener.stop()
+            # A first registration returns the issued client id here.
+            callback_client_id = listener.query_param("client_id")
+
+        issued_client_id = siwc.resolve_client_id(
+            callback_client_id=callback_client_id,
+            saved_client_id=saved["client_id"] if saved else None,
+        )
 
         with httpx2.Client() as http:
-            r = http.post(
-                _TOKEN_URL,
-                data={
-                    "grant_type": "authorization_code",
-                    "code": auth_code,
-                    "redirect_uri": redirect_uri,
-                    "client_id": _CLIENT_ID,
-                    "code_verifier": verifier,
-                },
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                timeout=15.0,
+            grant = siwc.exchange_code(
+                http,
+                code=code,
+                redirect_uri=redirect_uri,
+                client_id=issued_client_id,
+                code_verifier=verifier,
             )
-            if r.status_code >= 400:
-                body = r.text[:500]
-                raise RuntimeError(f"Token exchange failed ({r.status_code}): {body}")
-            data: dict[str, MutablePlainTree] = cast(
-                dict[str, MutablePlainTree],
-                r.json(),
+            id_token = grant.get("id_token")
+            if id_token is None or id_token == "":
+                raise siwc.OAuthTokenError(
+                    "invalid_token_response",
+                    "OpenAI did not return a verifiable identity. "
+                    "Please sign in again.",
+                )
+            claims = siwc.validate_id_token(
+                id_token,
+                client_id=issued_client_id,
+                nonce=nonce,
+                http=http,
             )
 
-        access_token = str(data["access_token"])
-        account_id = _jwt_claim(
-            access_token,
-            "https://api.openai.com/auth",
-            "chatgpt_account_id",
-        )
-        creds = cls.Credentials(
-            access_token=access_token,
-            refresh_token=str(data["refresh_token"]),
-            account_id=account_id,
-            expires_at=_token_expiry(access_token, data),
-        )
-        id_token = data.get("id_token")
-        if isinstance(id_token, str):
-            creds["id_token"] = id_token
+        subject = str(claims.get("sub") or "")
+        saved_subject = saved.get("subject") if saved is not None else None
+        if saved_subject is not None and saved_subject not in ("", subject):
+            # Registration guide section 4: never replace the selected
+            # account's registration with another account's identity.
+            raise siwc.OAuthTokenError(
+                "account_mismatch",
+                "This sign-in returned a different ChatGPT account. "
+                "Choose the original account or sign in under a new "
+                "--account.",
+            )
 
-        cls.save(creds, account=account)
-        plan = _jwt_claim(
-            access_token,
-            "https://api.openai.com/auth",
-            "chatgpt_plan_type",
-        )
-        out.write(f"Authenticated (plan={plan}, account={account_id[:8]}...).\n")
+        scopes = grant.get("scopes")
+        if scopes is None or len(scopes) == 0:
+            raise siwc.OAuthTokenError(
+                "invalid_token_response",
+                "OpenAI did not confirm the granted permissions. "
+                "Start the login again.",
+            )
+        record: OpenAISubscription.Credentials = {
+            "issuer": siwc.ISSUER,
+            "subject": subject,
+            "client_id": issued_client_id,
+            "ext_agent_host_id": host,
+            "access_token": grant["access_token"],
+            "refresh_token": grant["refresh_token"],
+            "token_type": grant["token_type"],
+            "expires_in": grant["expires_in"],
+            "scopes": scopes,
+            "saved_at": siwc.record_saved_at(),
+        }
+        email = claims.get("email")
+        if isinstance(email, str) and email:
+            record["email"] = email
+        record["id_token"] = id_token
+        earliest_refresh_at = grant.get("earliest_refresh_at")
+        if earliest_refresh_at is not None and earliest_refresh_at != "":
+            record["earliest_refresh_at"] = earliest_refresh_at
+
+        siwc.save_record(record, cred_path)
+        if not siwc.plan_usage_enabled(record):
+            # Retain the sign-in but refuse inference (errors and
+            # recovery): re-running login re-shows the consent screen.
+            raise siwc.PlanUsageNotGrantedError(
+                "Signed in, but ChatGPT plan usage was not granted. The "
+                "sign-in is saved; run login again to approve plan usage, "
+                "or switch to the API-key path: --provider OpenAI "
+                "--auth env.",
+            )
+        as_user = record.get("email") or subject[:8] or "unknown account"
+        out.write(f"Authenticated as {as_user} (plan usage enabled).\n")
         out.flush()
-        return creds
+        return record
+
+    @classmethod
+    async def logout(
+        cls,
+        *,
+        account: str | None = None,
+        output: IO[str] | None = None,
+    ) -> None:
+        """Sign out: revoke the refresh token, then clear local tokens.
+
+        Retains the registration (issued client id), the host id, and the
+        verified identity in a signed-out tombstone, per the SIWC docs:
+        a later sign-in reuses the registration instead of re-registering.
+
+        Args:
+          account: Named credential slot.
+          output: Stream for user-facing messages. ``None`` uses stdout.
+
+        """
+        out = output or sys.stdout
+        cred_path = credentials_path(_default_credentials_path(), account)
+        try:
+            record = await asyncio.to_thread(siwc.load_record, cred_path)
+        except (FileNotFoundError, ValueError):
+            out.write("No saved sign-in; nothing to sign out.\n")
+            return
+        if siwc.is_signed_out(record):
+            out.write("Already signed out.\n")
+            return
+        refresh_token = record.get("refresh_token", "")
+        if refresh_token:
+            async with httpx2.AsyncClient() as http:
+                try:
+                    await siwc.async_revoke(
+                        http,
+                        refresh_token=refresh_token,
+                        client_id=record["client_id"],
+                    )
+                except siwc.RevocationUncertainError as e:
+                    out.write(f"Warning: {e}\n")
+        record.pop("access_token", None)
+        record.pop("refresh_token", None)
+        record.pop("id_token", None)
+        record["signed_out"] = True
+        await asyncio.to_thread(siwc.save_record, record, cred_path)
+        as_user = record.get("email") or record.get("subject") or "this account"
+        out.write(f"Signed out ({as_user}).\n")
+        out.flush()
 
     def model(
         self,
@@ -422,6 +545,11 @@ class OpenAISubscription:
     async def get_sdk(self) -> openai.AsyncOpenAI:
         """Return OAuth-authed SDK client, refreshing as needed.
 
+        The base URL is the documented SIWC inference endpoint; the
+        request carries only the Bearer access token -- the Codex-backend
+        headers (``chatgpt-account-id``, ``originator``) are gone with the
+        legacy flow.
+
         Returns:
           client: Authenticated ``AsyncOpenAI`` SDK client.
 
@@ -440,14 +568,7 @@ class OpenAISubscription:
                 return cached[0]
             sdk = openai.AsyncOpenAI(
                 api_key=token,
-                base_url="https://chatgpt.com/backend-api/codex",
-                default_headers={
-                    "chatgpt-account-id": self._account_id,
-                    # Required by chatgpt.com/backend-api/codex to identify
-                    # the calling client; mirrors openai/codex's request
-                    # signing (codex-rs/login/src/auth/default_client.rs).
-                    "originator": "codex",
-                },
+                base_url=siwc.RESOURCE,
             )
             self._authed.set((sdk, token))
             if cached is not None:
@@ -475,13 +596,14 @@ class OpenAISubscription:
     #
     # Two failure modes this guards, both of which return False so the caller refreshes:
     # - disk token MATCHES ours: a sibling did not refresh; our token is the one that
-    # needs replacing (especially under ``handle_auth_error``, where the server already
-    # rejected it regardless of the local clock). - disk token DIFFERS but is itself
-    # already expired (its own refresh aged out, or clock skew): adopting it would 401
-    # again next call.
+    #   needs replacing (especially under ``handle_auth_error``, where the server already
+    #   rejected it regardless of the local clock). - disk token DIFFERS but is itself
+    #   already expired (its own refresh aged out, or clock skew): adopting it would 401
+    #   again next call. A signed-out tombstone on disk (a sibling signed out) also lands
+    #   here via the empty access token.
     #
-    # ``load`` raises ``ValueError`` on malformed JSON or an incomplete record; it
-    # means "no usable disk creds", so it returns False.
+    # ``siwc.load_record`` raises ``ValueError`` on malformed JSON or an incomplete
+    # record; it means "no usable disk creds", so it returns False.
     #
     # Disk I/O runs in a worker thread so the event loop is not blocked on a slow/NFS
     # read while the credential lock is held. Adopting a new token invalidates the
@@ -491,18 +613,20 @@ class OpenAISubscription:
         """Adopt a DIFFERENT, still-valid sibling-written disk token."""
         try:
             creds = await asyncio.to_thread(
-                OpenAISubscription.load,
-                account=self._account,
+                siwc.load_record,
+                self._cred_path(),
             )
-            disk_at = creds["access_token"]
+            disk_at = creds.get("access_token", "")
         except (FileNotFoundError, ValueError):
             return False
-        if disk_at == self._access_token:
+        if not disk_at or disk_at == self._access_token:
             return False
         self._access_token = disk_at
-        self._refresh_token = creds["refresh_token"]
-        self._account_id = creds["account_id"]
-        self._expires_at = creds["expires_at"]
+        self._refresh_token = creds.get("refresh_token", self._refresh_token)
+        self._client_id = creds["client_id"]
+        self._expires_at = _record_expiry(creds)
+        if creds["scopes"]:
+            self._scopes = list(creds["scopes"])
         await self._discard_sdk()
         return not self.expired
 
@@ -514,15 +638,14 @@ class OpenAISubscription:
         if cached is not None:
             await cached[0].close()
 
-    # Holds a cross-process file lock around the read-disk → maybe- POST → write-disk
+    # Holds a cross-process file lock around the read-disk -> maybe-POST -> write-disk
     # sequence so concurrent processes can't both consume the same refresh_token and
     # have one revoked by the OAuth endpoint's rotation rule.
     async def _ensure_valid(self) -> str:
         """Return a valid access token, reloading from disk or refreshing."""
         if not self.expired:
             return self._access_token
-        cred_path = credentials_path(_default_credentials_path(), self._account)
-        async with self._lock.get(), credential_file_lock(cred_path):
+        async with self._lock.get(), credential_file_lock(self._cred_path()):
             if not self.expired:
                 return self._access_token
             if await self._adopt_fresher_disk_creds():
@@ -536,8 +659,7 @@ class OpenAISubscription:
         Holds the cross-process credential lock so a concurrent
         sibling can't refresh between our disk-check and POST.
         """
-        cred_path = credentials_path(_default_credentials_path(), self._account)
-        async with self._lock.get(), credential_file_lock(cred_path):
+        async with self._lock.get(), credential_file_lock(self._cred_path()):
             # Adopt a sibling's fresher creds only if they are actually valid;
             # an adopted-but-expired token would 401 again on retry, so fall
             # through to ``_refresh`` (the same rule ``_ensure_valid`` uses).
@@ -547,63 +669,94 @@ class OpenAISubscription:
             await self._discard_sdk()
 
     async def _refresh(self) -> None:
-        """Exchange the refresh token for a new access token."""
+        """Exchange the refresh token for a new grant and persist it.
+
+        The caller must hold the cross-process credential lock. A
+        refresh-issued ID token is verified too (no nonce; DevKit
+        parity): an unreachable key service only warns -- availability is
+        not invalidity -- while a hard verification failure re-raises as
+        a re-authentication error.
+        """
         async with httpx2.AsyncClient() as http:
-            r = await http.post(
-                _TOKEN_URL,
-                json={
-                    "grant_type": "refresh_token",
-                    "refresh_token": self._refresh_token,
-                    "client_id": _CLIENT_ID,
-                },
-                headers={"Content-Type": "application/json"},
-                timeout=15.0,
+            grant = await siwc.async_refresh_grant(
+                http,
+                refresh_token=self._refresh_token,
+                client_id=self._client_id,
             )
-            if r.status_code in (400, 401):
-                # Refresh token was rotated by another process, revoked
-                # server-side, or aged out. Retrying is pointless --
-                # surface a clean user-facing error so the renderer
-                # shows actionable text instead of an httpx2 traceback.
+        id_token = grant.get("id_token")
+        if id_token is not None and id_token != "":
+            try:
+                claims = await asyncio.to_thread(
+                    siwc.validate_id_token,
+                    id_token,
+                    client_id=self._client_id,
+                )
+            except siwc.JWKSUnavailableError as e:
+                logger.warning(
+                    "Skipping refreshed ID-token verification: %s",
+                    e,
+                )
+            except siwc.IDTokenVerificationError as e:
                 raise AuthRefreshError(
-                    "OpenAI Codex subscription session expired or revoked. "
+                    f"OpenAI rejected the refreshed session ({e}). "
                     "Run /login to re-authenticate, or /model to switch "
                     "providers.",
-                )
-            r.raise_for_status()
-            data: dict[str, MutablePlainTree] = cast(
-                dict[str, MutablePlainTree],
-                r.json(),
-            )
-        access_token = str(data["access_token"])
-        creds = OpenAISubscription.Credentials(
-            access_token=access_token,
-            refresh_token=str(data["refresh_token"]),
-            account_id=self._account_id,
-            expires_at=_token_expiry(access_token, data),
-        )
-        self._access_token = creds["access_token"]
-        self._refresh_token = creds["refresh_token"]
-        self._expires_at = creds["expires_at"]
+                ) from e
+            else:
+                subject = str(claims.get("sub") or "")
+                if self._subject and subject and subject != self._subject:
+                    raise AuthRefreshError(
+                        "The refreshed ChatGPT identity does not match "
+                        "this account. Run /login and choose the original "
+                        "account.",
+                    )
+                if subject:
+                    self._subject = subject
+                email = claims.get("email")
+                if isinstance(email, str) and email:
+                    self._email = email
+        self._access_token = grant["access_token"]
+        self._refresh_token = grant["refresh_token"]
+        self._expires_at = _grant_expiry(self._access_token, grant["expires_in"])
+        self._scopes = list(grant.get("scopes") or self._scopes)
+        await asyncio.to_thread(self._persist_refreshed_record)
+
+    def _persist_refreshed_record(self) -> None:
+        """Merge the refreshed tokens into the on-disk record.
+
+        The caller holds the cross-process credential lock (via
+        ``_ensure_valid``/``handle_auth_error``); this runs in a worker
+        thread. An unreadable record is rebuilt from in-memory state
+        rather than lost, logging first so the corruption is not silently
+        erased (the same policy as the legacy flow).
+        """
+        cred_path = self._cred_path()
+        record: siwc.SIWCCredentials
         try:
-            creds["account_id"] = (
-                await asyncio.to_thread(OpenAISubscription.load, account=self._account)
-            )["account_id"]
-        except FileNotFoundError:
-            pass
-        except ValueError:
-            # Unusable creds file: malformed JSON or a record missing required
-            # fields like ``{"tokens": {}}``. ``save`` below overwrites it with
-            # the freshly-refreshed tokens; log first so the corruption is not
-            # silently erased. Matches the swallow set in
-            # ``_adopt_fresher_disk_creds``.
+            record = siwc.load_record(cred_path)
+        except (FileNotFoundError, ValueError):
             logger.warning(
-                "OpenAI creds file at %s was unreadable; overwriting with "
-                "refreshed tokens",
-                credentials_path(_default_credentials_path(), self._account),
+                "SIWC record at %s was unreadable; rewriting from memory",
+                cred_path,
             )
-        # ``save`` merges into the file's existing ``tokens``, so fields this
-        # record omits (``id_token``) survive the rewrite.
-        await asyncio.to_thread(OpenAISubscription.save, creds, account=self._account)
+            record = {
+                "issuer": siwc.ISSUER,
+                "client_id": self._client_id,
+                "ext_agent_host_id": siwc.host_id(cred_path.parent),
+                "scopes": list(self._scopes),
+            }
+        record["access_token"] = self._access_token
+        record["refresh_token"] = self._refresh_token
+        expires_at = _jwt_exp(self._access_token)
+        if expires_at > 0:
+            record["expires_in"] = expires_at - time.time()
+        record["scopes"] = list(self._scopes)
+        record["saved_at"] = siwc.record_saved_at()
+        if self._subject:
+            record["subject"] = self._subject
+        if self._email:
+            record["email"] = self._email
+        siwc.save_record(record, cred_path)
 
     # -- Credential I/O ------------------------------------------------
 
@@ -614,69 +767,29 @@ class OpenAISubscription:
         *,
         account: str | None = None,
     ) -> OpenAISubscription.Credentials:
-        """Load OAuth credentials from disk.
+        """Load SIWC credentials from disk.
 
         Args:
-          path: Explicit credentials file path, or ``None`` for default.
-          account: Named credential slot. ``None`` reads the active Codex
-            ``auth.json`` under ``$CODEX_HOME`` or ``~/.codex``.
+          path: Explicit record path, or ``None`` for the account slot.
+          account: Named credential slot. ``None`` reads the unnamed
+            slot in sagent's own auth directory.
 
         Returns:
-          creds: Loaded OAuth credentials.
+          creds: Loaded SIWC credential record.
 
         Raises:
-          FileNotFoundError: If no credentials file exists.
-          ValueError: If the file is not a complete OAuth credential record.
+          FileNotFoundError: If no record exists.
+          ValueError: If the file is not a usable SIWC record.
 
         """
         p = path or credentials_path(_default_credentials_path(), account)
-        if not p.exists():
-            raise FileNotFoundError(f"No credentials at {p}")
-        decoded: object = json.loads(p.read_text(encoding="utf-8"))
-        if not isinstance(decoded, dict):
+        record = siwc.load_record(p)
+        if siwc.is_signed_out(record):
             raise _CredentialFileError(
-                f"{p} must contain a JSON object with OpenAI subscription "
-                "OAuth credentials.",
+                f"{p} is a signed-out record. Run `sagent --provider "
+                "OpenAISubscription login` to sign in again.",
             )
-        raw = cast(dict[str, MutablePlainTree], decoded)
-        raw_tokens = raw.get("tokens")
-        if not isinstance(raw_tokens, dict):
-            auth_mode = raw.get("auth_mode")
-            if auth_mode in ("apikey", "api_key") or "OPENAI_API_KEY" in raw:
-                raise _CredentialFileError(
-                    f"{p} contains OpenAI API-key credentials, not ChatGPT "
-                    "subscription OAuth credentials. Use --provider OpenAI "
-                    "--auth env, or run `sagent --provider OpenAISubscription "
-                    "login` first.",
-                )
-            raise _CredentialFileError(
-                f"{p} does not contain OpenAI subscription OAuth tokens. Run "
-                "`sagent --provider OpenAISubscription login`.",
-            )
-        tokens = raw_tokens
-        required = ("access_token", "refresh_token", "account_id")
-        missing = [
-            name
-            for name in required
-            if not from_plain(tokens.get(name), str, default="")
-        ]
-        if missing:
-            raise _CredentialFileError(
-                f"{p} is missing required OAuth fields: {', '.join(missing)}. "
-                "Run `sagent --provider OpenAISubscription login`.",
-            )
-        access_token = cast(str, tokens.get("access_token"))
-        expires_at = _jwt_exp(access_token)
-        creds = cls.Credentials(
-            access_token=access_token,
-            refresh_token=cast(str, tokens.get("refresh_token")),
-            account_id=cast(str, tokens.get("account_id")),
-            expires_at=expires_at,
-        )
-        id_token = tokens.get("id_token")
-        if isinstance(id_token, str):
-            creds["id_token"] = id_token
-        return creds
+        return record
 
     @classmethod
     def save(
@@ -686,46 +799,28 @@ class OpenAISubscription:
         *,
         account: str | None = None,
     ) -> None:
-        """Persist credentials in Codex CLI-compatible format.
+        """Persist SIWC credentials atomically with owner-only mode.
 
         Args:
-          creds: OAuth credentials to persist.
-          path: Explicit file path, or ``None`` for default.
-          account: Named credential slot. ``None`` writes to the active Codex
-            ``auth.json`` under ``$CODEX_HOME`` or ``~/.codex``.
+          creds: SIWC credential record to persist.
+          path: Explicit record path, or ``None`` for the account slot.
+          account: Named credential slot.
 
         """
         p = path or credentials_path(_default_credentials_path(), account)
-        existing: dict[str, MutablePlainTree] = {}
-        if p.exists():
-            with contextlib.suppress(json.JSONDecodeError, OSError):
-                decoded: object = json.loads(p.read_text(encoding="utf-8"))
-                # Shape-checked, not just parse-checked: valid JSON of the
-                # wrong shape (a list, or ``tokens`` as a list) would raise
-                # below and leave the caller unable to persist a re-login.
-                if isinstance(decoded, dict):
-                    existing = cast(dict[str, MutablePlainTree], decoded)
-        raw_tokens = existing.get("tokens")
-        tokens = raw_tokens if isinstance(raw_tokens, dict) else {}
-        tokens["access_token"] = creds["access_token"]
-        tokens["refresh_token"] = creds["refresh_token"]
-        tokens["account_id"] = creds["account_id"]
-        id_token = creds.get("id_token", "")
-        if id_token:
-            tokens["id_token"] = id_token
-        existing["auth_mode"] = "chatgpt"
-        existing["tokens"] = tokens
-        atomic_write_bytes(p, json.dumps(existing).encode(), file_mode=0o600)
+        siwc.save_record(creds, p)
 
 
 class _OpenAISubModel(_OpenAIResponsesModel):
-    """OAuth retry and Codex-specific request restrictions."""
+    """OAuth retry and plan-usage request restrictions."""
 
     _provider: OpenAISubscription
 
     @override
     def _build_kwargs(self, request: ModelRequest) -> ResponseCreateParamsStreaming:
         body = super()._build_kwargs(request)
+        # SIWC preview limitations: temperature and max_output_tokens are
+        # omitted from the plan-backed Responses wire contract.
         body.pop("temperature", None)
         body.pop("max_output_tokens", None)
         return body
@@ -740,30 +835,73 @@ class _OpenAISubModel(_OpenAIResponsesModel):
             return await super().stream(request, publish)
         except openai.AuthenticationError:
             await self._provider.handle_auth_error()
+        except openai.APIStatusError as e:
+            mapped = _plan_usage_error(e)
+            if mapped is not None:
+                raise mapped from e
+            raise
         return await super().stream(request, publish)
 
 
-def _token_expiry(access_token: str, grant: dict[str, MutablePlainTree]) -> float:
-    """Return the token's JWT ``exp``, else the grant's ``expires_in`` from now."""
-    # ``exp`` wins because ``load`` re-derives expiry from the token alone; a
-    # local-clock deadline would disagree with it under clock skew.
+def _plan_usage_error(
+    error: openai.APIStatusError,
+) -> siwc.SubscriptionUsageError | None:
+    """Map a documented SIWC plan-usage error code to polished recovery text.
+
+    Args:
+      error: Status error raised by the Responses request.
+
+    Returns:
+      mapped: A user-facing error for a documented ``subscription_sharing``
+        code, or ``None`` to let the original propagate (transient 503
+        availability codes keep the provider's retry behavior).
+
+    """
+    text = str(error)
+    for code, message in siwc.PLAN_ERROR_RECOVERY.items():
+        if code in text:
+            return siwc.SubscriptionUsageError(code, message)
+    return None
+
+
+def _grant_expiry(access_token: str, expires_in: float) -> float:
+    """Return the access token's deadline: JWT ``exp``, else grant lifetime.
+
+    ``exp`` wins because ``_record_expiry`` re-derives expiry from the
+    token alone; a local-clock deadline would disagree with it under
+    clock skew.
+    """
     expires_at = _jwt_exp(access_token)
     if expires_at > 0:
         return expires_at
-    expires_in = from_plain(grant.get("expires_in"), float, default=0.0)
-    if expires_in <= 0:
-        # A zero deadline reads as always expired: every request would refresh
-        # and rotate the refresh token.
-        raise AuthRefreshError(
-            "OpenAI issued an access token with no expiry. Run /login to "
-            "re-authenticate.",
-        )
-    return time.time() + expires_in
+    # Defensive only: siwc grant parsing rejects non-positive lifetimes.
+    return time.time() + expires_in if expires_in > 0 else 0.0
+
+
+def _record_expiry(record: siwc.SIWCCredentials) -> float:
+    """Derive the access token deadline from a stored record.
+
+    ``exp`` from the token itself when present (robust to save-time clock
+    skew); otherwise ``saved_at + expires_in``; otherwise ``0.0`` so the
+    provider treats the token as expired and refreshes on first use.
+    """
+    expires_at = _jwt_exp(record.get("access_token", ""))
+    if expires_at > 0:
+        return expires_at
+    saved_at = record.get("saved_at", "")
+    expires_in = record.get("expires_in", 0.0)
+    if saved_at and expires_in > 0:
+        try:
+            saved = datetime.fromisoformat(saved_at)
+        except ValueError:
+            return 0.0
+        return saved.timestamp() + expires_in
+    return 0.0
 
 
 # Every JWT read below is lenient: a token the issuer shaped unexpectedly reads as
-# "no claim", never as an exception, so ``load`` keeps its ``ValueError`` contract
-# and the refresh paths stay reachable.
+# "no claim", never as an exception, so callers keep their error contracts and the
+# refresh paths stay reachable.
 def _jwt_payload(token: str) -> dict[str, object]:
     """Decode JWT payload without verification."""
     parts = token.split(".")
@@ -783,17 +921,3 @@ def _jwt_exp(token: str) -> float:
         return from_plain(_jwt_payload(token).get("exp"), float, default=0.0)
     except ReadError:
         return 0.0
-
-
-def _jwt_claim(token: str, namespace: str, key: str) -> str:
-    """Extract a nested string claim from a JWT namespace object."""
-    try:
-        claims = from_plain(
-            _jwt_payload(token).get(namespace),
-            dict[str, object],
-            default={},
-        )
-    except ReadError:
-        return ""
-    claim = claims.get(key)
-    return claim if isinstance(claim, str) else ""

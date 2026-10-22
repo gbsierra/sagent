@@ -327,6 +327,60 @@ def test_callback_without_a_code_is_an_error() -> None:
     listener.stop()
 
 
+def test_auth_code_listener_captures_callback_query_params() -> None:
+    """A successful callback's full query is readable via ``query_param``.
+
+    SIWC registrations return the issued ``client_id`` in the callback
+    query alongside the code; the shared listener must expose it without
+    protocol-specific subclassing.
+    """
+    listener = AuthCodeListener("expected")
+    listener.start()
+    try:
+        with request.urlopen(  # noqa: S310 -- The test exercises the OAuth localhost callback transport, whose URL is fixed by the protocol and never user-controlled.
+            f"{listener.redirect_uri}?code=abc&state=expected&client_id=oaiapp_test",
+            timeout=5,
+        ) as response:
+            assert response.status == 200
+        assert listener.query_param("client_id") == "oaiapp_test"
+        assert listener.query_param("code") == "abc"
+        assert listener.query_param("missing") == ""
+        assert listener.wait(1.0) == "abc"
+    finally:
+        listener.stop()
+
+
+def test_auth_code_listener_query_param_defaults_to_empty() -> None:
+    """Before any callback, every ``query_param`` reads as ``""``."""
+    listener = AuthCodeListener("state", port=0)
+    listener.start()
+    try:
+        assert listener.query_param("client_id") == ""
+    finally:
+        listener.stop()
+
+
+def test_auth_code_listener_state_mismatch_is_rejected() -> None:
+    """A wrong ``state`` 400s and surfaces "state mismatch" on ``wait``.
+
+    The comparison is constant-time (``hmac.compare_digest``), mirroring
+    the DevKit's callback handler; behavior for wrong state is unchanged.
+    """
+    listener = AuthCodeListener("expected")
+    listener.start()
+    try:
+        with pytest.raises(error.HTTPError) as raised:
+            request.urlopen(  # noqa: S310 -- The test exercises the OAuth localhost callback transport, whose URL is fixed by the protocol and never user-controlled.
+                f"{listener.redirect_uri}?code=abc&state=wrong",
+                timeout=5,
+            ).close()
+        assert raised.value.code == 400
+        with pytest.raises(RuntimeError, match="state mismatch"):
+            _ = listener.wait(1.0)
+    finally:
+        listener.stop()
+
+
 if __name__ == "__main__":
     from sagent.lib.testing.main import test_main
 

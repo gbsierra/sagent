@@ -7,10 +7,6 @@ from typing import TYPE_CHECKING, cast
 
 import asyncio
 import inspect
-import json
-import os
-import tempfile
-import time
 
 import pytest
 
@@ -20,14 +16,14 @@ from sagent.providers.google.api import Google
 from sagent.providers.google.cli import (
     GoogleCLI,
     _dispatch_session_update,
+    _gemini_cli_home,
+    _google_subprocess_env,
     _GoogleCLIModel,
     _GoogleCLIProcState,
-    _read_expiry,
     _user_prompt_blocks,
 )
 from sagent.providers.lib.cli_respawn import hash_system
 from sagent.providers.lib.hotspare import HotSpare
-from sagent.providers.lib.mcp_bridge import ToolsBridge
 from sagent.providers.lib.subproc import (
     Subproc,
     SubprocessTransportError,
@@ -50,19 +46,14 @@ if TYPE_CHECKING:
     from sagent.lib.codec import MutablePlainTree
 
 
-_CRED_PAYLOAD: dict[str, object] = {
-    "access_token": "test-at",
-    "refresh_token": "test-rt",
-    "expiry_date": (time.time() + 3600) * 1000.0,
-}
+def _which_missing(_name: str) -> str | None:
+    """Pretend Gemini is not installed."""
+    return None
 
 
-def _write_creds(tmp_path: Path) -> Path:
-    """Write a fake credentials file into ``tmp_path`` and return its path."""
-    path = tmp_path / "oauth_creds.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(_CRED_PAYLOAD), encoding="utf-8")
-    return path
+def _which_gemini(_name: str) -> str:
+    """Return a stable fake Gemini executable path."""
+    return "/usr/bin/gemini"
 
 
 def test_google_cli_does_not_import_subscription_provider() -> None:
@@ -70,34 +61,10 @@ def test_google_cli_does_not_import_subscription_provider() -> None:
     assert "providers.google_sub" not in source
 
 
-def test_from_cli_requires_credentials(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """``from_credentials`` raises ``FileNotFoundError`` if no creds file exists."""
-    monkeypatch.setattr(
-        "sagent.providers.google.cli._CREDS_PATH",
-        tmp_path / "missing.json",
-    )
-    with pytest.raises(FileNotFoundError, match="no credentials"):
-        GoogleCLI.from_credentials()
-
-
 def test_from_cli_rejects_missing_executable(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
 ) -> None:
     """``from_credentials`` fails fast if ``gemini`` is not on ``PATH``."""
-    creds = _write_creds(tmp_path)
-    monkeypatch.setattr(
-        "sagent.providers.google.cli._CREDS_PATH",
-        creds,
-    )
-
-    def _which_missing(name: str) -> str | None:
-        del name
-        return None
-
     monkeypatch.setattr(
         "sagent.providers.google.cli.shutil.which",
         _which_missing,
@@ -106,73 +73,86 @@ def test_from_cli_rejects_missing_executable(
         GoogleCLI.from_credentials()
 
 
-def test_from_cli_with_credentials(
+def test_from_cli_with_native_login(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
 ) -> None:
-    """``from_credentials`` returns a configured provider when both creds + CLI exist."""
-    creds = _write_creds(tmp_path)
-    monkeypatch.setattr(
-        "sagent.providers.google.cli._CREDS_PATH",
-        creds,
-    )
-
-    def _which_gemini(name: str) -> str | None:
-        del name
-        return "/usr/bin/gemini"
-
     monkeypatch.setattr(
         "sagent.providers.google.cli.shutil.which",
         _which_gemini,
     )
     provider = GoogleCLI.from_credentials()
     assert provider.account is None
+    assert GoogleCLI.from_credentials(account="work").account == "work"
 
 
-def test_from_cli_rejects_malformed_credentials(
+def test_google_cli_login_runs_native_command(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    creds = tmp_path / "oauth_creds.json"
-    creds.write_text("", encoding="utf-8")
-    monkeypatch.setattr(
-        "sagent.providers.google.cli._CREDS_PATH",
-        creds,
-    )
+    """``/login`` delegates OAuth storage and refresh to Gemini CLI."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    captured: dict[str, object] = {}
 
-    def _which_gemini(name: str) -> str | None:
-        del name
-        return "/usr/bin/gemini"
+    def fake_run(*args: object, **kwargs: object) -> object:
+        captured["args"] = args
+        captured["env"] = kwargs["env"]
+        return type("Result", (), {"returncode": 0})()
 
     monkeypatch.setattr(
         "sagent.providers.google.cli.shutil.which",
         _which_gemini,
     )
-    with pytest.raises(ValueError, match="Invalid credentials"):
-        GoogleCLI.from_credentials()
+    monkeypatch.setattr(
+        "sagent.providers.google.cli.subprocess.run",
+        fake_run,
+    )
+
+    GoogleCLI.login(account="work")
+
+    assert captured["args"] == (["/usr/bin/gemini", "login"],)
+    env = cast(dict[str, str], captured["env"])
+    assert env["GEMINI_CLI_HOME"] == str(_gemini_cli_home("work"))
 
 
-def test_from_cli_rejects_credentials_missing_oauth_fields(
+def test_google_subprocess_env_keeps_native_home_and_isolates_auth(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    creds = tmp_path / "oauth_creds.json"
-    creds.write_text(json.dumps({}), encoding="utf-8")
-    monkeypatch.setattr(
-        "sagent.providers.google.cli._CREDS_PATH",
-        creds,
-    )
+    """Auth isolation uses the Gemini setting, not a copied temporary HOME."""
+    operator_home = str(tmp_path / "operator-home")
+    monkeypatch.setenv("HOME", operator_home)
+    monkeypatch.setenv("USERPROFILE", operator_home)
+    monkeypatch.setenv("GEMINI_CLI_HOME", "/operator/gemini")
+    config_home = tmp_path / "sagent-gemini-work"
+    system_path = tmp_path / "system.md"
 
-    def _which_gemini(name: str) -> str | None:
-        del name
-        return "/usr/bin/gemini"
+    env = _google_subprocess_env(config_home, system_path=system_path)
 
-    monkeypatch.setattr(
-        "sagent.providers.google.cli.shutil.which",
-        _which_gemini,
+    assert env["HOME"] == operator_home
+    assert env["USERPROFILE"] == operator_home
+    assert env["GEMINI_CLI_HOME"] == str(config_home)
+    assert env["GEMINI_SYSTEM_MD"] == str(system_path)
+    assert env["GEMINI_DEFAULT_AUTH_TYPE"] == "oauth-personal"
+    for key in (
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+    ):
+        monkeypatch.setenv(key, "not-a-real-secret")
+        assert key not in _google_subprocess_env(None)
+
+
+def test_gemini_cli_home_default_is_native_and_named_is_sagent_owned(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("GEMINI_CLI_HOME", str(tmp_path / "native"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
+    assert _gemini_cli_home(None) is None
+    assert _gemini_cli_home("default") is None
+    assert _gemini_cli_home("work") == (
+        tmp_path / "xdg" / "rekursiv-ai" / "sagent" / "gemini" / "work"
     )
-    with pytest.raises(ValueError, match="Invalid credentials"):
-        GoogleCLI.from_credentials()
 
 
 def test_from_key_delegates_to_google() -> None:
@@ -337,17 +317,6 @@ def test_approx_request_tokens_sums_user_and_assistant() -> None:
     estimate = model.approx_request_tokens(request)
     # ``len("a"*16) // 4 = 4`` + ``4 // 4 = 1`` + ``4 // 4 = 1`` = 6.
     assert estimate == 6
-
-
-def test_read_expiry_handles_missing_and_invalid(tmp_path: Path) -> None:
-    """``_read_expiry`` returns ``0`` for missing, malformed, or non-numeric files."""
-    target = tmp_path / "creds.json"
-    target.write_text("{}", encoding="utf-8")
-    assert _read_expiry(target) == 0.0
-    target.write_text("not json", encoding="utf-8")
-    assert _read_expiry(target) == 0.0
-    target.write_text(json.dumps({"expiry_date": 12345.0}), encoding="utf-8")
-    assert _read_expiry(target) == pytest.approx(12345.0)
 
 
 def test_should_respawn_triggers() -> None:
@@ -657,7 +626,7 @@ async def test_exchange_turn_skips_assistant_replay(
 
 
 @pytest.mark.asyncio
-async def test_stream_writeback_failure_returns_response(
+async def test_stream_returns_response_without_credential_writeback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     provider = GoogleCLI()
@@ -688,15 +657,11 @@ async def test_stream_writeback_failure_returns_response(
         text_parts.append("ok")
         return "end_turn"
 
-    async def writeback_credentials() -> None:
-        raise OSError("credential writeback failed")
-
     user = UserMessage(text="hi")
     model._system_hash = hash_system("")
     model._session_id = "session"
     monkeypatch.setattr(model, "_hot_spare", _HotSpare())
     monkeypatch.setattr(model, "_send_prompt", send_prompt)
-    monkeypatch.setattr(model, "_writeback_credentials", writeback_credentials)
 
     response = await model.stream(ModelRequest(messages=[user]))
 
@@ -960,32 +925,6 @@ async def test_handshake_failure_is_a_transport_error(
         await cli._rpc_call(cast(Subproc, _Proc()), 1, "initialize", {})
 
 
-@pytest.mark.asyncio
-async def test_spawn_removes_tmpdir_when_population_fails(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    monkeypatch.setattr(
-        "sagent.providers.google.cli._CREDS_PATH",
-        tmp_path / "missing.json",
-    )
-    made: list[Path] = []
-    real_mkdtemp = tempfile.mkdtemp
-
-    def _tracking_mkdtemp(**kwargs: str) -> str:
-        path = real_mkdtemp(dir=tmp_path, **kwargs)
-        made.append(Path(path))
-        return path
-
-    monkeypatch.setattr(tempfile, "mkdtemp", _tracking_mkdtemp)
-    model = GoogleCLI().model("gemini-2.5-flash")
-    model._tools_bridge = cast(ToolsBridge, object())
-    with pytest.raises(ValueError, match="Invalid credentials"):
-        await model._spawn_initialized()
-    assert made
-    assert not any(path.exists() for path in made)
-
-
 def test_build_response_estimates_tokens_and_cost() -> None:
     """The Code Assist response is reconstructed with estimated usage + cost."""
     provider = GoogleCLI()
@@ -1023,94 +962,6 @@ def test_build_response_normalizes_acp_stop_reasons(raw: str, accepted: bool) ->
     else:
         with pytest.raises(ModelTerminationError):
             validate_model_response(response)
-
-
-@pytest.mark.asyncio
-async def test_writeback_credentials_atomic_and_0o600(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """Writeback is atomic (failure leaves target untouched) and target is ``0o600``.
-
-    With ``shutil.copyfile`` the destination is created and partially
-    written before any failure; a mid-write crash leaves a corrupt
-    file. ``atomic_write_bytes`` writes to a tmp sibling and renames,
-    so a mid-write crash never disturbs ``target``.
-    """
-    monkeypatch.setattr(
-        "sagent.providers.google.cli._CREDS_PATH",
-        tmp_path / "home" / ".gemini" / "oauth_creds.json",
-    )
-    provider = GoogleCLI()
-    model = provider.model("gemini-2.5-flash")
-    src_dir = tmp_path / "sandbox" / ".gemini"
-    src_dir.mkdir(parents=True)
-    src = src_dir / "oauth_creds.json"
-    src.write_text(json.dumps(_CRED_PAYLOAD), encoding="utf-8")
-    model._tmpdir = tmp_path / "sandbox"
-    target = tmp_path / "home" / ".gemini" / "oauth_creds.json"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    sentinel = json.dumps({"existing": "do not clobber"})
-    target.write_text(sentinel, encoding="utf-8")
-    target.chmod(0o600)
-    later = (time.time() + 7200) * 1000.0
-    src.write_text(
-        json.dumps({**_CRED_PAYLOAD, "expiry_date": later}),
-        encoding="utf-8",
-    )
-
-    real_open = os.open
-
-    def _flaky_open(path: str, flags: int, mode: int = 0o777) -> int:
-        if str(path).startswith(str(target)):
-            raise OSError("simulated disk full")
-        return real_open(path, flags, mode)
-
-    with monkeypatch.context() as fail_open:
-        fail_open.setattr(
-            "sagent.lib.atomic_file.os.open",
-            _flaky_open,
-        )
-        with pytest.raises(OSError, match="simulated disk full"):
-            await model._writeback_credentials()
-    assert target.read_text(encoding="utf-8") == sentinel
-    leftover = list(target.parent.glob(f"{target.name}.tmp.*"))
-    assert leftover == [], f"non-atomic writeback left tmp files: {leftover}"
-
-    await model._writeback_credentials()
-    assert (target.stat().st_mode & 0o777) == 0o600
-    assert json.loads(target.read_text(encoding="utf-8"))["expiry_date"] == (
-        pytest.approx(later)
-    )
-
-
-def test_writeback_credentials_works_across_event_loops(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """A model whose lock was first used in loop A still works in loop B."""
-    monkeypatch.setattr(
-        "sagent.providers.google.cli._CREDS_PATH",
-        tmp_path / "home" / ".gemini" / "oauth_creds.json",
-    )
-    provider = GoogleCLI()
-    model = provider.model("gemini-2.5-flash")
-    src_dir = tmp_path / "sandbox" / ".gemini"
-    src_dir.mkdir(parents=True)
-    src = src_dir / "oauth_creds.json"
-    src.write_text(json.dumps(_CRED_PAYLOAD), encoding="utf-8")
-    model._tmpdir = tmp_path / "sandbox"
-
-    asyncio.run(model._writeback_credentials())
-    payload = dict(_CRED_PAYLOAD)
-    payload["expiry_date"] = (time.time() + 7200) * 1000.0
-    src.write_text(json.dumps(payload), encoding="utf-8")
-    asyncio.run(model._writeback_credentials())
-
-    target = tmp_path / "home" / ".gemini" / "oauth_creds.json"
-    assert json.loads(target.read_text(encoding="utf-8"))["expiry_date"] == (
-        pytest.approx(payload["expiry_date"])
-    )
 
 
 if __name__ == "__main__":

@@ -7,8 +7,11 @@ Sagent separates providers from models. A provider owns authentication and creat
 | Provider class | Environment variable | Default model | Utility model | Notes |
 | --- | --- | --- | --- | --- |
 | `Anthropic` | `ANTHROPIC_API_KEY` | `opus-5.5` | `sonnet-5.5` | Anthropic API-key provider; `best` resolves to `fable-5.1`. |
+| `AnthropicCLI` | native `claude` login | `opus-5.5` | `sonnet-5.5` | Claude Code subscription through `claude`; named accounts use `CLAUDE_CONFIG_DIR`. |
 | `OpenAI` | `OPENAI_API_KEY` | `sol-6.1` | `luna-6.0` | OpenAI API provider. |
+| `OpenAISubscription` | Sign in with ChatGPT | `sol-6.1` | `luna-6.0` | ChatGPT plan through OpenAI's official SIWC flow; named accounts keep one sign-in record each. |
 | `Google` | `GOOGLE_API_KEY` | `gemini-pro-3.1` | `gemini-flash-lite-3.5` | Google Gemini provider. |
+| `GoogleCLI` | native `gemini` login | `gemini-pro-3.1` | `gemini-flash-lite-3.5` | Gemini subscription through Gemini CLI; named accounts use `GEMINI_CLI_HOME`. |
 | `Moonshot` | `MOONSHOT_API_KEY` | `kimi-3.0` | `kimi-2.6` | OpenAI-compatible Kimi provider. |
 | `DashScope` | `DASHSCOPE_API_KEY` | `qwen-plus-3.7` | `qwen-flash-3.8` | Alibaba DashScope provider. |
 | `MiniMax` | `MINIMAX_API_KEY` | `minimax-3.0` | `minimax-3.0` | MiniMax provider. |
@@ -16,6 +19,46 @@ Sagent separates providers from models. A provider owns authentication and creat
 | `OpenAICompat` | subclass-defined | subclass-defined | subclass-defined | Base class for chat-completions-compatible APIs. |
 
 The public package is designed around API-key providers.
+
+## Vendor CLI authentication
+
+`AnthropicCLI` and `GoogleCLI` delegate authentication to the installed
+vendor CLI instead of managing a live token or refresh lifecycle:
+
+```bash
+sagent --provider AnthropicCLI login
+sagent --provider GoogleCLI login
+```
+
+Pass `--account NAME` to maintain a separate named login. The default account
+uses the vendor's existing configuration. Named Anthropic accounts use a
+sagent-owned `CLAUDE_CONFIG_DIR`; named Google accounts use a sagent-owned
+`GEMINI_CLI_HOME`. The CLI providers preserve the operator's `HOME` for native
+tools. GoogleCLI never copies OAuth files into temporary subprocess
+directories; AnthropicCLI only reads and validates a preexisting legacy file
+when migrating an older named account.
+
+## ChatGPT subscription authentication
+
+`OpenAISubscription` signs in with OpenAI's official "Sign in with
+ChatGPT" flow. Sagent is its own client: on first sign-in it registers
+with OpenAI, then it verifies the identity token OpenAI returns and
+stores one sign-in record per account in Sagent's data directory. It
+never borrows another tool's ChatGPT login.
+
+```bash
+sagent --provider OpenAISubscription login
+sagent --provider OpenAISubscription --account work login
+```
+
+Sagent prints a sign-in URL, you finish the sign-in in your browser, and
+Sagent waits for the redirect. Add `--headless` to paste the final URL
+back by hand instead. The sign-in page asks for ChatGPT plan usage; if
+you decline, the sign-in is saved but cannot drive inference until you
+sign in again and accept. Signing out through the Python API
+(`OpenAISubscription.logout`) revokes the refresh token with OpenAI and
+clears the local tokens while keeping the registration, so signing back
+in does not start a new one.
 
 ## Basic usage
 
