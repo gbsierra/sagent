@@ -614,6 +614,14 @@ def main() -> int:
 
 def _do_login(args: argparse.Namespace) -> None:
     """Run the OAuth flow for ``args.provider`` and save under ``args.account``."""
+    if args.provider is None:
+        sys.stderr.write("Error: --provider is required for login.\n")
+        sys.exit(1)
+    try:
+        args.provider = require_provider(args.provider)
+    except UnknownProviderError as exc:
+        sys.stderr.write(f"Error: {exc}\n")
+        sys.exit(1)
     cls = getattr(providers, args.provider, None)
     if cls is None:
         sys.stderr.write(f"Error: unknown provider {args.provider!r}\n")
@@ -636,18 +644,6 @@ def _do_login(args: argparse.Namespace) -> None:
         sys.stderr.write(f"[login] {args.provider} login completed for '{account}'.\n")
         return
     if login_fn is None or save_fn is None:
-        if args.provider == "AnthropicCLI":
-            if args.account not in (None, "default"):
-                sys.stderr.write(
-                    "Error: AnthropicCLI named accounts use legacy credential "
-                    "files and do not support interactive login.\n",
-                )
-                sys.exit(1)
-            sys.stderr.write(
-                "Error: AnthropicCLI uses the Claude CLI login. Run:\n"
-                "  claude auth login --claudeai\n",
-            )
-            sys.exit(1)
         sys.stderr.write(
             f"Error: {args.provider} does not support interactive login.\n",
         )
