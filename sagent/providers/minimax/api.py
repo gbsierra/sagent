@@ -25,6 +25,7 @@ from sagent.catalog.table import ModelCatalog
 from sagent.providers.openai.compat import (
     OpenAICompat,
     OpenAICompatModel,
+    prefer_max_completion_tokens,
 )
 
 
@@ -49,6 +50,11 @@ class _MiniMaxModel(OpenAICompatModel):
         # Without it, thinking stays "inside ``content`` wrapped in
         # ``<think>`` tags", which the parser would show as the answer.
         body["reasoning_split"] = True
+        # "Legacy generation length limit parameter. Deprecated; use
+        # ``max_completion_tokens`` instead." -- the API reference's one
+        # output-cap field, for every MiniMax model; no row offers an
+        # effort, so the base always picks the deprecated spelling.
+        prefer_max_completion_tokens(body)
         # Only M3 offers a switch; M2.x accepts ``disabled`` but ignores it,
         # so its rows offer nothing to send.
         if self.capability.thinking.control != "budget":

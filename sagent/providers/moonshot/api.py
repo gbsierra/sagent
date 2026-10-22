@@ -18,19 +18,23 @@ DeepSeek/DashScope). Tool-calling uses the standard ``tool_calls`` block.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, ClassVar, override
+from typing import TYPE_CHECKING, ClassVar, cast, override
 
 from sagent.catalog.moonshot import models
 from sagent.catalog.openai import compatible
 from sagent.catalog.table import ModelCatalog
+from sagent.providers.moonshot.wire import tool_schema
 from sagent.providers.openai.compat import (
     OpenAICompat,
     OpenAICompatModel,
+    prefer_max_completion_tokens,
 )
 
 
 if TYPE_CHECKING:
-    from sagent.lib.codec import MutablePlainTree
+    from collections.abc import Mapping
+
+    from sagent.lib.codec import MutablePlainTree, PlainTree
     from sagent.types.model import ModelRequest
 
 
@@ -51,6 +55,11 @@ class _MoonshotModel(OpenAICompatModel):
         # "temperature is not modifiable -- use the default and do not pass
         # it explicitly".
         body.pop("temperature", None)
+        # Every request schema lists ``max_tokens`` only as "Deprecated,
+        # please refer to max_completion_tokens" (ChatRequestCommon for K3,
+        # ChatRequestBase for K2.x); the base picks the field by the row's
+        # effort, which is OpenAI's rule rather than Kimi's.
+        prefer_max_completion_tokens(body)
         # The base folds ``max`` onto OpenAI's ``high``; K3 takes the level
         # verbatim, and its row offers only levels the wire spells.
         if (
@@ -64,6 +73,18 @@ class _MoonshotModel(OpenAICompatModel):
             body["thinking"] = {
                 "type": "disabled" if not self.settings.thinking_active else "enabled",
             }
+        # ``parameters`` must conform to MFJS, not full JSON Schema, so each
+        # tool's schema is projected on the way out; the base already gave
+        # every request its own mutable copy.
+        tools = cast(
+            "list[dict[str, MutablePlainTree]]",
+            body.get("tools") or [],
+        )
+        for tool in tools:
+            function = cast("dict[str, MutablePlainTree]", tool["function"])
+            function["parameters"] = tool_schema(
+                cast("Mapping[str, PlainTree]", function["parameters"]),
+            )
         return body
 
 

@@ -1,11 +1,14 @@
-"""Tests for the Gemini thinking wire."""
+"""Tests for the Gemini thinking and tool-schema wire."""
 
 from __future__ import annotations
+
+from collections.abc import Mapping
 
 import pytest
 
 from sagent.catalog import google
-from sagent.providers.google.wire import thinking_config
+from sagent.lib.codec import immutable
+from sagent.providers.google.wire import thinking_config, tool_schema
 from sagent.types.capability import (
     ModelSettings,
     ThinkingBudget,
@@ -74,6 +77,104 @@ def test_default_effort_leaves_the_models_default_in_place(model_id: str) -> Non
 
 def test_budget_none_sends_no_thinking_config() -> None:
     assert _wire("gemini-2.5-flash", budget="none") is None
+
+
+def test_tool_schema_drops_additional_properties_recursively() -> None:
+    """``additionalProperties`` is not a Schema proto field, at any depth."""
+    schema = immutable(
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "nested": {"type": "object", "additionalProperties": False},
+            },
+            "items": [{"additionalProperties": False, "type": "string"}],
+        },
+    )
+    wire = tool_schema(schema)
+    properties = wire["properties"]
+    assert isinstance(properties, dict)
+    nested = properties["nested"]
+    assert isinstance(nested, dict)
+    assert "additionalProperties" not in wire
+    assert "additionalProperties" not in nested
+    items = wire["items"]
+    assert isinstance(items, list)
+    assert "additionalProperties" not in items[0]
+
+
+def test_tool_schema_collapses_a_type_array_to_its_first_member() -> None:
+    """``["array", "string"]`` has no proto spelling; the array is kept.
+
+    The paper tools declare ``ids`` this way so one bare id or many are both
+    legal, and that union is what ``validate_tool_input`` still accepts.
+    """
+    schema = immutable(
+        {
+            "type": "object",
+            "properties": {
+                "ids": {
+                    "type": ["array", "string"],
+                    "items": {"type": "string"},
+                    "description": "One id, or several.",
+                },
+            },
+            "required": ["ids"],
+        },
+    )
+    assert tool_schema(schema) == {
+        "type": "object",
+        "properties": {
+            "ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "One id, or several.",
+            },
+        },
+        "required": ["ids"],
+    }
+
+
+def test_tool_schema_turns_a_null_member_into_nullable() -> None:
+    """A nullable union is the one union the proto can say."""
+    schema = immutable({"type": ["string", "null"], "description": "Optional."})
+    assert tool_schema(schema) == {
+        "type": "string",
+        "nullable": True,
+        "description": "Optional.",
+    }
+
+
+def test_tool_schema_keeps_a_property_named_additional_properties() -> None:
+    """Only the schema key is dropped, never a property whose name matches."""
+    schema = immutable(
+        {
+            "type": "object",
+            "properties": {"additionalProperties": {"type": "boolean"}},
+        },
+    )
+    wire = tool_schema(schema)
+    properties = wire["properties"]
+    assert isinstance(properties, dict)
+    assert properties["additionalProperties"] == {"type": "boolean"}
+
+
+def test_tool_schema_leaves_the_shared_directive_schema_untouched() -> None:
+    """One frozen schema is reused by every request; the narrowing is a copy."""
+    schema = immutable(
+        {
+            "type": "object",
+            "properties": {"ids": {"type": ["array", "string"]}},
+            "additionalProperties": False,
+        },
+    )
+    tool_schema(schema)
+    properties = schema["properties"]
+    assert isinstance(properties, Mapping)
+    ids = properties["ids"]
+    assert isinstance(ids, Mapping)
+    assert ids["type"] == ("array", "string")
+    assert schema["additionalProperties"] is False
 
 
 if __name__ == "__main__":

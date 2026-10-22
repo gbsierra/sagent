@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Final, Protocol, cast, override
 
 import asyncio
 import base64
+import contextlib
 import json
 import logging
 import math
@@ -42,7 +43,7 @@ else:
 from sagent.catalog.google import api, models
 from sagent.catalog.table import ModelCatalog
 from sagent.lib.codec import MutablePlainTree, from_plain, mutable
-from sagent.providers.google.wire import thinking_config
+from sagent.providers.google.wire import thinking_config, tool_schema
 from sagent.providers.lib.errors import (
     error_status_code,
     is_context_overflow_text,
@@ -259,6 +260,8 @@ class _GeminiModel(ModelDefaults):
             timeout=60.0,
         )
         raise_for_gemini_status(r.status_code, r.text)
+        if 400 <= r.status_code < 500:
+            raise gemini_status_error(r, r.text)
         r.raise_for_status()
         return from_plain(
             cast(dict[str, MutablePlainTree], r.json()).get("totalTokens"),
@@ -320,10 +323,9 @@ class _GeminiModel(ModelDefaults):
             timeout=httpx2.Timeout(_STREAM_IDLE_TIMEOUT, connect=30.0),
         ) as r:
             if 400 <= r.status_code < 500:
-                raise_for_gemini_status(
-                    r.status_code,
-                    (await r.aread()).decode(errors="replace"),
-                )
+                body = (await r.aread()).decode(errors="replace")
+                raise_for_gemini_status(r.status_code, body)
+                raise gemini_status_error(r, body)
             r.raise_for_status()
             return await _consume_gemini_stream(
                 r,
@@ -359,7 +361,7 @@ def raise_for_gemini_status(status: int, body: str) -> None:
     Shared by every Gemini HTTP transport so the classification lives once,
     on the cross-vendor phrase set rather than a bare "too long" match that
     also fires on tool-schema validation errors. Non-overflow statuses fall
-    through to the caller's ``raise_for_status``.
+    through to :func:`gemini_status_error`.
 
     Args:
       status: HTTP status of the failing response.
@@ -377,20 +379,40 @@ def raise_for_gemini_status(status: int, body: str) -> None:
         raise PromptTooLongError(body)
 
 
-def _strip_additional_properties(schema: MutablePlainTree) -> MutablePlainTree:
-    """Remove ``additionalProperties`` recursively for Gemini tool schemas."""
-    if isinstance(schema, dict):
-        return {
-            k: _strip_additional_properties(v)
-            for k, v in schema.items()
-            if k != "additionalProperties"
-        }
-    if isinstance(schema, list):
-        return cast(
-            MutablePlainTree,
-            [_strip_additional_properties(item) for item in schema],
-        )
-    return schema
+def gemini_status_error(response: httpx2.Response, body: str) -> httpx2.HTTPStatusError:
+    """Return the exception a Gemini 4xx deserves, carrying the vendor's words.
+
+    ``raise_for_status`` alone reports only "400 Bad Request": Gemini names the
+    field it refused in ``error.message``, and a rejected request cannot be
+    diagnosed without that sentence. The response stays attached, so the raw
+    body is still reachable from the exception.
+
+    Args:
+      response: The failing response.
+      body: Decoded response body.
+
+    Returns:
+      error: The status error to raise.
+
+    """
+    return httpx2.HTTPStatusError(
+        _gemini_error_message(response.status_code, body),
+        request=response.request,
+        response=response,
+    )
+
+
+def _gemini_error_message(status: int, body: str) -> str:
+    """Return Gemini's own ``error.message``, else the body, else the status."""
+    with contextlib.suppress(json.JSONDecodeError, AttributeError, TypeError):
+        parsed: object = json.loads(body)
+        if isinstance(parsed, dict):
+            error = parsed.get("error")
+            if isinstance(error, dict):
+                message = error.get("message")
+                if isinstance(message, str) and message:
+                    return f"HTTP {status}: {message}"
+    return body or f"HTTP {status}"
 
 
 # Gemini groups consecutive ``functionResponse`` parts into one ``role=user`` content.
@@ -510,12 +532,7 @@ def _build_request(
                     {
                         "name": t.name,
                         "description": t.description,
-                        "parameters": _strip_additional_properties(
-                            cast(
-                                MutablePlainTree,
-                                mutable(t.directive_schema),
-                            ),
-                        ),
+                        "parameters": tool_schema(t.directive_schema),
                     }
                     for t in request.tools
                 ],

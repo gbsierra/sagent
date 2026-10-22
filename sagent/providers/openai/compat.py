@@ -444,6 +444,28 @@ class OpenAICompat:
         """Do nothing: each model owns and closes its own client."""
 
 
+def prefer_max_completion_tokens(body: dict[str, MutablePlainTree]) -> None:
+    """Move the output cap onto ``max_completion_tokens``, in place.
+
+    ``_build_body`` picks between the two spellings by whether the row
+    offers an effort, which is OpenAI's rule; vendors that deprecate the
+    older field for every model call this from ``_transform_body`` so the
+    effort heuristic cannot send the deprecated spelling. Kimi lists
+    ``max_tokens`` as "Deprecated, please refer to max_completion_tokens"
+    on every request schema, and MiniMax as "Legacy generation length
+    limit parameter. Deprecated; use ``max_completion_tokens`` instead."
+
+    Args:
+      body: The request body whose cap field is renamed.
+
+    """
+    cap = body.pop("max_tokens", None)
+    if cap is None:
+        cap = body.pop("max_completion_tokens", None)
+    if cap is not None:
+        body["max_completion_tokens"] = cap
+
+
 def build_messages(
     request: ModelRequest,
     max_image_dim: int = 0,

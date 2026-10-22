@@ -10,6 +10,7 @@ from sagent.providers.minimax.api import MiniMax, _MiniMaxModel
 from sagent.types.capability import ModelSettings, ThinkingBudget
 from sagent.types.cost import PriceKey
 from sagent.types.model import ModelRequest
+from sagent.types.runtime import UserMessage
 
 
 if TYPE_CHECKING:
@@ -91,6 +92,28 @@ def test_m3_sends_its_thinking_switch(budget: ThinkingBudget, wire: str) -> None
 
 def test_m2_sends_no_thinking_switch_it_would_ignore() -> None:
     assert "thinking" not in _body("MiniMax-M2.7")
+
+
+@pytest.mark.parametrize("model_id", sorted(MiniMax.catalog.models))
+def test_the_output_cap_leaves_the_deprecated_spelling(model_id: str) -> None:
+    """``max_tokens`` is "Legacy ... Deprecated; use ``max_completion_tokens``".
+
+    No MiniMax row offers an effort, so the base builder always picks the
+    deprecated field; MiniMax's API reference documents the modern one for
+    every model ("recommended value is 131072 ... maximum is 524288" for
+    M3, "65536 ... 204800" for the rest).
+    """
+    m = cast(_MiniMaxModel, MiniMax.from_key("k").model(model_id))
+    m._settings = ModelSettings.narrowest(m.capability)
+    body = m._build_body(
+        ModelRequest(
+            messages=[UserMessage(text="x")],
+            max_response_tokens=512,
+        ),
+        stream=False,
+    )
+    assert body["max_completion_tokens"] == 512
+    assert "max_tokens" not in body
 
 
 def test_m3_priority_tier_survives_the_transport() -> None:

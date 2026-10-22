@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import replace
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import json
 import logging
@@ -12,12 +12,12 @@ import logging
 import httpx2
 import pytest
 
-from sagent.lib.codec import MutablePlainTree, PlainTree, from_plain, loads
+from sagent.bin.cli import DEFAULT_TOOLS, resolve_tools
+from sagent.lib.codec import MutablePlainTree, PlainTree, from_plain, immutable, loads
 from sagent.providers.google.api import (
     Google,
     _build_request,
     _build_response,
-    _strip_additional_properties,
 )
 from sagent.types.capability import (
     ModelCapability,
@@ -51,42 +51,6 @@ from sagent.types.runtime import (
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
-
-
-def test_strip_additional_properties_removes_top_level_key() -> None:
-    schema: MutablePlainTree = {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {"a": 1},
-    }
-    out = cast(dict[str, MutablePlainTree], _strip_additional_properties(schema))
-    assert "additionalProperties" not in out
-    assert out["type"] == "object"
-
-
-def test_strip_additional_properties_recurses_into_lists_and_dicts() -> None:
-    schema: MutablePlainTree = {
-        "type": "object",
-        "properties": {
-            "nested": {
-                "additionalProperties": False,
-                "type": "object",
-            },
-        },
-        "items": [{"additionalProperties": False}],
-    }
-    out = cast(dict[str, MutablePlainTree], _strip_additional_properties(schema))
-    nested = cast(
-        dict[str, MutablePlainTree],
-        cast(dict[str, MutablePlainTree], out["properties"])["nested"],
-    )
-    assert "additionalProperties" not in nested
-    items_list = from_plain(out["items"], list[dict[str, MutablePlainTree]])
-    assert "additionalProperties" not in items_list[0]
-
-
-def test_strip_additional_properties_scalar_passthrough() -> None:
-    assert _strip_additional_properties(cast(MutablePlainTree, "x")) == "x"
 
 
 def _make_request(messages: list[ModelContextEvent], **kw: object) -> ModelRequest:
@@ -824,6 +788,42 @@ async def test_google_stream_400_other_raises_http_status_error() -> None:
     with pytest.raises(httpx2.HTTPStatusError) as raised:
         await m.stream(ModelRequest(messages=[UserMessage(text="x")]))
     assert raised.value.response.status_code == 400
+    # A body with no ``error.message`` still reaches the caller verbatim.
+    assert "malformed request body" in str(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_google_stream_400_reports_the_vendors_own_message() -> None:
+    """Gemini names the field it refused; a bare status hides the cause."""
+    payload = json.dumps(
+        {
+            "error": {
+                "code": 400,
+                "message": (
+                    "Invalid value at 'tools[0].function_declarations[9]"
+                    ".parameters.properties[6].value.type' (TYPE),"
+                    " \"['array', 'string']\""
+                ),
+                "status": "INVALID_ARGUMENT",
+            },
+        },
+    )
+
+    def handle(request: httpx2.Request) -> httpx2.Response:
+        del request
+        return httpx2.Response(
+            400,
+            text=payload,
+            headers={"Content-Type": "application/json"},
+        )
+
+    m = Google.from_key("k").model("gemini-2.5-flash")
+    m._client = httpx2.AsyncClient(transport=httpx2.MockTransport(handle))
+    with pytest.raises(httpx2.HTTPStatusError) as raised:
+        await m.stream(ModelRequest(messages=[UserMessage(text="x")]))
+    assert "Invalid value at" in str(raised.value)
+    assert "properties[6].value.type" in str(raised.value)
+    assert raised.value.response.status_code == 400
 
 
 @pytest.mark.asyncio
@@ -884,6 +884,87 @@ def test_build_request_tools_strip_additional_properties() -> None:
     )
     schema = from_plain(fns[0]["parameters"], dict[str, MutablePlainTree])
     assert "additionalProperties" not in schema
+
+
+class _UnionTool(_StubTool):
+    """Tool whose directive schema uses a JSON Schema type array."""
+
+    name = "Ids"
+    directive_schema: Mapping[str, PlainTree] = immutable(
+        {
+            "type": "object",
+            "properties": {
+                "ids": {"type": ["array", "string"], "items": {"type": "string"}},
+            },
+            "required": ["ids"],
+        },
+    )
+
+
+def _declaration_of(tool: object) -> dict[str, MutablePlainTree]:
+    """Return the one function declaration a request builds for ``tool``."""
+    body = _wire(
+        ModelRequest(messages=[UserMessage(text="hi")], tools=[cast(Any, tool)])
+    )
+    tools_section = from_plain(body["tools"], list[dict[str, MutablePlainTree]])
+    declarations = from_plain(
+        tools_section[0]["functionDeclarations"],
+        list[dict[str, MutablePlainTree]],
+    )
+    return declarations[0]
+
+
+def test_build_request_narrows_a_type_array_for_gemini() -> None:
+    """A union the proto cannot spell is narrowed, not dropped or rejected."""
+    parameters = from_plain(
+        _declaration_of(_UnionTool())["parameters"],
+        dict[str, MutablePlainTree],
+    )
+    properties = from_plain(parameters["properties"], dict[str, MutablePlainTree])
+    ids = from_plain(properties["ids"], dict[str, MutablePlainTree])
+    assert ids["type"] == "array"
+    assert from_plain(ids["items"], dict[str, MutablePlainTree]) == {"type": "string"}
+
+
+def _proto_offences(node: object, path: str) -> list[str]:
+    """Return where a schema uses something Gemini's Schema proto has no field for."""
+    if isinstance(node, list):
+        return [
+            offence
+            for index, item in enumerate(node)
+            for offence in _proto_offences(item, f"{path}[{index}]")
+        ]
+    if not isinstance(node, dict):
+        return []
+    offences = [f"{path}.{key}" for key in ("additionalProperties",) if key in node]
+    if isinstance(node.get("type"), list):
+        offences.append(f"{path}.type={node['type']!r}")
+    for key, value in node.items():
+        offences.extend(_proto_offences(value, f"{path}.{key}"))
+    return offences
+
+
+def test_google_default_tool_declarations_stay_inside_the_proto() -> None:
+    """Every default tool's schema survives into a body Gemini accepts.
+
+    ``type`` is one enum in Gemini's Schema proto, so a JSON Schema type array
+    such as the paper tools' ``["array", "string"]`` ids is a 400 for the whole
+    request. This drives the real tool set through the real body builder.
+    """
+    tools = resolve_tools(list(DEFAULT_TOOLS))
+    body = _wire(ModelRequest(messages=[UserMessage(text="hi")], tools=tuple(tools)))
+    tools_section = from_plain(body["tools"], list[dict[str, MutablePlainTree]])
+    declarations = from_plain(
+        tools_section[0]["functionDeclarations"],
+        list[dict[str, MutablePlainTree]],
+    )
+    assert [d["name"] for d in declarations] == [t.name for t in tools]
+    offences = [
+        f"{declaration['name']}{path}"
+        for declaration in declarations
+        for path in _proto_offences(declaration["parameters"], "")
+    ]
+    assert offences == []
 
 
 def test_build_request_echoes_thought_signature() -> None:
