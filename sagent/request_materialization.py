@@ -96,6 +96,66 @@ def filter_request_modalities(
     return dataclasses.replace(request, messages=out)
 
 
+def unsupported_attachments(
+    attachments: tuple[BytesMessage, ...],
+    inputs: frozenset[InputModality],
+) -> list[BytesMessage]:
+    """Return the attachments a model/transport pair cannot receive.
+
+    The classifier :func:`filter_request_modalities` applies on the wire.
+    The Agent uses the same rule to warn when fresh input arrives, without
+    changing stored history, and to warn about older history before a send.
+
+    Args:
+      attachments: One entry's attachments.
+      inputs: Effective input modalities, after the catalog row is met
+          with the transport.
+
+    Returns:
+      unsupported: Attachments whose KNOWN modality family (image, pdf,
+          audio, video) ``inputs`` lacks. Unclassifiable descriptors are
+          absent: each encoder still holds the per-wire allow-list that
+          decides an exotic type such as ``image/svg+xml`` for the format
+          it names.
+
+    """
+    return [a for a in attachments if _is_unsupported(a, inputs)]
+
+
+def withheld_attachments(
+    messages: Sequence[ModelContextEvent],
+    inputs: frozenset[InputModality],
+) -> list[BytesMessage]:
+    """Return every attachment ``filter_request_modalities`` would withhold.
+
+    Lets a caller answer "what will this send drop?" with the wire's own
+    classifier instead of a re-implementation that can disagree with it.
+
+    Args:
+      messages: Conversation history (the resolved view this send ships).
+      inputs: Effective input modalities of the model this view ships to.
+
+    Returns:
+      withheld: User-, agent-, and tool-result attachments the filter
+          would drop, in encounter order.
+
+    """
+    withheld: list[BytesMessage] = []
+    for entry in messages:
+        if isinstance(entry, (UserMessage, AgentSendMessage, ToolResult)):
+            withheld.extend(unsupported_attachments(entry.attachments, inputs))
+    return withheld
+
+
+def _is_unsupported(
+    attachment: BytesMessage,
+    inputs: frozenset[InputModality],
+) -> bool:
+    """Whether a KNOWN modality family is missing from ``inputs``."""
+    modality = _attachment_modality(attachment.descriptor)
+    return modality is not None and modality not in inputs
+
+
 def _split_attachments(
     attachments: tuple[BytesMessage, ...],
     inputs: frozenset[InputModality],
@@ -109,11 +169,10 @@ def _split_attachments(
     kept: list[BytesMessage] = []
     dropped: list[str] = []
     for attachment in attachments:
-        modality = _attachment_modality(attachment.descriptor)
-        if modality is None or modality in inputs:
-            kept.append(attachment)
-        else:
+        if _is_unsupported(attachment, inputs):
             dropped.append(attachment.descriptor)
+        else:
+            kept.append(attachment)
     return tuple(kept), dropped
 
 

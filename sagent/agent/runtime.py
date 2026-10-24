@@ -790,6 +790,15 @@ class AgentRuntime:
         # predicate-evaluation time; an async one-directional event cannot
         # supply that. Same shape and rationale as ``before_tool_spawn``.
         self.has_pending_background: Callable[[], bool] | None = None
+        # Agent policy observes fresh human input before the runtime commits
+        # it. The hook may warn about attachments the current model cannot
+        # read, but the original event stays intact in history so a later
+        # model switch can use them. Tool results and agent-sent messages do
+        # not pass through this hook; the send-time filter handles them.
+        self.inspect_user_input: (
+            Callable[[UserMessage | UserQueuedMessage | UserDeferredMessage], None]
+            | None
+        ) = None
         # Lifted from run_forever locals for observer/REPL visibility.
         # Task[None]: tools/model post results to inbox, not via return.
         self.running_tools: dict[str, asyncio.Task[None]] = {}
@@ -1669,6 +1678,13 @@ class AgentRuntime:
                 self._was_idle = False
 
                 for item_idx, item in enumerate(items):
+                    # Warn at intake, but commit the original event unchanged.
+                    # Re-pushed slices below are inspected when re-drained.
+                    if self.inspect_user_input is not None and isinstance(
+                        item,
+                        (UserMessage, UserQueuedMessage, UserDeferredMessage),
+                    ):
+                        self.inspect_user_input(item)
                     match item:
                         case Quit():
                             logger.debug(

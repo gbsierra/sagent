@@ -11,6 +11,8 @@ from sagent.request_materialization import (
     _defer_user_between_tool_pair,
     materialize_messages,
     materialize_request,
+    unsupported_attachments,
+    withheld_attachments,
 )
 from sagent.types.model import ModelRequest
 from sagent.types.runtime import (
@@ -746,6 +748,36 @@ def test_materializing_without_inputs_leaves_attachments_alone() -> None:
     assert isinstance(entry, UserMessage)
     assert entry.attachments == (attachment,)
     assert entry.text == "hi"
+
+
+def test_unsupported_attachments_matches_the_wire_filter() -> None:
+    """The public classifier is the wire's own: no second opinion to drift."""
+    image = BytesMessage(data=b"png", descriptor="image/png")
+    pdf = BytesMessage(data=b"%PDF", descriptor="application/pdf")
+    opaque = BytesMessage(data=b"x", descriptor="application/octet-stream")
+
+    text_only = unsupported_attachments((image, pdf, opaque), frozenset({"text"}))
+    assert text_only == [image, pdf], "unknown MIME must pass through"
+
+    with_pdf = unsupported_attachments((image, pdf), frozenset({"text", "pdf"}))
+    assert with_pdf == [image]
+
+
+def test_withheld_attachments_scans_every_carrier_in_order() -> None:
+    """User, agent-send, and tool-result attachments are all covered."""
+    image = BytesMessage(data=b"png", descriptor="image/png")
+    pdf = BytesMessage(data=b"%PDF", descriptor="application/pdf")
+    audio = BytesMessage(data=b"wav", descriptor="audio/wav")
+    messages = [
+        UserMessage(text="look", attachments=(image,)),
+        AgentSendMessage(source="bob", text="and this", attachments=(pdf,)),
+        ToolResult(call_id="call_1", content="read", attachments=(audio,)),
+        AssistantMessage(text="not a carrier"),
+    ]
+
+    withheld = withheld_attachments(messages, frozenset({"text", "pdf"}))
+
+    assert withheld == [image, audio]
 
 
 if __name__ == "__main__":

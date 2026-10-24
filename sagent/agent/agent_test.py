@@ -7650,6 +7650,247 @@ async def test_a_model_that_reads_pdfs_receives_the_bytes_intact() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_withheld_attachment_warns_the_operator_once() -> None:
+    """The model is told in-band; the HUMAN is told via one advisory.
+
+    ``filter_request_modalities`` leaves the model a note so it can ask for a
+    supported representation, but nothing told the person who pasted the
+    payload that it never shipped -- their answer about a document the model
+    never received read as a wrong answer, not a missing one. The advisory
+    fires once per distinct payload: history carries an old attachment on
+    every later turn, so an unkeyed warning would repeat forever.
+    """
+    model = StubModel(
+        inputs=frozenset({"text"}),
+        responses=[AssistantMessage(text="ok"), AssistantMessage(text="ok")],
+    )
+    a = Agent(model=model, tools=[], compactor=None)
+    published: list[object] = []
+    a.runtime.observers.append(published.append)
+    a.runtime.append_history(
+        UserMessage(
+            text="summarize this",
+            attachments=(BytesMessage(b"%PDF-1.4", "application/pdf"),),
+        ),
+    )
+    for _ in range(2):
+        await a._agent_model.stream(
+            history=a.runtime.context().messages,
+            publish=lambda _ev: None,
+        )
+
+    notices = [e for e in published if isinstance(e, NoticeMessage)]
+    assert len(notices) == 1, "the same payload must warn once, not per turn"
+    assert notices[0].tier == "advisory"
+    assert "attachment withheld" in notices[0].text
+    assert "application/pdf" in notices[0].text
+    assert "supported inputs: text" in notices[0].text
+    assert model.model_id in notices[0].text
+
+
+@pytest.mark.asyncio
+async def test_a_distinct_withheld_payload_warns_again() -> None:
+    """Dedupe is per payload, not per session: a new file is a new warning."""
+    model = StubModel(
+        inputs=frozenset({"text"}),
+        responses=[AssistantMessage(text="ok"), AssistantMessage(text="ok")],
+    )
+    a = Agent(model=model, tools=[], compactor=None)
+    published: list[object] = []
+    a.runtime.observers.append(published.append)
+
+    for payload in (b"%PDF-1.4 one", b"%PDF-1.4 two"):
+        a.runtime.append_history(
+            UserMessage(
+                text="summarize this",
+                attachments=(BytesMessage(payload, "application/pdf"),),
+            ),
+        )
+        await a._agent_model.stream(
+            history=a.runtime.context().messages,
+            publish=lambda _ev: None,
+        )
+
+    notices = [e for e in published if isinstance(e, NoticeMessage)]
+    assert len(notices) == 2
+
+
+@pytest.mark.asyncio
+async def test_withheld_payload_warns_again_for_another_model() -> None:
+    """The same bytes can be newly unsupported after a model switch."""
+    first = StubModel(
+        inputs=frozenset({"text"}),
+        responses=[AssistantMessage(text="ok")],
+    )
+    second = StubModel(
+        inputs=frozenset({"text"}),
+        responses=[AssistantMessage(text="ok")],
+        model_id="second-text-model",
+    )
+    a = Agent(model=first, tools=[], compactor=None)
+    published: list[object] = []
+    a.runtime.observers.append(published.append)
+    a.runtime.append_history(
+        UserMessage(
+            text="summarize this",
+            attachments=(BytesMessage(b"%PDF-1.4", "application/pdf"),),
+        ),
+    )
+    await a._agent_model.stream(
+        history=a.runtime.context().messages,
+        publish=lambda _ev: None,
+    )
+
+    a.swap_model(second)
+    await a._agent_model.stream(
+        history=a.runtime.context().messages,
+        publish=lambda _ev: None,
+    )
+
+    notices = [e for e in published if isinstance(e, NoticeMessage)]
+    assert len(notices) == 2
+    assert second.model_id in notices[1].text
+
+
+@pytest.mark.asyncio
+async def test_an_accepted_attachment_never_warns() -> None:
+    """No withheld bytes -> no advisory; the model just receives them."""
+    model = StubModel(
+        inputs=frozenset({"text", "image", "pdf"}),
+        responses=[AssistantMessage(text="ok")],
+    )
+    a = Agent(model=model, tools=[], compactor=None)
+    published: list[object] = []
+    a.runtime.observers.append(published.append)
+    a.runtime.append_history(
+        UserMessage(
+            text="summarize this",
+            attachments=(BytesMessage(b"%PDF-1.4", "application/pdf"),),
+        ),
+    )
+    await a._agent_model.stream(
+        history=a.runtime.context().messages,
+        publish=lambda _ev: None,
+    )
+
+    assert not [e for e in published if isinstance(e, NoticeMessage)]
+
+
+@pytest.mark.asyncio
+async def test_an_unclassifiable_attachment_never_warns() -> None:
+    """Unknown MIME types reach the encoder; the withhold path stays silent."""
+    model = StubModel(
+        inputs=frozenset({"text"}),
+        responses=[AssistantMessage(text="ok")],
+    )
+    a = Agent(model=model, tools=[], compactor=None)
+    published: list[object] = []
+    a.runtime.observers.append(published.append)
+    a.runtime.append_history(
+        UserMessage(
+            text="look",
+            attachments=(BytesMessage(b"x", "application/octet-stream"),),
+        ),
+    )
+    await a._agent_model.stream(
+        history=a.runtime.context().messages,
+        publish=lambda _ev: None,
+    )
+
+    assert not [e for e in published if isinstance(e, NoticeMessage)]
+    sent = model.received[0]
+    (entry,) = [m for m in sent.messages if isinstance(m, UserMessage)]
+    assert entry.attachments != ()
+
+
+def test_intake_warns_about_a_fresh_attachment_without_changing_it() -> None:
+    """The intake observer warns while keeping the original message intact."""
+    model = StubModel(inputs=frozenset({"text"}))
+    a = Agent(model=model, tools=[], compactor=None)
+    published: list[object] = []
+    a.runtime.observers.append(published.append)
+    event = UserMessage(
+        text="what does this say",
+        attachments=(BytesMessage(b"%PDF-1.4", "application/pdf"),),
+    )
+
+    a._inspect_user_input(event)
+
+    assert event.attachments[0].data == b"%PDF-1.4"
+    assert event.text == "what does this say"
+    notices = [e for e in published if isinstance(e, NoticeMessage)]
+    assert len(notices) == 1
+    assert "attachment not sent to this model" in notices[0].text
+    assert "application/pdf" in notices[0].text
+    assert "remains in history" in notices[0].text
+
+
+def test_intake_does_not_warn_about_an_accepted_attachment() -> None:
+    model = StubModel(inputs=frozenset({"text", "image", "pdf"}))
+    a = Agent(model=model, tools=[], compactor=None)
+    published: list[object] = []
+    a.runtime.observers.append(published.append)
+    attachment = BytesMessage(b"%PDF-1.4", "application/pdf")
+    event = UserMessage(text="what does this say", attachments=(attachment,))
+
+    a._inspect_user_input(event)
+
+    assert not [e for e in published if isinstance(e, NoticeMessage)]
+
+
+@pytest.mark.asyncio
+async def test_fresh_unsupported_attachment_stays_in_history_but_not_the_request() -> (
+    None
+):
+    """Intake warns once; the wire omits the PDF, preserving it for later."""
+    model = StubModel(
+        inputs=frozenset({"text"}),
+        responses=[AssistantMessage(text="ok")],
+    )
+    a = Agent(model=model, tools=[], compactor=None)
+    published: list[object] = []
+    a.runtime.observers.append(published.append)
+    attachment = BytesMessage(b"%PDF-1.4", "application/pdf")
+
+    async for _ in a.run(UserMessage(text="summarize this", attachments=(attachment,))):
+        pass
+
+    stored = [m for m in a.runtime.context().messages if isinstance(m, UserMessage)]
+    assert stored[0].attachments == (attachment,)
+    assert stored[0].text == "summarize this"
+    sent = [m for m in model.received[0].messages if isinstance(m, UserMessage)]
+    assert sent[0].attachments == ()
+    assert "application/pdf not accepted by this model" in sent[0].text
+    notices = [e for e in published if isinstance(e, NoticeMessage)]
+    assert len(notices) == 1, "intake and send must not warn twice for one file"
+    assert "attachment not sent to this model" in notices[0].text
+
+
+@pytest.mark.asyncio
+async def test_switching_to_a_pdf_model_can_use_the_stored_attachment() -> None:
+    """A model change can now read bytes that an earlier model could not."""
+    text_model = StubModel(
+        inputs=frozenset({"text"}),
+        responses=[AssistantMessage(text="ok")],
+    )
+    pdf_model = StubModel(
+        inputs=frozenset({"text", "pdf"}),
+        responses=[AssistantMessage(text="summary")],
+    )
+    a = Agent(model=text_model, tools=[], compactor=None)
+    attachment = BytesMessage(b"%PDF-1.4", "application/pdf")
+    async for _ in a.run(UserMessage(text="summarize", attachments=(attachment,))):
+        pass
+
+    a.swap_model(pdf_model)
+    async for _ in a.run(UserMessage(text="try the PDF again")):
+        pass
+
+    sent = [m for m in pdf_model.received[0].messages if isinstance(m, UserMessage)]
+    assert any(attachment in m.attachments for m in sent)
+
+
+@pytest.mark.asyncio
 async def test_fresh_text_heavy_request_rejected_before_send() -> None:
     """Pre-send guard counts the WHOLE request, not just attachment bytes.
 

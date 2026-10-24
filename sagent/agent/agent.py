@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, Final, Literal, NoReturn
 import asyncio
 import contextlib
 import dataclasses
+import hashlib
 import inspect
 import itertools
 import json
@@ -94,11 +95,16 @@ from sagent.lib import last_models
 from sagent.lib.tool_validation import validate_tool_input
 from sagent.providers import providers
 from sagent.providers.lib.errors import PolicyBlockedError
-from sagent.request_materialization import materialize_request
+from sagent.request_materialization import (
+    materialize_request,
+    unsupported_attachments,
+    withheld_attachments,
+)
 
 # The one module imported whole rather than by name: this file touches 36
 # of its symbols, and the flat list buried every other import here.
 from sagent.types import runtime
+from sagent.types.capability import format_modalities
 from sagent.types.cost import TokenCost, TokenCount
 from sagent.types.exceptions import (
     BudgetExhaustedError,
@@ -149,6 +155,7 @@ if TYPE_CHECKING:
     import contextvars
 
     from sagent.types.capability import (
+        InputModality,
         ModelCapability,
         ModelLimits,
         ModelSettings,
@@ -423,6 +430,10 @@ class Agent:
         # a window escalating warn -> blocked still re-fires; cleared when the
         # window drops below the hysteresis clear point.
         self._usage_warned: set[tuple[str, bool]] = set()
+        # Track which payloads were already warned about for each model and
+        # descriptor. History repeats across turns, but a model switch or a
+        # different MIME type must not suppress a newly relevant warning.
+        self._modality_warned: set[tuple[str, str, bytes]] = set()
 
         # Wrappers. ``_agent_compactor`` is None when no rich compactor
         # was supplied (the runtime is satisfied with a None compactor).
@@ -461,6 +472,9 @@ class Agent:
         # infra (REPL pump, watchdogs) live indefinitely by design;
         # counting them would wedge a one-shot ``Agent.run`` forever.
         self.runtime.has_pending_background = self._has_pending_background
+        # Warn about unsupported fresh attachments when they reach the inbox,
+        # while retaining them in history for a later model switch.
+        self.runtime.inspect_user_input = self._inspect_user_input
         for fn in (
             self._track_activity,
             self._track_tool_registry,
@@ -2303,6 +2317,85 @@ class Agent:
             for job in self._bg.values()
         )
 
+    # Warn while fresh input commits, but keep the original attachment in
+    # history. The existing request-time filter withholds it from this model's
+    # wire request; a later switch to a capable model can still use the bytes.
+    def _inspect_user_input(
+        self,
+        event: runtime.UserMessage
+        | runtime.UserQueuedMessage
+        | runtime.UserDeferredMessage,
+    ) -> None:
+        """Tell the human which attachments this model cannot receive."""
+        inputs = self.model.capability.inputs
+        unsupported = unsupported_attachments(event.attachments, inputs)
+        if not unsupported:
+            return
+        # This input will also appear in the next request's history. Mark it
+        # as warned so the send-time advisory does not repeat the intake notice.
+        for attachment in unsupported:
+            self._modality_warned.add(
+                (
+                    self.model.tagged_model_id,
+                    attachment.descriptor,
+                    hashlib.sha256(attachment.data).digest(),
+                ),
+            )
+        self.runtime.publish(
+            runtime.NoticeMessage(
+                text=_attachment_notice(
+                    lead="attachment not sent to this model",
+                    descriptors=[attachment.descriptor for attachment in unsupported],
+                    model_id=self.model.tagged_model_id,
+                    inputs=inputs,
+                    remedy=(
+                        "The file remains in history but will be withheld from"
+                        " this model. Switch to a model that accepts it (/model)"
+                        " or resend it in a supported format."
+                    ),
+                ),
+                tier="advisory",
+            ),
+        )
+
+    # The operator half. ``request_materialization`` already leaves the MODEL a note in
+    # place of withheld bytes, so the model can ask for a supported representation -- but
+    # nothing told the HUMAN their attachment never shipped, and an answer about a
+    # document the model never received reads as a wrong answer, not a missing one. Warn
+    # once per model, descriptor, and payload: history carries an old attachment on
+    # every later turn, but a model switch may change what the user needs to know.
+    # Store a content digest, not the raw bytes (which would pin a large file in memory).
+    def _surface_withheld_attachments(
+        self,
+        history: Sequence[runtime.ModelContextEvent],
+    ) -> None:
+        """Publish one advisory per payload the wire will withhold this turn."""
+        inputs = self.model.capability.inputs
+        for attachment in withheld_attachments(history, inputs):
+            key = (
+                self.model.tagged_model_id,
+                attachment.descriptor,
+                hashlib.sha256(attachment.data).digest(),
+            )
+            if key in self._modality_warned:
+                continue
+            self._modality_warned.add(key)
+            self.runtime.publish(
+                runtime.NoticeMessage(
+                    text=_attachment_notice(
+                        lead="attachment withheld",
+                        descriptors=[attachment.descriptor],
+                        model_id=self.model.tagged_model_id,
+                        inputs=inputs,
+                        remedy=(
+                            "It will not reach the model. Switch to a model that"
+                            " takes it (/model) or resend it in a supported format."
+                        ),
+                    ),
+                    tier="advisory",
+                ),
+            )
+
     async def compact_if_needed(
         self,
         history: list[runtime.ModelContextEvent],
@@ -2625,6 +2718,27 @@ def _last_assistant_index(
             if isinstance(history[idx], runtime.AssistantMessage)
         ),
         None,
+    )
+
+
+# The operator-facing half of the unsupported-attachment policy: the model already gets a
+# note in place of withheld bytes (``request_materialization._omitted_notice``), but the
+# human who pasted the payload was told nothing. One renderer for both the intake refusal
+# and the request-time withhold advisory, so the two moments read the same and name the
+# same facts (what, which model, what it does take, what to do about it).
+def _attachment_notice(
+    *,
+    lead: str,
+    descriptors: Sequence[str],
+    model_id: str,
+    inputs: frozenset[InputModality],
+    remedy: str,
+) -> str:
+    """Render a one-line operator notice for attachments a model cannot take."""
+    named = ", ".join(sorted(set(descriptors)))
+    return (
+        f"[{lead}: {named} not accepted by {model_id}"
+        f" (supported inputs: {format_modalities(inputs)}). {remedy}]"
     )
 
 
@@ -3137,6 +3251,15 @@ class _AgentModel:
         resume_retry_at = self._agent.runtime.resume_retry_at
         self._agent.runtime.resume_retry_at = None
         observed_model = ObservedModel(self._inner, self._agent.record_response)
+
+        # Tell the HUMAN once per payload about every attachment this send will
+        # withhold, BEFORE the model call. ``materialize_request`` below leaves the
+        # model a note in the withheld bytes' place, so the model can ask for a
+        # supported representation; without this the operator saw only an answer
+        # about a document that never shipped. Fires from the SEND path, never from
+        # the measure-only callers, and only when this model/transport pair actually
+        # drops something.
+        self._agent._surface_withheld_attachments(history)  # noqa: SLF001 -- _AgentModel is Agent's own send bridge, same module.
 
         for attempt in range(MAX_OVERFLOW_RECOVERY + 1):
             # ``inputs`` withholds attachments this model/transport pair cannot

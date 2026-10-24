@@ -408,6 +408,123 @@ async def test_deferred_messages_wait_until_model_idle() -> None:
 
 
 @pytest.mark.asyncio
+async def test_intake_inspects_user_input_without_changing_history() -> None:
+    """The hook runs before commit, but the original message is retained."""
+    agent, _collector = make_agent([AssistantMessage(text="answered")])
+    seen: list[RuntimeEvent] = []
+
+    def _inspect(event: UserMessage | UserQueuedMessage | UserDeferredMessage) -> None:
+        seen.append(event)
+        assert not [
+            m for m in agent.context().messages if isinstance(m, UserMessage)
+        ], "inspection must run before history commit"
+
+    agent.inspect_user_input = _inspect
+    message = UserMessage(
+        text="look",
+        attachments=(BytesMessage(data=b"png", descriptor="image/png"),),
+    )
+    agent.inbox.push_back(message)
+
+    await run_with_quit(agent)
+
+    user_msgs = [m for m in agent.context().messages if isinstance(m, UserMessage)]
+    assert len(user_msgs) == 1
+    assert user_msgs[0].attachments == message.attachments
+    assert user_msgs[0].text == message.text
+    assert seen == [message]
+
+
+@pytest.mark.asyncio
+async def test_intake_inspects_queued_and_deferred_messages() -> None:
+    """The hook sees both kinds of human input without discarding bytes."""
+    agent, _collector = make_agent(
+        [AssistantMessage(text="first"), AssistantMessage(text="second")],
+    )
+    seen: list[RuntimeEvent] = []
+    deferred_sent = False
+    queued_attachment = BytesMessage(data=b"png", descriptor="image/png")
+    deferred_attachment = BytesMessage(data=b"%PDF", descriptor="application/pdf")
+
+    def _inspect(event: UserMessage | UserQueuedMessage | UserDeferredMessage) -> None:
+        seen.append(event)
+
+    def _stage_deferred_on_idle(event: RuntimeEvent) -> None:
+        nonlocal deferred_sent
+        if isinstance(event, AgentIdle) and not deferred_sent:
+            deferred_sent = True
+            agent.inbox.push_back(
+                UserDeferredMessage(
+                    text="later",
+                    attachments=(deferred_attachment,),
+                ),
+            )
+
+    def _quit_on_second_idle(event: RuntimeEvent) -> None:
+        if isinstance(event, ModelIdle) and deferred_sent:
+            agent.inbox.push_back(Quit())
+
+    agent.inspect_user_input = _inspect
+    agent.observers.append(_stage_deferred_on_idle)
+    agent.observers.append(_quit_on_second_idle)
+    agent.inbox.push_back(
+        UserQueuedMessage(text="start", attachments=(queued_attachment,)),
+    )
+
+    await run_until_quit(agent)
+
+    messages = [m for m in agent.context().messages if isinstance(m, UserMessage)]
+    assert any(
+        "start" in m.text and queued_attachment in m.attachments for m in messages
+    )
+    assert any(
+        "later" in m.text and deferred_attachment in m.attachments for m in messages
+    )
+    assert any(isinstance(e, UserQueuedMessage) for e in seen)
+    assert any(isinstance(e, UserDeferredMessage) for e in seen)
+
+
+@pytest.mark.asyncio
+async def test_intake_inspection_is_optional_and_off_by_default() -> None:
+    """No hook installed -> input commits verbatim (bare-runtime default)."""
+    attachment = BytesMessage(data=b"png", descriptor="image/png")
+    agent, _collector = make_agent([AssistantMessage(text="ok")])
+    agent.inbox.push_back(UserMessage(text="look", attachments=(attachment,)))
+
+    await run_with_quit(agent)
+
+    user_msgs = [m for m in agent.context().messages if isinstance(m, UserMessage)]
+    assert user_msgs[0].attachments == (attachment,)
+
+
+@pytest.mark.asyncio
+async def test_intake_inspection_does_not_run_for_tool_results() -> None:
+    """Only human input triggers the hook; tool results go through normally."""
+    tool = StubTool(response="ok")
+    agent, _collector = make_agent(
+        [
+            AssistantMessage(tool_calls=(ToolCall(id="t1", name="echo", args={}),)),
+            AssistantMessage(text="done"),
+        ],
+        tools=[tool],
+    )
+    seen: list[RuntimeEvent] = []
+
+    def _inspect(event: UserMessage | UserQueuedMessage | UserDeferredMessage) -> None:
+        seen.append(event)
+
+    agent.inspect_user_input = _inspect
+    agent.inbox.push_back(UserMessage(text="go"))
+
+    await run_with_quit(agent)
+
+    results = [m for m in agent.context().messages if isinstance(m, ToolResult)]
+    assert results, "the tool result must reach history"
+    assert not any(isinstance(e, ToolResult) for e in seen)
+    assert results[0].content == "ok"
+
+
+@pytest.mark.asyncio
 async def test_simple_text_response() -> None:
     """User message -> model text response -> turn complete."""
     agent, collector = make_agent(
