@@ -665,7 +665,7 @@ def _group_history_by_round(
     groups: list[list[ModelContextEvent]] = []
     current: list[ModelContextEvent] = []
     for entry in history:
-        if isinstance(entry, (AgentSendMessage, UserMessage)) and current:
+        if type(entry) in (AgentSendMessage, UserMessage) and current:
             groups.append(current)
             current = [entry]
         else:
@@ -718,13 +718,18 @@ def _safe_split_boundaries(history: list[ModelContextEvent]) -> list[bool]:
     """Return whether each prefix boundary has no unresolved tool calls."""
     unresolved: set[str] = set()
     safe = [True]
+
+    add = unresolved.add
+    discard = unresolved.discard
+    append = safe.append
+
     for entry in history:
-        if isinstance(entry, AssistantMessage):
+        if type(entry) is AssistantMessage:
             for tc in entry.tool_calls:
-                unresolved.add(tc.id)
-        elif isinstance(entry, ToolResult):
-            unresolved.discard(entry.call_id)
-        safe.append(not unresolved)
+                add(tc.id)
+        elif type(entry) is ToolResult:
+            discard(entry.call_id)
+        append(not unresolved)
     return safe
 
 
@@ -739,7 +744,7 @@ def _strip_attachments(
     """Drop binary attachments before summarization."""
     out: list[ModelContextEvent] = []
     for entry in history:
-        if isinstance(entry, (AgentSendMessage, UserMessage)) and entry.attachments:
+        if type(entry) in (AgentSendMessage, UserMessage) and getattr(entry, "attachments", None):
             marked = _attach_markers(entry.text, entry.attachments)
             if not marked:
                 logger.debug(
@@ -748,7 +753,7 @@ def _strip_attachments(
                 )
                 continue
             out.append(dataclasses.replace(entry, text=marked, attachments=()))
-        elif isinstance(entry, ToolResult) and entry.attachments:
+        elif type(entry) is ToolResult and getattr(entry, "attachments", None):
             marked = _attach_markers(entry.content, entry.attachments)
             if not marked:
                 logger.debug(
@@ -800,8 +805,10 @@ def _groups_to_drop(
     if gap is None:
         return max(1, len(groups) // 5)
     tokens = 0
-    for i, g in enumerate(groups):
-        tokens += estimate_entry_tokens(model, g)
+
+    # Micro-optimization avoiding enumerate
+    for i in range(len(groups)):
+        tokens += estimate_entry_tokens(model, groups[i])
         if tokens >= gap:
             return i + 1
     return max(1, len(groups) // 5)
@@ -857,18 +864,20 @@ def _request_entries(
     entries = [entry for group in groups for entry in group]
     entries = _elide_skill_results(entries)
     entries = _drop_orphan_tool_results(entries)
-    entries = [
-        dataclasses.replace(
-            entry,
-            content=f"{_COMPACTOR_TOOL_RESULT_NOTICE}\n{entry.content[:tool_result_cap_chars]}",
-        )
-        if isinstance(entry, ToolResult) and _exceeds_cap(entry, tool_result_cap_chars)
-        else entry
-        for entry in entries
-    ]
-    if entries and not isinstance(entries[0], (AgentSendMessage, UserMessage)):
-        return [UserMessage(text="[earlier messages elided]"), *entries]
-    return entries
+
+    out = []
+    for entry in entries:
+        if type(entry) is ToolResult and tool_result_cap_chars > 0 and len(entry.content) > tool_result_cap_chars and not entry.content.startswith(_COMPACTOR_TOOL_RESULT_NOTICE):
+            out.append(dataclasses.replace(
+                entry,
+                content=f"{_COMPACTOR_TOOL_RESULT_NOTICE}\n{entry.content[:tool_result_cap_chars]}",
+            ))
+        else:
+            out.append(entry)
+
+    if out and not isinstance(out[0], (AgentSendMessage, UserMessage)):
+        return [UserMessage(text="[earlier messages elided]"), *out]
+    return out
 
 
 def _exceeds_cap(entry: ToolResult, cap_chars: int) -> bool:
@@ -892,17 +901,16 @@ def _elide_skill_results(
     """Replace ``Skill`` tool-result bodies with a stable notice."""
     skill_call_ids: set[str] = set()
     for entry in entries:
-        if not isinstance(entry, AssistantMessage):
-            continue
-        for tc in entry.tool_calls:
-            if tc.name == "Skill":
-                skill_call_ids.add(tc.id)
+        if type(entry) is AssistantMessage:
+            for tc in entry.tool_calls:
+                if tc.name == "Skill":
+                    skill_call_ids.add(tc.id)
     if not skill_call_ids:
         return entries
     out: list[ModelContextEvent] = []
     for entry in entries:
         if (
-            isinstance(entry, ToolResult)
+            type(entry) is ToolResult
             and entry.call_id in skill_call_ids
             and not entry.content.startswith(_SKILL_BODY_ELIDED_NOTICE)
         ):
@@ -1003,19 +1011,25 @@ def _append_user_guidance(body: str, guidance: str) -> str:
 # ``strategy='summary'`` for an output that never passed the contract. Return ``None``
 # instead so the caller dispatches to ``fallback_splice`` with
 # ``strategy='summary_fallback'``.
+_ANALYSIS_RE = re.compile(r"<analysis>[\s\S]*?</analysis>")
+_SUMMARY_RE = re.compile(r"<summary>([\s\S]*?)</summary>")
+_NEWLINES_RE = re.compile(r"\n\n+")
+
 def _format_summary(raw: str) -> str | None:
     r"""Strip ``<analysis>``, extract ``<summary>`` content."""
-    text = re.sub(r"<analysis>[\s\S]*?</analysis>", "", raw)
-    m = re.search(r"<summary>([\s\S]*?)</summary>", text)
+    text = _ANALYSIS_RE.sub("", raw)
+    m = _SUMMARY_RE.search(text)
     if not m:
         logger.warning(
             "compactor output missing <summary> tag (%d chars); falling back",
             len(text),
         )
         return None
-    if not m.group(1).strip():
+
+    summary_content = m.group(1).strip()
+    if not summary_content:
         logger.warning("compactor output has an empty <summary> block; falling back")
         return None
-    text = f"Summary:\n{m.group(1).strip()}"
-    text = re.sub(r"\n\n+", "\n\n", text)
-    return text.strip()
+
+    text = f"Summary:\n{summary_content}"
+    return _NEWLINES_RE.sub("\n\n", text).strip()

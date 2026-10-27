@@ -1827,11 +1827,14 @@ def _append_lines(path: Path, lines: Sequence[str]) -> None:
 def _lacks_trailing_newline(path: Path) -> bool:
     """Whether ``path`` ends mid-line."""
     try:
-        with path.open("rb") as handle:
-            if handle.seek(0, os.SEEK_END) == 0:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            if os.lseek(fd, 0, os.SEEK_END) == 0:
                 return False
-            _ = handle.seek(-1, os.SEEK_END)
-            return handle.read(1) != b"\n"
+            os.lseek(fd, -1, os.SEEK_END)
+            return os.read(fd, 1) != b"\n"
+        finally:
+            os.close(fd)
     except OSError:
         return False
 

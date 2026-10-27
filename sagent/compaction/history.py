@@ -63,7 +63,7 @@ def append_to_first_user(history: list[ModelContextEvent], text: str) -> None:
 
     """
     for j, entry in enumerate(history):
-        if isinstance(entry, (UserMessage, AgentSendMessage)):
+        if type(entry) in (UserMessage, AgentSendMessage):
             joined = f"{entry.text}\n\n{text}" if entry.text else text
             history[j] = dataclasses.replace(entry, text=joined)
             return

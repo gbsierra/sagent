@@ -218,6 +218,7 @@ def plan_scrunch(
     if n == 0:
         return ScrunchPlan(partitions=())
     safe = _pair_safe_boundaries(context)
+    sizes = [entry_tokens(e, model) for e in context]
 
     deficit = total - target_input_tokens
     partitions: list[range] = []
@@ -248,7 +249,7 @@ def plan_scrunch(
         stop = start
         tokens = 0
         while stop < n:
-            stop_tokens = entry_tokens(context[stop], model)
+            stop_tokens = sizes[stop]
             if stop > start and tokens + stop_tokens > partition_tokens_cap:
                 break
             tokens += stop_tokens
@@ -258,7 +259,7 @@ def plan_scrunch(
         # forward-progress option; the resolver invariant guarantees
         # the matching tool_result lives within ``n``.
         while stop < n and not safe[stop]:
-            tokens += entry_tokens(context[stop], model)
+            tokens += sizes[stop]
             stop += 1
         # Forward-progress floor: a partition whose input is no larger
         # than the producer's expected summary output would replace N
@@ -268,7 +269,7 @@ def plan_scrunch(
         # producer's own retry loop handles oversize input by
         # truncating tool results).
         while stop < n and tokens <= summary_size_estimate_tokens:
-            tokens += entry_tokens(context[stop], model)
+            tokens += sizes[stop]
             stop += 1
         if stop <= start:
             break
@@ -489,11 +490,17 @@ def _pair_safe_boundaries(
     """Return whether each prefix boundary has no unresolved tool pairs."""
     unresolved: set[str] = set()
     safe = [True]
+
+    # micro-optimization avoiding isinstance and append lookups
+    add = unresolved.add
+    discard = unresolved.discard
+    append = safe.append
+
     for entry in context:
-        if isinstance(entry, AssistantMessage):
+        if type(entry) is AssistantMessage:
             for tc in entry.tool_calls:
-                unresolved.add(tc.id)
-        elif isinstance(entry, ToolResult):
-            unresolved.discard(entry.call_id)
-        safe.append(not unresolved)
+                add(tc.id)
+        elif type(entry) is ToolResult:
+            discard(entry.call_id)
+        append(not unresolved)
     return safe

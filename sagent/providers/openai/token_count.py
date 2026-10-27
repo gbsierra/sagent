@@ -26,6 +26,14 @@ else:
     resized_dims = lazy_import("sagent.lib.image", "resized_dims")
 
 
+import functools
+
+
+@functools.lru_cache(maxsize=16)
+def _get_encoding(encoding_name: str) -> tiktoken.Encoding:
+    return tiktoken.get_encoding(encoding_name)
+
+
 def approx_text_tokens(
     text: str,
     *,
@@ -46,7 +54,7 @@ def approx_text_tokens(
     encoding = openai.tokenizer(base_model_id(model_id))
     if encoding is None:
         return int(len(text) / approx_chars_per_token)
-    return len(tiktoken.get_encoding(encoding).encode_ordinary(text))
+    return len(_get_encoding(encoding).encode_ordinary(text))
 
 
 def approx_image_tokens(data: bytes, *, model_id: str, max_edge: int) -> int:
