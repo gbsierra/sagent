@@ -11,9 +11,9 @@ from __future__ import annotations
 from stat import S_ISDIR
 from typing import TYPE_CHECKING, Final
 
+import functools
 import re
 import shutil
-import functools
 import subprocess
 
 import rignore
