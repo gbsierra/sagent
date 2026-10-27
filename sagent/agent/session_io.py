@@ -600,7 +600,7 @@ def session_file_lock(path: Path) -> Generator[None]:
             finally:
                 depth[0] -= 1
             return
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0), 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
             depth[0] = 1
@@ -1816,7 +1816,7 @@ def _append_lines(path: Path, lines: Sequence[str]) -> None:
         # interrupted AND the first one written afterwards.
         prefix = b"\n" if _lacks_trailing_newline(path) else b""
         payload = prefix + "".join(line + "\n" for line in lines).encode("utf-8")
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0), 0o600)
         try:
             write_all(fd, payload)
             os.fsync(fd)

@@ -1,6 +1,7 @@
 """Tests for ``agent.session_io``: v4 JSONL persistence."""
 
 from __future__ import annotations
+import errno
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +23,7 @@ from sagent.agent import (
 from sagent.agent.agent import Agent
 from sagent.agent.context import resolve_context, validate_context
 from sagent.agent.session_io import (
+    session_file_lock,
     PersistentAgentRecord,
     SessionMeta,
     _apply_update_in_place,
@@ -3291,3 +3293,15 @@ if __name__ == "__main__":
     from sagent.lib.testing.runner import test_main
 
     test_main(__file__)
+
+@pytest.mark.skipif(not hasattr(os, "O_NOFOLLOW"), reason="Requires O_NOFOLLOW")
+def test_session_file_lock_rejects_symlink(tmp_path: Path) -> None:
+    target = tmp_path / "target.txt"
+    target.write_text("target", encoding="utf-8")
+    link = tmp_path / "link.txt"
+    link.symlink_to(target)
+
+    with pytest.raises(OSError) as exc:
+        with session_file_lock(link):
+            pass
+    assert exc.value.errno in (errno.ELOOP, errno.EACCES, errno.EEXIST, errno.EINVAL)
