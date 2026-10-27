@@ -151,21 +151,16 @@ re-attach can refresh the file."""
 def _collect_inlined_paths(history: list[ModelContextEvent]) -> set[str]:
     """Collect resolved file paths whose contents are already inline in history."""
     inlined: dict[str, str] = {}
-    for entry in history:
-        if not isinstance(entry, AssistantMessage):
-            continue
-        for tc in entry.tool_calls:
-            if tc.name.lower() not in _INLINING_TOOLS:
-                continue
-            fp = tc.args.get("file_path")
-            if isinstance(fp, str) and fp:
-                inlined[tc.id] = fp
     paths: set[str] = set()
     for entry in history:
-        if not isinstance(entry, ToolResult):
-            continue
-        fp = inlined.get(entry.call_id)
-        if fp is None or entry.is_error or entry.content == CLEARED:
-            continue
-        paths.add(str(Path(fp).resolve()))
+        if isinstance(entry, AssistantMessage):
+            for tc in entry.tool_calls:
+                if tc.name.lower() in _INLINING_TOOLS:
+                    fp = tc.args.get("file_path")
+                    if isinstance(fp, str) and fp:
+                        inlined[tc.id] = fp
+        elif isinstance(entry, ToolResult):
+            fp = inlined.get(entry.call_id)
+            if fp is not None and not entry.is_error and entry.content != CLEARED:
+                paths.add(str(Path(fp).resolve()))
     return paths
