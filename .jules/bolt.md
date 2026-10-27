@@ -1,0 +1,3 @@
+## 2026-10-15 - Glob File Operations Bottleneck
+**Learning:** In the `sagent` framework, agents frequently use the `glob` tool to search and walk repositories. This results in heavy, sequential CPU execution on string parsing, regex compilation, and sorting paths via `.split()`. In a large repo, this generates billions of short-lived list allocations that cause blocking Garbage Collection pauses.
+**Action:** When optimizing path handling functions (like `glob`, `grep`, or file walking logic), avoid using `.split("/")` for path sort keys; use `replace("/", "\x00")` instead, which eliminates allocations while perfectly preserving directory-first sort semantics. Similarly, prefer simple string `in` checks over regex character class searches for high-frequency token checks.

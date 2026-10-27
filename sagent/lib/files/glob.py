@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Final
 
 import re
 import shutil
+import functools
 import subprocess
 
 import rignore
@@ -52,7 +53,11 @@ def glob(root: Path, pattern: str, /) -> list[Path]:
     parts = [part for part in pattern.split("/") if part != "."]
     hidden = any(part.startswith(".") and part != ".." for part in parts)
     fixed = next(
-        (i for i, part in enumerate(parts[:-1]) if re.search(r"[*?\[{]", part)),
+        (
+            i
+            for i, part in enumerate(parts[:-1])
+            if "*" in part or "?" in part or "[" in part or "{" in part
+        ),
         len(parts) - 1,
     )
     start = _kept_directory(root, parts[:fixed], hidden=hidden)
@@ -130,8 +135,17 @@ def _glob_fd(fd: str, root: Path, pattern: str, *, hidden: bool) -> list[Path]:
     return [root / rel for rel in rels]
 
 
-def _components(rel: str) -> list[str]:
-    return rel.split("/")
+def _components(rel: str) -> str:
+    return rel.replace("/", "\x00")
+
+
+@functools.lru_cache(maxsize=512)
+def _compile_translated(pattern: str) -> re.Pattern[str]:
+    """Cache pattern to regex translation and compilation for repeated use."""
+    try:
+        return re.compile(_translate(pattern))
+    except re.error as error:
+        raise GlobError(f"invalid glob {pattern!r}: {error}") from error
 
 
 # One ignore-honouring walk, each kept entry matched against the glob in Python.
@@ -147,10 +161,7 @@ def _glob_rignore(
     limit: int | None = None,
 ) -> list[Path] | None:
     """List ``pattern``'s files with rignore, descending at most ``depth`` levels."""
-    try:
-        matcher = re.compile(_translate(pattern))
-    except re.error as error:
-        raise GlobError(f"invalid glob {pattern!r}: {error}") from error
+    matcher = _compile_translated(pattern)
     prefix = len(str(root)) + 1
     found: list[Path] = []
     walk = rignore.walk(
@@ -167,7 +178,7 @@ def _glob_rignore(
             return None
         if matcher.fullmatch(str(path)[prefix:]) and _listed(path):
             found.append(path)
-    found.sort(key=lambda path: str(path)[prefix:].split("/"))
+    found.sort(key=lambda path: str(path)[prefix:].replace("/", "\x00"))
     return found
 
 
