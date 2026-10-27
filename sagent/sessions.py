@@ -32,13 +32,12 @@ from typing import IO, TYPE_CHECKING, Final
 import contextlib
 import json
 import logging
+import os
 import re
 import shutil
 import sys
 import time
 import uuid
-
-from treekle import ReadError
 
 from sagent.lib.userdirs import data_dir
 
@@ -858,12 +857,16 @@ def _session_candidates(directory: Path) -> list[tuple[float, Path]]:
     if not directory.is_dir():
         return []
     candidates: list[tuple[float, Path]] = []
-    for child in directory.iterdir():
-        # A session deleted between the listing and the ``stat`` is skipped.
-        try:
-            candidates.append(((child / "session.jsonl").stat().st_mtime, child))
-        except OSError:
-            continue
+    try:
+        for entry in os.scandir(directory):
+            if entry.is_dir():
+                try:
+                    mtime = Path(entry.path, "session.jsonl").stat().st_mtime
+                    candidates.append((mtime, Path(entry.path)))
+                except OSError:
+                    pass
+    except OSError:
+        pass
     return candidates
 
 

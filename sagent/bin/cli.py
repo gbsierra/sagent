@@ -70,7 +70,7 @@ import shlex
 import signal
 import sys
 
-from treekle import ReadError, from_plain, json_loads
+from treekle import ReadError, from_plain
 from wesearch.fetch import FetchSession
 
 from sagent import (
