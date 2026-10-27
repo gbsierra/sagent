@@ -390,6 +390,7 @@ def _run_as_fully_detached(
     )
     proc = subprocess.Popen(  # noqa: S603 -- The agent's own command runs through a fixed bash argv; that is this tool's purpose.
         argv,
+        shell=False,
         cwd="/" if exec_prefix else state.bash_cwd,
         env=env,
         # Bash must not share the REPL terminal; interactive children
