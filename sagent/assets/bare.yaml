@@ -30,6 +30,8 @@ tool_descriptions:
   AgentSpawn: default/tools_agentspawn.md
   AgentSend: default/tools_agentsend.md
   BackgroundTask: default/tools_backgroundtask.md
+  TaskControl: default/tools_taskcontrol.md
+  Kill: default/tools_kill.md
   PaperSearch: default/tools_papersearch.md
   PaperDetails: default/tools_paperdetails.md
   PaperAuthor: default/tools_paperauthor.md

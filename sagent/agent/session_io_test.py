@@ -362,6 +362,34 @@ def test_tool_result_kind_round_trips(tmp_path: Path) -> None:
     assert out.kind is ToolResultKind.PENDING
 
 
+def test_tool_result_failure_attribution_round_trips(tmp_path: Path) -> None:
+    """ToolResult.failure_attribution survives serialize/reload through the session tape."""
+    tc = ToolCall(id="c1", name="Bash", args={})
+    asst = AssistantMessage(tool_calls=(tc,))
+    attribution = {
+        "signal": "SIGKILL",
+        "trigger": "kill_alias",
+        "exit_code": -9,
+        "job_id": "job-1",
+    }
+    res = ToolResult(
+        call_id="c1",
+        content=CANCELLED_PLACEHOLDER,
+        is_error=True,
+        kind=ToolResultKind.CANCELLED,
+        failure_attribution=attribution,
+    )
+    history = _round_trip_history([asst, res], tmp_path)
+    assert len(history) == 2
+    out = history[1]
+    assert isinstance(out, ToolResult)
+    assert out.failure_attribution == attribution
+    assert out.failure_attribution["signal"] == "SIGKILL"
+    assert out.failure_attribution["trigger"] == "kill_alias"
+    assert out.failure_attribution["exit_code"] == -9
+    assert out.failure_attribution["job_id"] == "job-1"
+
+
 def test_legacy_tool_result_infers_kind_from_content() -> None:
     """A pre-discriminator record (no ``result_kind``) recovers kind by content.
 

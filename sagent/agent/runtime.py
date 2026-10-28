@@ -314,7 +314,7 @@ from sagent.types.tape import (
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, Sequence
+    from collections.abc import Callable, Iterator, Mapping, Sequence
 
 
 # ``current_call_id_var`` is set by ``_run_tool_and_post`` before
@@ -426,6 +426,10 @@ class GatedDeque[T]:
         self._queue: asyncio.Queue[T] = asyncio.Queue()
         self._gate: tuple[type, ...] | None = None
         self._gate_baseline: int = 0
+
+    def __iter__(self) -> Iterator[T]:
+        """Iterate over a snapshot of the current queue items without draining."""
+        return iter(list(self._queue._queue))  # noqa: SLF001
 
     @property
     def gate_armed(self) -> bool:
@@ -2705,6 +2709,11 @@ class AgentRuntime:
         # so. Without it, downstream consumers that key on parent_id (UI
         # grouping, splice routing) see the synth result as orphan even though
         # the cohort gate matched.
+        attribution = (
+            {"trigger": "runtime_kill", "call_id": cid}
+            if mode == "kill"
+            else None
+        )
         self.append_history(
             ToolResult(
                 call_id=cid,
@@ -2712,6 +2721,7 @@ class AgentRuntime:
                 content=placeholder,
                 is_error=is_error,
                 kind=kind,
+                failure_attribution=attribution,
             ),
         )
         self.detached[cid] = task
@@ -2989,6 +2999,11 @@ class AgentRuntime:
                 content=CANCELLED_PLACEHOLDER,
                 is_error=True,
                 kind=ToolResultKind.CANCELLED,
+                failure_attribution={
+                    "trigger": "group_skipped_after_cancel",
+                    "call_id": call.id,
+                    "tool": call.name,
+                },
             ),
         )
 
@@ -3095,6 +3110,11 @@ class AgentRuntime:
                 content=CANCELLED_PLACEHOLDER,
                 is_error=True,
                 kind=ToolResultKind.CANCELLED,
+                failure_attribution={
+                    "trigger": "cancelled_error",
+                    "call_id": call.id,
+                    "tool": call.name,
+                },
             )
         except Exception as exc:  # noqa: BLE001 -- Tool failures must be recorded without stopping the dispatch engine.
             logger.debug(

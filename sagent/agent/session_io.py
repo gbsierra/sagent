@@ -1124,7 +1124,7 @@ def _entry_to_json(entry: TapeEvent) -> dict[str, object]:
             "timestamp": entry.timestamp,
             "hidden": entry.hidden,
         }
-    return {
+    d_res: dict[str, object] = {
         "type": "tool_result",
         "call_id": entry.call_id,
         "content": entry.content,
@@ -1143,6 +1143,9 @@ def _entry_to_json(entry: TapeEvent) -> dict[str, object]:
         "timestamp": entry.timestamp,
         "hidden": entry.hidden,
     }
+    if entry.failure_attribution is not None:
+        d_res["failure_attribution"] = dict(entry.failure_attribution)
+    return d_res
 
 
 def _ref_to_json(ref: TapeRef) -> dict[str, object]:
@@ -1486,6 +1489,8 @@ def _entry_from_json(d: Mapping[str, object]) -> TapeEvent | None:
         )
     if t == "tool_result":
         content = str(d.get("content") or "")
+        raw_fa = d.get("failure_attribution")
+        failure_attribution = dict(raw_fa) if isinstance(raw_fa, dict) else None
         return ToolResult(
             call_id=str(d.get("call_id") or ""),
             content=content,
@@ -1496,6 +1501,7 @@ def _entry_from_json(d: Mapping[str, object]) -> TapeEvent | None:
             diff_file_path=str(d.get("diff_file_path") or ""),
             hint=str(d.get("hint") or ""),
             summary=str(d.get("summary") or ""),
+            failure_attribution=failure_attribution,
             id=entry_id,
             parent_id=parent_id,
             timestamp=timestamp,

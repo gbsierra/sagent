@@ -41,6 +41,8 @@ import inspect
 import itertools
 import json
 import logging
+import os
+import signal
 import time
 import uuid
 
@@ -81,6 +83,7 @@ from sagent.agent.state import (
     tool_state_var,
     unique_registry_label,
 )
+from sagent.agent.supervisor import current_job_id_var, get_default_supervisor
 from sagent.catalog.table import UnknownModelError, UnsupportedTagError
 from sagent.compaction.history import (
     MAX_CONSECUTIVE_COMPACT_FAILURES,
@@ -656,6 +659,11 @@ class Agent:
 
         """
         return self.model.approx_text_tokens(text)
+
+    @property
+    def label(self) -> str:
+        """The stable registry label for this agent."""
+        return self._registered_label() or agent_label_var.get("") or self.name or ""
 
     @property
     def max_request_tokens(self) -> int:
@@ -1317,48 +1325,54 @@ class Agent:
             ),
         )
 
-    def shutdown(self, *, force: bool = False) -> None:
+    def shutdown(self, *, force: bool = False, cascade: bool = False) -> None:
         """End ``serve_forever`` cleanly.
 
         Cancels long-lived tasks that would otherwise outlive
         ``serve_forever`` and write to a dead inbox: every cohort-decayed
         ``runtime.detached`` task, and every explicit ``background: true``
-        tool job in ``self._bg``. Serviced subagents are exempt -- they
-        own their own ``serve_forever`` and are never touched by the
-        parent's shutdown; oneshot subagents have already self-stopped.
+        tool job in ``self._bg``. Serviced subagents are exempt unless
+        ``cascade=True``.
 
         ``force=True`` additionally drains the foreground cohort by
-        pushing a ``Kill()`` verb before ``Quit()``. The cooperative
-        Kill+Quit sequence (rather than a single Kill-with-quit op) is
-        deliberate: ``Kill()`` returns the cohort to a paired state via
-        ``_stop_all_tools``; ``Quit()`` then lets ``run_forever`` observe
-        the cleanly drained state and exit. Folding the two would skip
-        the cohort cleanup gate.
+        pushing a ``Kill()`` verb before ``Quit()``.
 
         Args:
           force: When True, also push ``Kill()`` for the foreground cohort.
+          cascade: When True, recursively terminate descendant subagents.
 
         """
         if not self._shutting_down:
             self._close_task = _schedule_close(self.model, self._owned_provider)
         self._shutting_down = True
-        self._stop_driver(force=force)
+        self._stop_driver(force=force, cascade=cascade)
 
-    async def aclose(self) -> None:
+    async def aclose(self, *, force: bool = False, cascade: bool = False) -> None:
         """Shut down the agent and await terminal model and provider cleanup."""
-        self.shutdown()
+        self.shutdown(force=force, cascade=cascade)
         if self._close_task is None:
             self._close_task = asyncio.create_task(
                 _close_model(self.model, self._owned_provider),
             )
         await asyncio.shield(self._close_task)
 
-    def _stop_driver(self, *, force: bool = False) -> None:
+    def _stop_driver(self, *, force: bool = False, cascade: bool = False) -> None:
         if force:
             self.kill_all_tools()
         self._cancel_all_detached()
+        supervisor = get_default_supervisor()
         for job in list(self._bg.values()):
-            if _should_cancel_background(job, mode="all"):
+            if _should_cancel_background(job, mode="all", cascade=cascade):
+                if cascade and job.kind == "subagent":
+                    label = job.queue_id.removeprefix("persistent:")
+                    child = agent_registry.get(label)
+                    if child is not None and child is not self:
+                        child.shutdown(force=True, cascade=True)
+                elif job.pgid or job.pid:
+                    with contextlib.suppress(OSError):
+                        target_pgid = job.pgid or job.pid
+                        if supervisor.is_pgid_alive(target_pgid):
+                            os.killpg(target_pgid, signal.SIGKILL)
                 _ = job.task.cancel()
         self.runtime.inbox.push_back(runtime.Quit())
 
@@ -2216,8 +2230,9 @@ class Agent:
         if job_id is not None:
             return job_id
         job_id = f"job-{next(self._job_counter)}"
-        self._job_ids_by_call_id[call_id] = job_id
-        self._call_ids_by_job_id[job_id] = call_id
+        if call_id:
+            self._job_ids_by_call_id[call_id] = job_id
+            self._call_ids_by_job_id[job_id] = call_id
         return job_id
 
     def _call_id_for_job(self, job_or_call_id: str) -> str:
@@ -3292,8 +3307,12 @@ class _AgentTool:
         )
         if bg_requested or delay_sec > 0:
             job_id = self._agent.job_id_for_call(call_id)
+            if not call_id:
+                call_id = job_id
+            cmd = str(clean_args.get("command", "")) if "command" in clean_args else (label if label != self._inner.name else "")
+            ready_event = asyncio.Event()
             task = asyncio.create_task(
-                self._run_bg(call_id, job_id, clean_args, delay_sec),
+                self._run_bg(call_id, job_id, clean_args, delay_sec, ready_event),
             )
             task.add_done_callback(
                 log_task_exception(
@@ -3301,28 +3320,44 @@ class _AgentTool:
                     f"background tool {self._inner.name!r} crashed",
                 ),
             )
+            entry = BackgroundTaskEntry(
+                task=task,
+                tool_name=self._inner.name,
+                queue_id=job_id,
+                call_id=call_id,
+                started=time.time(),
+                delay_sec=delay_sec,
+                kind="tool",
+                command=cmd,
+                ready_event=ready_event,
+            )
             self._agent.register_background(
                 job_id,
-                BackgroundTaskEntry(
-                    task=task,
-                    tool_name=self._inner.name,
-                    queue_id=job_id,
-                    call_id=call_id,
-                    started=time.time(),
-                    delay_sec=delay_sec,
-                    kind="tool",
-                ),
+                entry,
             )
+            if delay_sec == 0 and "command" in clean_args:
+                for _ in range(10):
+                    if entry.pid is not None or task.done():
+                        break
+                    await asyncio.sleep(0.005)
+            ready_event.set()
+            pid_part = f", pid={entry.pid}" if entry.pid is not None else ""
             return runtime.ToolResult(
                 call_id=call_id,
-                content=f"{runtime.RUNNING_PREFIX}{self._inner.name}]",
+                content=f"{runtime.RUNNING_PREFIX}{self._inner.name} (id={job_id}{pid_part})]",
                 kind=runtime.ToolResultKind.PENDING,
             )
-        result = await self._inner.run(clean_args)
-        if not result.call_id:
-            result = dataclasses.replace(result, call_id=call_id)
-        result = self._inject_conditional_rules(result, clean_args)
-        return self._agent.bound_result(result, tool=self._inner)
+        agent_tok = current_agent_var.set(self._agent)
+        call_tok = current_call_id_var.set(call_id)
+        try:
+            result = await self._inner.run(clean_args)
+            if not result.call_id:
+                result = dataclasses.replace(result, call_id=call_id)
+            result = self._inject_conditional_rules(result, clean_args)
+            return self._agent.bound_result(result, tool=self._inner)
+        finally:
+            current_call_id_var.reset(call_tok)
+            current_agent_var.reset(agent_tok)
 
     def _inject_conditional_rules(
         self,
@@ -3359,79 +3394,96 @@ class _AgentTool:
         job_id: str,
         args: Mapping[str, object],
         delay_sec: float,
+        ready_event: asyncio.Event | None = None,
     ) -> None:
         """Background-task body: optional sleep, run inner, post result."""
+        call_tok = current_call_id_var.set(call_id)
+        job_tok = current_job_id_var.set(job_id)
+        agent_tok = current_agent_var.set(self._agent)
         try:
-            if delay_sec > 0:
-                await asyncio.sleep(delay_sec)
-            result = await self._inner.run(args)
-            if not result.call_id:
-                result = dataclasses.replace(result, call_id=call_id)
-            result = self._inject_conditional_rules(result, args)
-            processed = self._agent.bound_result(result, tool=self._inner)
-        except asyncio.CancelledError:
-            # Two cancellation paths, distinguished by registry membership
-            # at cancel time (checked below):
-            #
-            # 1. Registry-popped first (``cancel_background`` / ``/kill``,
-            #    and ``clear`` via ``_cancel_all_background``): the job is
-            #    already gone from ``background``. The absence is the cleanup
-            #    signal -- consume the cancellation and exit normally so the
-            #    kill verb's cleanup path stays synchronous.
-            #
-            # 2. Registry still populated (``Agent.shutdown``, which cancels
-            #    ``job.task`` WITHOUT popping first; or a raw external
-            #    ``task.cancel``): post a ``[cancelled]`` ``DetachedResult``
-            #    so the splice site sees a paired result for the assistant's
-            #    tool_use, then re-raise so the cancel chain reaches the
-            #    scheduler -- asyncio requires every ``CancelledError`` catch
-            #    to re-raise or be the explicit endpoint of the cancel chain
-            #    (only the registry-popped path is that endpoint).
-            if job_id not in self._agent.background:
-                logger.debug(
-                    "background tool %r cancelled via registry pop (job_id=%s)",
+            try:
+                if delay_sec > 0:
+                    await asyncio.sleep(delay_sec)
+                result = await self._inner.run(args)
+                if not result.call_id:
+                    result = dataclasses.replace(result, call_id=call_id)
+                result = self._inject_conditional_rules(result, args)
+                processed = self._agent.bound_result(result, tool=self._inner)
+            except asyncio.CancelledError:
+                # Two cancellation paths, distinguished by registry membership
+                # at cancel time (checked below):
+                #
+                # 1. Registry-popped first (``cancel_background`` / ``/kill``,
+                #    and ``clear`` via ``_cancel_all_background``): the job is
+                #    already gone from ``background``. The absence is the cleanup
+                #    signal -- consume the cancellation and exit normally so the
+                #    kill verb's cleanup path stays synchronous.
+                #
+                # 2. Registry still populated (``Agent.shutdown``, which cancels
+                #    ``job.task`` WITHOUT popping first; or a raw external
+                #    ``task.cancel``): post a ``[cancelled]`` ``DetachedResult``
+                #    so the splice site sees a paired result for the assistant's
+                #    tool_use, then re-raise so the cancel chain reaches the
+                #    scheduler -- asyncio requires every ``CancelledError`` catch
+                #    to re-raise or be the explicit endpoint of the cancel chain
+                #    (only the registry-popped path is that endpoint).
+                if job_id not in self._agent.background:
+                    logger.debug(
+                        "background tool %r cancelled via registry pop (job_id=%s)",
+                        self._inner.name,
+                        job_id,
+                    )
+                    return
+                logger.warning(
+                    "background tool %r cancelled externally with job_id=%s still"
+                    " in registry; pairing tool_use with [cancelled] and re-raising",
                     self._inner.name,
                     job_id,
                 )
-                return
-            logger.warning(
-                "background tool %r cancelled externally with job_id=%s still"
-                " in registry; pairing tool_use with [cancelled] and re-raising",
-                self._inner.name,
-                job_id,
-            )
-            self._agent.runtime.inbox.push_back(
-                runtime.DetachedResult(
-                    result=runtime.ToolResult(
-                        call_id=call_id,
-                        content=runtime.CANCELLED_PLACEHOLDER,
-                        is_error=True,
-                        kind=runtime.ToolResultKind.CANCELLED,
+                if ready_event is not None:
+                    await ready_event.wait()
+                self._agent.runtime.inbox.push_back(
+                    runtime.DetachedResult(
+                        result=runtime.ToolResult(
+                            call_id=call_id,
+                            content=runtime.CANCELLED_PLACEHOLDER,
+                            is_error=True,
+                            kind=runtime.ToolResultKind.CANCELLED,
+                            failure_attribution={
+                                "trigger": "external_cancellation",
+                                "job_id": job_id,
+                            },
+                        ),
                     ),
-                ),
+                )
+                self._agent.forget_background(job_id)
+                raise
+            except Exception as exc:
+                logger.exception("background tool %r failed", self._inner.name)
+                processed = runtime.ToolResult(
+                    call_id=call_id,
+                    content=f"{type(exc).__name__}: {exc}",
+                    is_error=True,
+                )
+            # Order matters and must stay await-free: push the result, THEN
+            # drop the registry entry. The two statements run atomically under
+            # cooperative scheduling (no ``await`` between), so ``_fully_drained``
+            # can never observe an empty inbox AND an empty ``_bg`` mid-handoff.
+            # Even were they to interleave, the ordering is belt-and-suspenders:
+            # after ``push_back`` the inbox is non-empty (gate stays False); the
+            # registry only clears once the result is already queued. Inserting an
+            # ``await`` between these lines would open a spurious-``AgentIdle``
+            # window -- do not.
+            if ready_event is not None:
+                await ready_event.wait()
+            self._agent.runtime.inbox.push_back(
+                runtime.DetachedResult(result=processed),
             )
             self._agent.forget_background(job_id)
-            raise
-        except Exception as exc:
-            logger.exception("background tool %r failed", self._inner.name)
-            processed = runtime.ToolResult(
-                call_id=call_id,
-                content=f"{type(exc).__name__}: {exc}",
-                is_error=True,
-            )
-        # Order matters and must stay await-free: push the result, THEN
-        # drop the registry entry. The two statements run atomically under
-        # cooperative scheduling (no ``await`` between), so ``_fully_drained``
-        # can never observe an empty inbox AND an empty ``_bg`` mid-handoff.
-        # Even were they to interleave, the ordering is belt-and-suspenders:
-        # after ``push_back`` the inbox is non-empty (gate stays False); the
-        # registry only clears once the result is already queued. Inserting an
-        # ``await`` between these lines would open a spurious-``AgentIdle``
-        # window -- do not.
-        self._agent.runtime.inbox.push_back(
-            runtime.DetachedResult(result=processed),
-        )
-        self._agent.forget_background(job_id)
+        finally:
+            current_call_id_var.reset(call_tok)
+            current_job_id_var.reset(job_tok)
+            current_agent_var.reset(agent_tok)
 
 
 class _AgentCompactor:
@@ -3801,6 +3853,7 @@ def _should_cancel_background(
     job: BackgroundTaskEntry,
     *,
     mode: Literal["tools_only", "all"],
+    cascade: bool = False,
 ) -> bool:
     """Decide whether a background ``job`` should be cancelled."""
     if job.hidden:
@@ -3809,4 +3862,6 @@ def _should_cancel_background(
         return job.kind == "tool"
     if job.task.done():
         return False
+    if cascade:
+        return True
     return not (job.kind == "subagent" and job.lifecycle == "serviced")

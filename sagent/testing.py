@@ -288,6 +288,9 @@ class _NullRichModel(MockModelCaps):
 class FakeAgent:
     """Stand-in ``AgentLike`` for unit tests."""
 
+    label: str = ""
+    """Registry label for this agent."""
+
     tool_state: ToolState = field(default_factory=ToolState)
     """Per-agent tool state (read cache, bash_cwd, etc.)."""
 

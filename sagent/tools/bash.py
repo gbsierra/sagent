@@ -25,11 +25,17 @@ import time
 
 from treekle import from_plain, immutable
 
-from sagent.agent.runtime import EXCLUSIVE_KEY
+from sagent.agent.runtime import EXCLUSIVE_KEY, current_call_id_var
 from sagent.agent.state import (
     ToolState,
     approx_tokens,
+    current_agent_var,
     get_tool_state,
+)
+from sagent.agent.supervisor import (
+    current_job_id_var,
+    get_default_supervisor,
+    resolve_agent_label,
 )
 from sagent.lib import debug_log
 from sagent.tools.core import (
@@ -326,11 +332,45 @@ class Bash:
                 drain_sec=self.drain_sec,
             )
         body = text
+        failure_attribution: dict[str, object] | None = None
+        is_error = False
+        if "[timeout after" in text:
+            is_error = True
+            failure_attribution = {
+                "trigger": "timeout",
+                "signal": "SIGKILL",
+                "exit_code": 124,
+            }
+        elif "[exit code: -9]" in text or "[exit code: 137]" in text:
+            is_error = True
+            failure_attribution = {
+                "trigger": "oom",
+                "signal": "SIGKILL",
+                "exit_code": 137,
+            }
+        elif "[exit code: -15]" in text or "[exit code: 143]" in text:
+            is_error = True
+            failure_attribution = {
+                "trigger": "user_kill",
+                "signal": "SIGTERM",
+                "exit_code": 143,
+            }
+
         if not self._peer_matchers:
-            return ToolResult(call_id="", content=body)
+            return ToolResult(
+                call_id="",
+                content=body,
+                is_error=is_error,
+                failure_attribution=failure_attribution,
+            )
         nudges = self._collect_nudges(command)
         if not nudges:
-            return ToolResult(call_id="", content=body)
+            return ToolResult(
+                call_id="",
+                content=body,
+                is_error=is_error,
+                failure_attribution=failure_attribution,
+            )
         # Bake the banner into ``content`` so the model sees it, and
         # surface the same nudges on ``hint`` for the renderer.
         banner_body = "\n".join(f"[bash-lint] {h}" for h in nudges)
@@ -338,7 +378,9 @@ class Bash:
         return ToolResult(
             call_id="",
             content=f"{banner}\n\n{body}",
+            is_error=is_error,
             hint="\n".join(nudges),
+            failure_attribution=failure_attribution,
         )
 
     # Every Bash call is traced, nudged or not. Whether the banner changes behaviour is
@@ -401,6 +443,27 @@ def _run_as_fully_detached(
     )
     reap_background_processes()
     _BACKGROUND_PROCESSES.append(proc)
+    call_id = current_call_id_var.get("")
+    job_id = current_job_id_var.get("")
+    target_id = call_id or job_id
+    agent = current_agent_var.get(None)
+    supervisor = get_default_supervisor()
+    supervisor.register_process(
+        call_id=target_id or f"detached-{proc.pid}",
+        pid=proc.pid,
+        pgid=proc.pid,
+        command=command,
+        tool_name="Bash",
+        agent_label=resolve_agent_label(agent),
+        process=proc,
+    )
+    if agent is not None and (call_id or job_id):
+        for job in agent.background.values():
+            if (call_id and call_id in (job.call_id, job.queue_id)) or (job_id and job.queue_id == job_id):
+                job.pid = proc.pid
+                job.pgid = proc.pid
+                job.command = command
+                break
     logger.info("Fully detached process started: pid=%d", proc.pid)
     return f"(running in background, pid={proc.pid})"
 
@@ -451,6 +514,9 @@ async def _run_foreground(
     # takes a pipe held here as its stdin. That pipe closing is how it hears that it
     # must stop.
     held = _HeldPipe() if exec_prefix else None
+    call_id = ""
+    target_id = ""
+    supervisor = get_default_supervisor()
     try:
         # ``$0``: names the shell in ``$0`` and in its error prefixes, so a
         # syntax error still reads ``bash: ...`` as it did when the command was
@@ -477,6 +543,63 @@ async def _run_foreground(
             env=env,
             start_new_session=True,
         )
+        tail_buffer: list[str] = []
+        if proc.stdout is not None:
+            orig_stdout_feed = proc.stdout.feed_data
+
+            def _tee_stdout(chunk: bytes) -> None:
+                with contextlib.suppress(Exception):
+                    for line in chunk.decode("utf-8", errors="replace").splitlines(keepends=True):
+                        if tail_buffer and not tail_buffer[-1].endswith("\n"):
+                            tail_buffer[-1] += line
+                        else:
+                            tail_buffer.append(line)
+                        if len(tail_buffer) > 200:
+                            tail_buffer.pop(0)
+                orig_stdout_feed(chunk)
+
+            proc.stdout.feed_data = _tee_stdout
+
+        if proc.stderr is not None:
+            orig_stderr_feed = proc.stderr.feed_data
+
+            def _tee_stderr(chunk: bytes) -> None:
+                with contextlib.suppress(Exception):
+                    for line in chunk.decode("utf-8", errors="replace").splitlines(keepends=True):
+                        if tail_buffer and not tail_buffer[-1].endswith("\n"):
+                            tail_buffer[-1] += line
+                        else:
+                            tail_buffer.append(line)
+                        if len(tail_buffer) > 200:
+                            tail_buffer.pop(0)
+                orig_stderr_feed(chunk)
+
+            proc.stderr.feed_data = _tee_stderr
+
+        call_id = current_call_id_var.get("")
+        job_id = current_job_id_var.get("")
+        target_id = call_id or job_id
+        agent = current_agent_var.get(None)
+        supervisor = get_default_supervisor()
+        if target_id:
+            supervisor.register_process(
+                call_id=target_id,
+                pid=proc.pid,
+                pgid=proc.pid,
+                command=command,
+                tool_name="Bash",
+                agent_label=resolve_agent_label(agent),
+                process=proc,
+                stdout_tail=tail_buffer,
+            )
+        if agent is not None and (call_id or job_id):
+            for job in agent.background.values():
+                if (call_id and call_id in (job.call_id, job.queue_id)) or (job_id and job.queue_id == job_id):
+                    job.pid = proc.pid
+                    job.pgid = proc.pid
+                    job.command = command
+                    job.stdout_tail = tail_buffer
+                    break
         start = time.monotonic()
         # ``communicate()`` is driven by a task we own, so a timeout cancels
         # the WAIT and not the read: the partial stdout/stderr collected
@@ -505,6 +628,8 @@ async def _run_foreground(
             if held is not None:
                 held.release()
     finally:
+        if target_id:
+            supervisor.unregister_process(target_id)
         if held is not None:
             held.close()
     return _process_output(

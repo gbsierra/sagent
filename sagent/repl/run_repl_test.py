@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import dataclasses
 import sys
+import time
 
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyPressEvent
@@ -853,6 +854,27 @@ def test_format_tasks_marks_self() -> None:
     ):
         out = format_tasks(_as_agent(agent))
     assert "(self)" in out
+
+
+def test_format_tasks_lists_foreground_cohort_tools() -> None:
+    agent = _FakeAgent()
+    other = MagicMock()
+    other.runtime.model_call = None
+    other.runtime.compact_task = None
+    other.runtime.cohort = {"call-42"}
+    other.runtime.running_tools = {}
+    other.background = {}
+    other._tool_registry = {"call-42": ("Bash", time.time() - 3.0)}
+    with patch(
+        "sagent.repl.slash_handlers.agent_registry",
+        {"Worker": other},
+    ):
+        out = format_tasks(_as_agent(agent))
+    assert "Worker" in out
+    assert "fg=1" in out
+    assert "fg: Worker/call-42" in out
+    assert "Bash" in out
+    assert "running" in out
 
 
 def test_format_tasks_lists_bg_jobs() -> None:

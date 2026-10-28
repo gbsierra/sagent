@@ -40,9 +40,10 @@ from typing import TYPE_CHECKING
 
 import functools
 
-from prompt_toolkit.filters import is_done
+from prompt_toolkit.filters import Condition, is_done
 from prompt_toolkit.key_binding import KeyBindings
 
+from sagent.agent.supervisor import get_default_supervisor
 from sagent.repl.input_queues import InputQueues, QueuedInputBlock
 from sagent.types.runtime import (
     BytesMessage,
@@ -159,6 +160,17 @@ def build_key_bindings(
     # the non-eager default, so ``_kb_ctrl_c`` (halt when busy, clear the
     # line when idle) actually runs and Ctrl+C never exits the REPL.
     kb.add("c-c", eager=True)(functools.partial(_kb_ctrl_c, agent))
+    kb.add(
+        "escape",
+        filter=Condition(
+            lambda: bool(
+                agent.work is not None
+                or getattr(agent.runtime, "cohort", None)
+                or get_default_supervisor().has_active_foreground(agent)
+            ),
+        ),
+        eager=True,
+    )(functools.partial(_kb_escape, agent))
     kb.add("c-z")(_kb_suspend)
     kb.add("c-_")(_kb_undo)
     kb.add("escape", "z")(_kb_undo)
@@ -545,3 +557,13 @@ def _kb_suspend(event: KeyPressEvent) -> None:
 def _kb_undo(event: KeyPressEvent) -> None:
     """Undo the last buffer edit (Ctrl+_ / Esc-z)."""
     event.current_buffer.undo()
+
+
+def _kb_escape(agent: Agent, event: KeyPressEvent) -> None:
+    """Emergency brake: immediately terminate active foreground processes and halt agent."""
+    del event
+    supervisor = get_default_supervisor()
+    supervisor.kill_active_foreground(agent)
+    if agent.work is not None or agent.runtime.cohort:
+        agent.halt()
+

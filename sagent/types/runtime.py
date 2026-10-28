@@ -363,6 +363,9 @@ class ToolResult(SessionMessage):
     summary: str = ""
     """Optional short post-execution receipt line."""
 
+    failure_attribution: Mapping[str, object] | None = None
+    """Structured failure attribution metadata (e.g. signal, trigger, exit_code, job_id)."""
+
 
 # Display text for the synthetic ``ToolResult`` stubs the runtime appends when
 # a tool's real result is unavailable at history-linearization time. These fill

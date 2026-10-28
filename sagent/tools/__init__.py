@@ -54,6 +54,7 @@ from sagent.tools.play_audio import PlayAudio
 from sagent.tools.read import Read
 from sagent.tools.skill import Skill
 from sagent.tools.slack import Slack
+from sagent.tools.task_control import Kill, TaskControl
 from sagent.tools.web_fetch import WebFetch
 from sagent.tools.web_search import WebSearch
 from sagent.tools.wiki import Wiki
@@ -69,6 +70,7 @@ __all__ = (
     "Edit",
     "Glob",
     "Grep",
+    "Kill",
     "Linear",
     "List",
     "PaperAuthor",
@@ -79,6 +81,7 @@ __all__ = (
     "Read",
     "Skill",
     "Slack",
+    "TaskControl",
     "ToolState",
     "WebFetch",
     "WebSearch",

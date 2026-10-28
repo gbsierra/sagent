@@ -98,6 +98,21 @@ class BackgroundTaskEntry:
     notify_on_asleep: bool = True
     """Whether subagent idle pings are enabled."""
 
+    command: str = ""
+    """Command string or summary associated with the task."""
+
+    pid: int | None = None
+    """OS Process ID if the task spawned a subprocess."""
+
+    pgid: int | None = None
+    """OS Process Group ID if the task spawned a subprocess in a process group."""
+
+    stdout_tail: list[str] = dataclasses.field(default_factory=list)
+    """Recent stdout/stderr output lines for live inspection."""
+
+    ready_event: asyncio.Event = dataclasses.field(default_factory=asyncio.Event)
+    """Event set when the initial background placeholder has been returned and queued."""
+
     def __post_init__(self) -> None:
         """Validate the configuration on initialization."""
         if (

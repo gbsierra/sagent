@@ -537,6 +537,11 @@ class AgentLike(Protocol):
     and liveness inspection."""
 
     @property
+    def label(self) -> str:
+        """The stable registry label for this agent."""
+        ...
+
+    @property
     def max_request_bytes(self) -> int:
         """The active model's request-body byte ceiling.
 

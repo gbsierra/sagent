@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import cast
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import asyncio
 
@@ -927,6 +927,39 @@ def test_real_buffer_nav_commit_at_queue_stop_replaces() -> None:
     _handler(kb, ("enter",))(_real_event(buf))
     assert queues.queue == QueuedInputBlock(text="Q-edited")
     assert not nav.active()
+
+
+def test_escape_emergency_brake_halts_and_kills_active_foreground() -> None:
+    """Esc keybinding triggers emergency brake, calling supervisor and agent.halt()."""
+    agent = _busy_agent()
+    queues = InputQueues()
+    kb = _build(agent, queues)
+    matches = kb.get_bindings_for_keys((Keys.Escape,))
+    assert len(matches) > 0
+    eager = [m for m in matches if m.eager()]
+    assert len(eager) > 0
+
+    with patch("sagent.repl.keybindings.get_default_supervisor") as mock_get_sup:
+        mock_sup = MagicMock()
+        mock_get_sup.return_value = mock_sup
+        buf = _real_buf("")
+        _handler(kb, ("escape",))(_real_event(buf))
+
+        mock_sup.kill_active_foreground.assert_called_once_with(agent)
+        assert agent.halt_calls == 1
+
+
+def test_escape_idle_filter_disabled_preserving_alt_sequences() -> None:
+    """When agent is idle, eager escape filter is disabled, preserving Alt-Enter and Alt-Z."""
+    agent = _idle_agent()
+    queues = InputQueues()
+    kb = _build(agent, queues)
+    matches = kb.get_bindings_for_keys((Keys.Escape,))
+    assert len(matches) > 0
+    # On idle agent, filter evaluates to False so escape does not intercept multi-key bindings
+    for m in matches:
+        if m.eager():
+            assert not m.filter()
 
 
 if __name__ == "__main__":

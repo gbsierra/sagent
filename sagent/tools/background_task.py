@@ -29,7 +29,6 @@ from sagent.agent.session_io import append_persistent_agent_lifecycle
 from sagent.agent.state import (
     AgentLike,
     agent_registry,
-    current_agent_var,
 )
 from sagent.tools.core import load_tool_description
 from sagent.types.runtime import (
@@ -117,39 +116,10 @@ class BackgroundTask:
         return None
 
     async def run(self, args: Mapping[str, object]) -> ToolResult:
-        """Dispatch a list, cancel, or foreground operation.
+        """Dispatch a list, cancel, or foreground operation via TaskControl."""
+        from sagent.tools.task_control import TaskControl  # noqa: PLC0415
 
-        Args:
-          args: Directive with ``operation`` (``list``/``cancel``/
-              ``foreground``) and optional ``id``.
-
-        Returns:
-          result: Listing table, cancel confirmation, or the foregrounded
-              task's ``ToolResult``; error when ``id`` is missing or unknown.
-
-        """
-        op = str(args.get("operation", ""))
-        job_id = str(args.get("id", ""))
-
-        agent = current_agent_var.get(None)
-        if agent is None:
-            return ToolResult(
-                call_id="",
-                content="BackgroundTask: no active agent",
-                is_error=True,
-            )
-
-        if op == "list":
-            return self._list(agent)
-        if op == "cancel":
-            return self._cancel(agent, job_id)
-        if op == "foreground":
-            return await self._foreground(agent, job_id)
-        return ToolResult(
-            call_id="",
-            content=f"Unknown operation: {op!r}",
-            is_error=True,
-        )
+        return await TaskControl().run(args)
 
     def _list(self, agent: AgentLike) -> ToolResult:
         """Render the current background-task table."""

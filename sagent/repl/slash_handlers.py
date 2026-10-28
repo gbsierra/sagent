@@ -210,12 +210,32 @@ def format_tasks(agent: Agent) -> str:
         # the Protocol does promise.
         runtime = other.runtime
         fg_active = runtime.model_call is not None or runtime.compact_task is not None
-        fg = 1 if fg_active else 0
+        cohort = getattr(runtime, "cohort", None)
+        running_tools = getattr(runtime, "running_tools", None)
+        fg_cohort_tools: list[tuple[str, str, float]] = []
+        if isinstance(cohort, set) or isinstance(running_tools, dict):
+            active_cids = (
+                (cohort if isinstance(cohort, set) else set())
+                | (set(running_tools.keys()) if isinstance(running_tools, dict) else set())
+            )
+            for cid in sorted(active_cids):
+                registry = getattr(other, "_tool_registry", None)
+                entry = registry.get(cid) if isinstance(registry, dict) else None
+                if entry:
+                    name, started = entry
+                    fg_cohort_tools.append((cid, name, max(0.0, now - started)))
+                else:
+                    fg_cohort_tools.append((cid, "Tool", 0.0))
+        fg = (1 if fg_active else 0) + len(fg_cohort_tools)
         bg_n = len(visible_bg)
         total_fg += fg
         total_bg += bg_n
         tag = " (self)" if other is agent else ""
         lines.append(f"  {label}{tag:<8s}  fg={fg} bg={bg_n}")
+        for cid, name, elapsed in fg_cohort_tools:
+            lines.append(
+                f"    fg: {label}/{cid:<10s}  {name:<16s}  running     {elapsed:.0f}s"
+            )
         for job in visible_bg:
             if job.kind == "subagent":
                 phase = _subagent_phase(job)
