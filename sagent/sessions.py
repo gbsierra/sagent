@@ -38,7 +38,7 @@ import sys
 import time
 import uuid
 
-from treekle import ReadError, json_loads
+from treekle import ReadError
 
 from sagent.lib.userdirs import data_dir
 
@@ -776,11 +776,11 @@ def _iter_jsonl(lines: Iterable[str]) -> Iterator[dict[str, object]]:
         if not line:
             continue
         try:
-            record = json_loads(line, dict[str, object])
+            record = json.loads(line)
         except json.JSONDecodeError:
             logger.warning("Skipping malformed JSONL line: %r", line[:120])
             continue
-        except ReadError:
+        if not isinstance(record, dict):
             logger.warning("Skipping non-dict JSONL record: %r", line[:120])
             continue
         yield record
