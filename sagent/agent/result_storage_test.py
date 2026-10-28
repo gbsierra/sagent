@@ -387,6 +387,7 @@ def test_read_oversized_hint_targets_original_file_with_limit(tmp_path: Path) ->
     out = post_process_result(
         ToolResult(call_id="call_read_hint", content=content),
         "Read",
+        args={"file_path": "src/module.py", "offset": 100},
         session_dir=tmp_path,
         persist_tokens=100,
         max_chars=5_000,
@@ -394,10 +395,19 @@ def test_read_oversized_hint_targets_original_file_with_limit(tmp_path: Path) ->
     assert PERSISTED_TAG in out.content
     assert "limit=" in out.content
     assert "offset=" in out.content
-    assert (
-        "Read(file_path=" not in out.content
-    )  # Avoids double line numbers by reading original file
+    assert 'Read(file_path="src/module.py"' in out.content
     assert "Full output archived to:" in out.content
+
+    # When args is absent, it safely falls back to referencing the archived file
+    out_no_args = post_process_result(
+        ToolResult(call_id="call_read_hint_fallback", content=content),
+        "Read",
+        session_dir=tmp_path,
+        persist_tokens=100,
+        max_chars=5_000,
+    )
+    assert PERSISTED_TAG in out_no_args.content
+    assert "file_path=" in out_no_args.content
 
 
 def test_bash_oversized_hint_includes_limit(tmp_path: Path) -> None:

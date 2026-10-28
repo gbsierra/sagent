@@ -29,9 +29,11 @@ executes during provider wire request assembly (:func:`materialize_messages` /
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
 import dataclasses
+import os
 import re
 
 from sagent.types.runtime import (
@@ -52,7 +54,10 @@ DEFAULT_TAIL_TURNS: Final = 6
 BASH_ELIDE_MIN_LINES: Final = 10
 BASH_ELIDE_MIN_CHARS: Final = 500
 
-_EXIT_CODE_PATTERN: Final = re.compile(r"\[exit code:\s*(-?\d+)\]")
+_EXIT_MARKER_RE: Final = re.compile(r"(?:^|\n)\[exit code:\s*(-?\d+)\]\s*$")
+_REASON_MARKER_RE: Final = re.compile(
+    r"(?:^|\n)\[(timeout|killed|cancelled|failed)[^\]]*\]\s*$"
+)
 
 
 __all__ = [
@@ -115,10 +120,11 @@ def _is_failed_bash(result: ToolResult) -> bool:
     """Return True if the bash result represents an execution failure."""
     if result.is_error:
         return True
-    match = _EXIT_CODE_PATTERN.search(result.content)
-    if match and int(match.group(1)) != 0:
+    content = result.content or ""
+    if _REASON_MARKER_RE.search(content):
         return True
-    return "[killed" in result.content or "[timed out" in result.content
+    match = _EXIT_MARKER_RE.search(content)
+    return bool(match and int(match.group(1)) != 0)
 
 
 def elide_historical_thinking(
@@ -162,7 +168,10 @@ def elide_historical_thinking(
             preserved = tuple(
                 b for b in event.thinking_blocks if "encrypted_content" in b
             )
-            out.append(dataclasses.replace(event, thinking_blocks=preserved))
+            text = event.text
+            if not text and not event.tool_calls and not preserved:
+                text = "[Historical reasoning elided]"
+            out.append(dataclasses.replace(event, text=text, thinking_blocks=preserved))
         else:
             out.append(event)
 
@@ -194,6 +203,41 @@ def prune_observations(
         keep_tail_turns=keep_tail_turns,
         elide_thinking=False,
     )
+
+
+def _canonical_path(path_str: str) -> str:
+    """Return an absolute, normalized path for reliable read supersession."""
+    if not path_str:
+        return ""
+    try:
+        return str(Path(path_str).expanduser().resolve())
+    except (OSError, ValueError):
+        return os.path.normpath(path_str)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _ReadInvocation:
+    call_id: str
+    turn_idx: int
+    raw_path: str
+    canonical_path: str
+    offset: int
+    limit: int  # 0 means to EOF
+
+    def supersedes(self, earlier: _ReadInvocation) -> bool:
+        if self.turn_idx <= earlier.turn_idx:
+            return False
+        if self.canonical_path != earlier.canonical_path:
+            return False
+        # If this read reaches EOF, it supersedes if it started at or before the earlier read
+        if self.limit <= 0:
+            return self.offset <= earlier.offset
+        # If both are bounded windows, this window must completely enclose the earlier window
+        if earlier.limit > 0:
+            earlier_end = earlier.offset + earlier.limit
+            self_end = self.offset + self.limit
+            return self.offset <= earlier.offset and self_end >= earlier_end
+        return False
 
 
 def prune_messages(
@@ -248,8 +292,8 @@ def prune_messages(
                 for tc in event.tool_calls:
                     call_map[tc.id] = (tc, t_idx)
 
-    # 2. Identify reads across ALL turns: path -> list of (turn_idx, call_id)
-    reads_by_path: dict[str, list[tuple[int, str]]] = {}
+    # 2. Identify reads across ALL turns:
+    reads: list[_ReadInvocation] = []
     for t_idx, turn in enumerate(turns):
         for event in turn:
             if isinstance(event, AssistantMessage):
@@ -257,19 +301,47 @@ def prune_messages(
                     if tc.name.lower() == "read":
                         file_path = tc.args.get("file_path") or tc.args.get("path")
                         if file_path is not None:
-                            path_str = str(file_path)
-                            reads_by_path.setdefault(path_str, []).append(
-                                (t_idx, tc.id)
+                            raw_p = str(file_path)
+                            norm_p = _canonical_path(raw_p)
+                            raw_off = (
+                                tc.args.get("offset")
+                                if tc.args.get("offset") is not None
+                                else tc.args.get("start_line")
+                            )
+                            if isinstance(raw_off, int):
+                                offset = raw_off
+                            elif isinstance(raw_off, str) and raw_off.isdigit():
+                                offset = int(raw_off)
+                            else:
+                                offset = 1
+
+                            raw_lim = tc.args.get("limit")
+                            if isinstance(raw_lim, int):
+                                limit = raw_lim
+                            elif isinstance(raw_lim, str) and raw_lim.isdigit():
+                                limit = int(raw_lim)
+                            else:
+                                limit = 0
+                            reads.append(
+                                _ReadInvocation(
+                                    call_id=tc.id,
+                                    turn_idx=t_idx,
+                                    raw_path=raw_p,
+                                    canonical_path=norm_p,
+                                    offset=max(1, offset),
+                                    limit=max(0, limit),
+                                )
                             )
 
     # A read call in pre-tail turns is superseded if a subsequent read of the same
-    # path occurred at a later turn (either in pre-tail or within the active tail).
+    # file fully encloses or supersedes the earlier read's line window.
     superseded_call_ids: dict[str, str] = {}
-    for path_str, read_list in reads_by_path.items():
-        if len(read_list) > 1:
-            for t_idx, call_id in read_list[:-1]:
-                if t_idx < pre_tail_count:
-                    superseded_call_ids[call_id] = path_str
+    for earlier in reads:
+        if earlier.turn_idx < pre_tail_count:
+            for later in reads:
+                if later.supersedes(earlier):
+                    superseded_call_ids[earlier.call_id] = earlier.raw_path
+                    break
 
     # 3. Assemble pruned messages
     out: list[ModelContextEvent] = []

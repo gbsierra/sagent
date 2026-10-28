@@ -213,7 +213,7 @@ down. Zero matches surface a visible error.
 
 ### Prompt cache diagnostics
 
-Type `/cache` (or `/c`) in the interactive REPL to inspect prompt cache performance:
+Type `/cache` in the interactive REPL to inspect prompt cache performance:
 
 ```text
 /cache

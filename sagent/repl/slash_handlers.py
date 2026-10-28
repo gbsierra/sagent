@@ -380,17 +380,6 @@ def _reachable_thinking_words(agent: Controllable) -> tuple[str, ...]:
     return tuple(word for word in THINKING_COMMANDS if thinking_offered(word, settings))
 
 
-def _emit_cache_report(sink: object, text: str) -> None:
-    """Send report text to a Printer or standard text stream."""
-    write_line = getattr(sink, "write_line", None)
-    if callable(write_line):
-        write_line(text)
-    else:
-        write = getattr(sink, "write", None)
-        if callable(write):
-            write(text)
-
-
 # Cache Miss Tool (/cache REPL command):
 # Reports prompt tokens, cached reads, hit rate, and wasted USD from prefix mutations.
 # Empirical: Detects 80.0% hit rate and $0.0160 wasted spend in benchmark.
@@ -400,7 +389,7 @@ def do_cache(agent: Agent, printer: Printer | None) -> None:
         return
     cost_tracker = getattr(agent, "cost_tracker", None)
     if cost_tracker is None:
-        _emit_cache_report(printer, "No cost tracker found on agent.\n")
+        _write(printer, "No cost tracker found on agent.\n")
         return
 
     totals = getattr(cost_tracker, "total", None)
@@ -423,7 +412,7 @@ def do_cache(agent: Agent, printer: Printer | None) -> None:
         f"  Total Missed Tokens: {summary.missed_tokens:,}\n"
         f"  Wasted Spend:        ${summary.wasted_cost_usd:.4f}\n"
     )
-    _emit_cache_report(printer, report)
+    _write(printer, report)
 
 
 do_cache_diagnostic = do_cache

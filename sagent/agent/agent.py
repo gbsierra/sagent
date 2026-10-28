@@ -631,12 +631,14 @@ class Agent:
         result: runtime.ToolResult,
         *,
         tool: Tool,
+        args: Mapping[str, object] | None = None,
     ) -> runtime.ToolResult:
         """Persist ``result`` past its tool's cap, the round's, or the context's.
 
         Args:
           result: Fresh result from ``tool``.
           tool: The tool that produced it; its ``max_result_chars`` applies.
+          args: Directive arguments supplied to the tool invocation.
 
         Returns:
           bounded: ``result``, or a persisted preview of it.
@@ -663,6 +665,7 @@ class Agent:
         processed = post_process_result(
             result,
             tool.name,
+            args=args,
             session_dir=self.session_dir,
             persist_tokens=persist_tokens,
             max_chars=max_chars,
@@ -1841,8 +1844,10 @@ class Agent:
         )
         ledger_prefix = self.constraint_ledger.to_prompt_prefix()
         blocks = (
-            "\n\n".join(p for p in (note, self.system, ledger_prefix) if p),
-            "\n\n".join(p for p in (self.append_system, *tool_prompts) if p),
+            "\n\n".join(p for p in (note, self.system) if p),
+            "\n\n".join(
+                p for p in (self.append_system, ledger_prefix, *tool_prompts) if p
+            ),
             project,
         )
         return tuple(b for b in blocks if b)
@@ -3492,7 +3497,7 @@ class _AgentTool:
         if not result.call_id:
             result = dataclasses.replace(result, call_id=call_id)
         result = self._inject_conditional_rules(result, clean_args)
-        return self._agent.bound_result(result, tool=self._inner)
+        return self._agent.bound_result(result, tool=self._inner, args=clean_args)
 
     def _inject_conditional_rules(
         self,
@@ -3538,7 +3543,7 @@ class _AgentTool:
             if not result.call_id:
                 result = dataclasses.replace(result, call_id=call_id)
             result = self._inject_conditional_rules(result, args)
-            processed = self._agent.bound_result(result, tool=self._inner)
+            processed = self._agent.bound_result(result, tool=self._inner, args=args)
         except asyncio.CancelledError:
             # Two cancellation paths, distinguished by registry membership
             # at cancel time (checked below):

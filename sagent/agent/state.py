@@ -31,6 +31,7 @@ from typing import (
     override,
     runtime_checkable,
 )
+from xml.sax.saxutils import escape
 
 import contextvars
 import dataclasses
@@ -164,32 +165,48 @@ class ConstraintLedger:
         parts: list[str] = ["<protected-constraint-ledger>"]
         if self.active_inquiry_id:
             if self.inquiry_title or self.inquiry_validation:
-                parts.append(f'  <active-inquiry id="{self.active_inquiry_id}">')
+                parts.append(
+                    f'  <active-inquiry id="{escape(self.active_inquiry_id)}">'
+                )
                 if self.inquiry_title:
-                    parts.append(f"    <title>{self.inquiry_title}</title>")
+                    parts.append(f"    <title>{escape(self.inquiry_title)}</title>")
                 if self.inquiry_validation:
                     parts.append(
-                        f"    <validation>{self.inquiry_validation}</validation>"
+                        f"    <validation>{escape(self.inquiry_validation)}</validation>"
                     )
                 parts.append("  </active-inquiry>")
             else:
                 parts.append(
-                    f"  <active-inquiry>{self.active_inquiry_id}</active-inquiry>"
+                    f"  <active-inquiry>{escape(self.active_inquiry_id)}</active-inquiry>"
                 )
+        if self.trackinizer_inquiry_ids:
+            other_ids = [
+                iid
+                for iid in self.trackinizer_inquiry_ids
+                if iid != self.active_inquiry_id
+            ]
+            if other_ids:
+                parts.append("  <inquiry-history>")
+                parts.extend(
+                    f"    <inquiry-id>{escape(iid)}</inquiry-id>" for iid in other_ids
+                )
+                parts.append("  </inquiry-history>")
         if self.active_experiment_id:
             parts.append(
-                f"  <active-experiment>{self.active_experiment_id}</active-experiment>"
+                f"  <active-experiment>{escape(self.active_experiment_id)}</active-experiment>"
             )
         if self.workspace_boundaries:
             parts.append("  <workspace-boundaries>")
             parts.extend(
-                f"    <boundary>{b}</boundary>" for b in self.workspace_boundaries
+                f"    <boundary>{escape(b)}</boundary>"
+                for b in self.workspace_boundaries
             )
             parts.append("  </workspace-boundaries>")
         if self.user_constraints:
             parts.append("  <user-constraints>")
             parts.extend(
-                f"    <constraint>{c}</constraint>" for c in self.user_constraints
+                f"    <constraint>{escape(c)}</constraint>"
+                for c in self.user_constraints
             )
             parts.append("  </user-constraints>")
         parts.append("</protected-constraint-ledger>")

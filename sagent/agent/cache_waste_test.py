@@ -212,6 +212,9 @@ def test_do_cache_handler_renders_report() -> None:
         def write_line(self, msg: str) -> None:
             self.output += msg
 
+        def write_slash_block(self, msg: str) -> None:
+            self.output += msg
+
     @dataclasses.dataclass
     class _MockCostTracker:
         total: TokenCount = dataclasses.field(

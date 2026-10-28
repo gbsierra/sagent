@@ -391,6 +391,111 @@ def test_elide_historical_thinking_preserves_encrypted_reasoning_blocks() -> Non
     assert asst2_pruned.thinking_blocks == (plaintext_thought_block,)
 
 
+def test_disjoint_windowed_reads_not_superseded() -> None:
+    """Disjoint windowed reads of the same file are preserved and not superseded."""
+    events: list[ModelContextEvent] = [UserMessage(text="Inspect head of file")]
+    am1 = AssistantMessage(
+        tool_calls=(
+            ToolCall(
+                id="c_read_w1",
+                name="Read",
+                args={"file_path": "src/model.py", "offset": 1, "limit": 50},
+            ),
+        ),
+    )
+    tr1 = ToolResult(call_id="c_read_w1", content="HEAD OF FILE\n" * 50)
+    events.extend([am1, tr1])
+
+    # Intermediary turn older than tail
+    events.append(UserMessage(text="Next step"))
+    events.append(AssistantMessage(text="Continuing..."))
+
+    # Active tail turns: read disjoint window lines 100-150 in turn 3 of tail
+    for i in range(1, 7):
+        events.append(UserMessage(text=f"Tail user {i}"))
+        if i == 3:
+            am_tail = AssistantMessage(
+                tool_calls=(
+                    ToolCall(
+                        id="c_read_w2",
+                        name="Read",
+                        args={"file_path": "src/model.py", "offset": 100, "limit": 50},
+                    ),
+                ),
+            )
+            tr_tail = ToolResult(call_id="c_read_w2", content="MIDDLE OF FILE\n" * 50)
+            events.extend([am_tail, tr_tail])
+        else:
+            events.append(AssistantMessage(text=f"Tail asst {i}"))
+
+    pruned = prune_messages(events, tail_turns=6, elide_thinking=False)
+    res_w1 = next(
+        e for e in pruned if isinstance(e, ToolResult) and e.call_id == "c_read_w1"
+    )
+    assert "HEAD OF FILE" in res_w1.content
+    assert "superseded" not in res_w1.content
+
+
+def test_bash_timeout_reason_marker_strictly_preserved() -> None:
+    """A bash command terminated by timeout is preserved and not scrubbed as rc=0."""
+    events: list[ModelContextEvent] = [UserMessage(text="Run build")]
+    stdout = "building packages...\n" * 50
+    content = f"{stdout}\n[timeout after 30.0s]"
+    am1 = AssistantMessage(
+        tool_calls=(
+            ToolCall(
+                id="c_bash_to",
+                name="Bash",
+                args={"command": "cargo build"},
+            ),
+        ),
+    )
+    tr1 = ToolResult(call_id="c_bash_to", content=content, is_error=False)
+    events.extend([am1, tr1])
+
+    # Intermediary turn older than tail
+    events.append(UserMessage(text="Next step"))
+    events.append(AssistantMessage(text="Continuing..."))
+
+    # 6 active tail turns
+    for i in range(1, 7):
+        events.append(UserMessage(text=f"Tail user {i}"))
+        events.append(AssistantMessage(text=f"Tail asst {i}"))
+
+    pruned = prune_messages(events, tail_turns=6, elide_thinking=False)
+    res_bash = next(
+        e for e in pruned if isinstance(e, ToolResult) and e.call_id == "c_bash_to"
+    )
+    assert "timeout after 30.0s" in res_bash.content
+    assert "Command succeeded" not in res_bash.content
+
+
+def test_hollow_assistant_thinking_elision_sets_placeholder_text() -> None:
+    """Historical assistant message with only thinking gets placeholder text to avoid empty wire message."""
+    thought_block = {"type": "thinking", "thinking": "Thinking about the task..."}
+    hollow_asst = AssistantMessage(
+        text="",
+        tool_calls=(),
+        thinking_blocks=(thought_block,),
+    )
+    latest_asst = AssistantMessage(
+        text="Final answer",
+        thinking_blocks=(thought_block,),
+    )
+    events: list[ModelContextEvent] = [
+        UserMessage(text="Turn 1 prompt"),
+        hollow_asst,
+        UserMessage(text="Turn 2 prompt"),
+        latest_asst,
+    ]
+
+    pruned = elide_historical_thinking(events)
+    asst1_pruned = pruned[1]
+    assert isinstance(asst1_pruned, AssistantMessage)
+    assert asst1_pruned.text == "[Historical reasoning elided]"
+    assert asst1_pruned.thinking_blocks == ()
+
+
 if __name__ == "__main__":
     from sagent.lib.testing.runner import test_main
 

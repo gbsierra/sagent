@@ -77,6 +77,29 @@ def test_constraint_ledger_with_inquiry_title_and_validation() -> None:
     assert "No deletions" in updated.to_prompt_prefix()
 
 
+def test_constraint_ledger_escapes_xml_special_characters() -> None:
+    ledger = ConstraintLedger(
+        user_constraints=('Avoid <dir>/file.txt & "tmp"',),
+        inquiry_title="Verify A & B < C",
+    )
+    xml = ledger.to_prompt_prefix()
+    assert "Avoid &lt;dir&gt;/file.txt &amp;" in xml
+    assert "&lt;" in xml
+    assert "<dir>" not in xml
+
+
+def test_constraint_ledger_renders_inquiry_history() -> None:
+    ledger = ConstraintLedger(
+        active_inquiry_id="inq_active",
+        trackinizer_inquiry_ids=("inq_past_1", "inq_past_2", "inq_active"),
+    )
+    xml = ledger.to_prompt_prefix()
+    assert "<active-inquiry>inq_active</active-inquiry>" in xml
+    assert "<inquiry-history>" in xml
+    assert "<inquiry-id>inq_past_1</inquiry-id>" in xml
+    assert "<inquiry-id>inq_past_2</inquiry-id>" in xml
+
+
 if __name__ == "__main__":
     from sagent.lib.testing.runner import test_main
 

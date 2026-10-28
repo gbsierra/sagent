@@ -29,6 +29,8 @@ from sagent.lib.atomic_file import write_all
 
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from sagent.types.runtime import ToolResult
 
 
@@ -41,6 +43,7 @@ def post_process_result(
     result: ToolResult,
     tool_name: str,
     *,
+    args: Mapping[str, object] | None = None,
     session_dir: Path | None,
     persist_tokens: int,
     max_chars: int = 0,
@@ -57,6 +60,7 @@ def post_process_result(
     Args:
       result: Tool result to post-process.
       tool_name: Originating tool name (gates exempt-from-persist).
+      args: Directive arguments supplied to the tool invocation.
       session_dir: Directory where ``tool-results/<id>.txt`` lives;
           ``None`` falls back to a private per-process temp dir.
       persist_tokens: Per-result token threshold. ``0`` disables
@@ -90,6 +94,7 @@ def post_process_result(
             result.call_id,
             content,
             tool_name=tool_name,
+            args=args,
             session_dir=session_dir,
         )
         if preview is not None:
@@ -122,7 +127,7 @@ def stub_cost_tokens(content: str, *, preview_chars: int = 2_000) -> int:
         f"{'x' * 40}.txt\n\n"
         f"Preview (first {preview_chars:,} chars):\n"
         f"{content[:preview_chars]}\n...\n"
-        f"[Use Read(offset=1, limit=500) or Read(start_line=1, limit=500) to read remaining {total_lines} lines]\n"
+        f'[Use Read(file_path="...", offset=1, limit=500) to read remaining {total_lines} lines]\n'
         f"</persisted-output>",
     )
 
@@ -132,6 +137,7 @@ def _persist_oversized(
     content: str,
     *,
     tool_name: str = "",
+    args: Mapping[str, object] | None = None,
     session_dir: Path | None,
     preview_chars: int = 2_000,
 ) -> str | None:
@@ -151,7 +157,7 @@ def _persist_oversized(
     # Bounded reads preview: adds line counts and paging hints for large outputs.
     # Empirical: 100% SHA-256 byte parity on disk; drops read payload from 39,375 to 566 tokens (-98.6%).
     total_lines = len(content.splitlines())
-    preview_limit = min(preview_chars, 1920)
+    preview_limit = min(preview_chars, 1800)
     preview = content[:preview_chars]
     if len(content) > preview_chars:
         nl = content.rfind("\n", preview_chars // 2, preview_limit)
@@ -161,18 +167,48 @@ def _persist_oversized(
             preview = content[:preview_limit]
     preview_lines = len(preview.splitlines())
     has_more = len(content) > len(preview)
-    next_line = preview_lines + 1
     remaining_lines = max(0, total_lines - preview_lines)
     chunk_size = min(500, max(50, remaining_lines))
     if has_more:
         if tool_name.lower() == "read":
-            more = (
-                f"\n...\n"
-                f"[Use Read(offset={next_line}, limit={chunk_size}) or "
-                f"Read(start_line={next_line}, limit={chunk_size}) to read next {chunk_size} lines. "
-                f"Full output archived to: {filepath}]\n"
-            )
+            file_path = str(args.get("file_path", "")) if args else ""
+            lines = preview.splitlines()
+            resume_line = 0
+            if lines and "\t" in lines[-1]:
+                num_prefix = lines[-1].split("\t", 1)[0].strip()
+                if num_prefix.isdigit():
+                    resume_line = int(num_prefix) + 1
+            if resume_line <= 0:
+                raw_offset = (
+                    args.get("offset")
+                    if (args and args.get("offset") is not None)
+                    else (args.get("start_line") if args else None)
+                )
+                if isinstance(raw_offset, int):
+                    start_offset = raw_offset
+                elif isinstance(raw_offset, str) and raw_offset.isdigit():
+                    start_offset = int(raw_offset)
+                else:
+                    start_offset = 1
+                resume_line = start_offset + preview_lines
+
+            if file_path:
+                more = (
+                    f"\n...\n"
+                    f'[Use Read(file_path="{file_path}", offset={resume_line}, limit={chunk_size}) or '
+                    f'Read(file_path="{file_path}", start_line={resume_line}, limit={chunk_size}) '
+                    f"to read next {chunk_size} lines. "
+                    f"Full output archived to: {filepath}]\n"
+                )
+            else:
+                more = (
+                    f"\n...\n"
+                    f'[Use Read(file_path="{filepath}", offset={resume_line}, limit={chunk_size}) '
+                    f"to read next {chunk_size} lines. "
+                    f"Full output archived to: {filepath}]\n"
+                )
         else:
+            next_line = preview_lines + 1
             more = (
                 f"\n...\n"
                 f'[Use Read(file_path="{filepath}", offset={next_line}, limit={chunk_size}) '
