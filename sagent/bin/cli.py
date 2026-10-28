@@ -61,7 +61,7 @@ import shlex
 import signal
 import sys
 
-from treekle import from_plain, json_loads
+from treekle import ReadError, from_plain, json_loads
 from wesearch.fetch import FetchSession
 
 from sagent import (
@@ -1461,12 +1461,14 @@ def _parse_stream_json(raw: str) -> str:
         if not line:
             continue
         try:
-            record = json_loads(line, dict[str, object])
+            record = json.loads(line)
         except json.JSONDecodeError as e:
             raise ValueError(f"invalid JSON line in stream-json input: {e}") from e
         # A non-object raises ``ReadError``, which is fatal. A bare ``{}`` is a
         # valid prompt-less line and must be skipped, exactly like the
         # prompt-less ``{"other": "data"}``.
+        if not isinstance(record, dict):
+            raise ReadError(f"Expected dict, got {type(record).__name__}")
         p = from_plain(record.get("prompt"), str, default="")
         if p:
             prompts.append(p)

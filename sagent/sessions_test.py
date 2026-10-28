@@ -171,6 +171,8 @@ def test_existing_scope_dir_returns_most_recent(tmp_path: Path) -> None:
     # Force ordering.
     os.utime(old, (1, 1))
     os.utime(new, (1_000_000, 1_000_000))
+    os.utime(old / "session.jsonl", (1, 1))
+    os.utime(new / "session.jsonl", (1_000_000, 1_000_000))
     selected = existing_scope_dir(scope, base=tmp_path)
     assert selected == new
 
