@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from types import MappingProxyType
 from typing import TYPE_CHECKING, cast, override
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import json
-import operator
 
 from treekle import from_plain
 
@@ -18,6 +17,8 @@ import pytest
 
 from sagent.agent.retry import error_status, is_retryable
 from sagent.bin.cli import DEFAULT_TOOLS, resolve_tools
+from sagent.catalog.anthropic import api
+from sagent.catalog.table import ModelCatalog, ModelTable
 from sagent.providers.anthropic.api import (
     Anthropic,
     _AnthropicModel,
@@ -36,10 +37,12 @@ from sagent.providers.lib.errors import (
     StreamingResponseNotReadError,
 )
 from sagent.providers.lib.id_remap import IdRemapper
+from sagent.tools import tool
 from sagent.types.capability import (
     ModelCapability,
     ModelLimits,
     ModelSettings,
+    ThinkingCapability,
 )
 from sagent.types.cost import (
     PriceCatalog,
@@ -56,10 +59,10 @@ from sagent.types.runtime import (
     DETACHED_PLACEHOLDER,
     AssistantMessage,
     BytesMessage,
-    ModelContextEvent,
     ToolCall,
     ToolResult,
     UserMessage,
+    WireMessage,
 )
 
 
@@ -81,9 +84,59 @@ else:
     MessageParam = lazy_import("anthropic.types", "MessageParam")
 
 
+@pytest.fixture(autouse=True)
+def synthetic_catalog(monkeypatch: pytest.MonkeyPatch) -> ModelTable:
+    row = ModelCapability(
+        model_id="example-1.0",
+        wire_model_id="wire-example",
+        approx_chars_per_token=2.5,
+        context={
+            "": ModelLimits(max_request_tokens=600_000, max_response_tokens=96_000),
+            "+200k": ModelLimits(
+                max_request_tokens=200_000,
+                max_response_tokens=48_000,
+            ),
+        },
+        thinking=ThinkingCapability(
+            effort=frozenset({"none", "low", "high"}),
+            budget=frozenset({"none", "auto", "fixed"}),
+            output=frozenset({"none", "text", "redacted"}),
+        ),
+        service_tier=frozenset({"auto", "default", "priority"}),
+        prices=PriceCatalog(
+            {
+                PriceKey("auto"): TokenPrice(
+                    request=3.0,
+                    response=7.0,
+                    cache_write=2.0,
+                    cache_write_1h=4.0,
+                    cache_read=0.5,
+                ),
+            },
+        ),
+    )
+    table = ModelTable(
+        rows=(
+            row,
+            replace(
+                row,
+                model_id="utility-example-1.0",
+                service_tier=frozenset({"auto", "default"}),
+            ),
+        ),
+        roles={"default": "example", "utility": "utility-example"},
+    )
+    monkeypatch.setattr(
+        Anthropic,
+        "catalog",
+        ModelCatalog(models=table, transport=api()),
+    )
+    return table
+
+
 def _free_model() -> _AnthropicModel:
     """Return a model whose every rate is zero -- cost is not what these assert."""
-    m = Anthropic.from_key("k").model("claude-opus-4-7")
+    m = Anthropic.from_key("k").model("wire-example")
     m._capability = replace(
         m.capability,
         prices=PriceCatalog(
@@ -103,7 +156,7 @@ def _free_model() -> _AnthropicModel:
 
 def _fast_model() -> _AnthropicModel:
     """Opus rates with a 2x priority tier, for the billed-speed tests."""
-    m = Anthropic.from_key("k").model("claude-opus-4-8")
+    m = Anthropic.from_key("k").model("wire-example")
     m._capability = replace(
         m.capability,
         prices=PriceCatalog(
@@ -130,24 +183,24 @@ def _fast_model() -> _AnthropicModel:
 
 
 def _make_request(
-    messages: list[ModelContextEvent],
+    messages: list[WireMessage],
 ) -> ModelRequest:
     return ModelRequest(messages=messages)
 
 
 def test_normalized_anthropic_id_uses_vendor_id_on_the_wire() -> None:
-    model = Anthropic.from_key("k").model("opus-5.5")
+    model = Anthropic.from_key("k").model("example-1.0")
     kwargs = model._build_kwargs(
         ModelRequest(messages=[UserMessage(text="hello")]),
         [],
     )
-    assert kwargs["model"] == "claude-opus-5-5"
+    assert kwargs["model"] == "wire-example"
 
 
 def test_the_default_tools_serialize_as_request_json() -> None:
     # Tool schemas are frozen (nested mappingproxy); the SDK posts them with
     # ``json.dumps``, so a shallow copy fails at the first nested object.
-    model = Anthropic.from_key("k").model("opus-5.5")
+    model = Anthropic.from_key("k").model("example-1.0")
     kwargs = model._build_kwargs(
         ModelRequest(
             messages=[UserMessage(text="hello")],
@@ -160,7 +213,7 @@ def test_the_default_tools_serialize_as_request_json() -> None:
 
 @pytest.mark.parametrize(
     "model_id",
-    ["opus-4.7", "opus-4.7+200k", "sonnet-4.6", "fable-5.1", "opus-5.5"],
+    ["example", "example+200k", "utility"],
 )
 def test_no_model_sends_the_retired_1m_context_beta(model_id: str) -> None:
     """1M is the default on every 1M model; the beta header is no longer needed."""
@@ -175,11 +228,11 @@ def test_no_model_sends_the_retired_1m_context_beta(model_id: str) -> None:
 @pytest.mark.parametrize(
     ("model_id", "budget", "output", "display"),
     [
-        ("opus-5.5", "auto", "text", "summarized"),
-        ("opus-4.8", "auto", "text", "summarized"),
-        ("sonnet-5.5", "auto", "redacted", "omitted"),
-        ("opus-4.6", "fixed", "text", "summarized"),
-        ("haiku-4.5", "fixed", "redacted", "omitted"),
+        ("example-1.0", "auto", "text", "summarized"),
+        ("example", "auto", "text", "summarized"),
+        ("example", "auto", "redacted", "omitted"),
+        ("example", "fixed", "text", "summarized"),
+        ("utility-example-1.0", "fixed", "redacted", "omitted"),
     ],
 )
 def test_thinking_output_selects_the_wire_display(
@@ -198,7 +251,7 @@ def test_thinking_output_selects_the_wire_display(
 
 
 def test_thinking_without_an_output_choice_sends_no_display() -> None:
-    model = Anthropic.from_key("k").model("opus-5.5")
+    model = Anthropic.from_key("k").model("example-1.0")
     model.settings.thinking_budget = "auto"
     kwargs = model._build_kwargs(ModelRequest(messages=[]), [])
     assert kwargs["thinking"] == {"type": "adaptive"}
@@ -206,7 +259,7 @@ def test_thinking_without_an_output_choice_sends_no_display() -> None:
 
 def test_no_thinking_sends_no_display() -> None:
     """``display`` is invalid with thinking off; nothing to display."""
-    model = Anthropic.from_key("k").model("opus-4.8")
+    model = Anthropic.from_key("k").model("example")
     model.settings.thinking_output = "text"
     kwargs = model._build_kwargs(ModelRequest(messages=[]), [])
     assert "thinking" not in kwargs
@@ -270,6 +323,107 @@ def test_build_messages_user_text_only() -> None:
     # Cache breakpoint may have rewritten the last block to add cache_control;
     # ensure the underlying text payload is preserved.
     assert any(b.get("text") == "hi" for b in blocks)
+
+
+def test_build_messages_marks_a_cache_point_ahead_of_the_last_message() -> None:
+    document = UserMessage(text="long shared document", cache_point=True)
+    question = UserMessage(text="the question")
+    msgs = _build_messages(_make_request([document, question]), cache_ttl="1h")
+    # Two user messages in a row coalesce into one wire message; both blocks
+    # keep their own cache_control.
+    blocks = [b for m in msgs for b in cast(list[dict[str, object]], m["content"])]
+    marks = [(b.get("text"), b.get("cache_control")) for b in blocks]
+    assert marks == [
+        ("long shared document", {"type": "ephemeral", "ttl": "1h"}),
+        ("the question", {"type": "ephemeral", "ttl": "1h"}),
+    ]
+    plain = _build_messages(_make_request([UserMessage(text="a"), question]))
+    first = cast(list[dict[str, object]], plain[0]["content"])[0]
+    assert "cache_control" not in first
+
+
+def _look(topic: str) -> str:
+    """Look a topic up."""
+    return topic
+
+
+def _peek(topic: str) -> str:
+    """Peek at a topic."""
+    return topic
+
+
+def test_a_tool_gate_change_withdraws_and_restores_tools_where_it_happened() -> None:
+    """Every schema stays in ``tools``; the gate changes as a system message.
+
+    The change sits after the message that made it, so the history before it
+    stays byte-identical and cached, and the last-message mark stays on the
+    user's turn, not on the change.
+    """
+    request = ModelRequest(
+        messages=[
+            UserMessage(text="a", offered_tools=("Look",)),
+            AssistantMessage(text="ok"),
+            UserMessage(text="b", offered_tools=("Look", "Peek")),
+        ],
+        tools=[tool(_look, name="Look"), tool(_peek, name="Peek")],
+    )
+    msgs = _build_messages(request)
+    assert [m["role"] for m in msgs] == [
+        "user",
+        "system",
+        "assistant",
+        "user",
+        "system",
+    ]
+    peek = {"type": "tool_reference", "name": "Peek"}
+    assert msgs[1]["content"] == [{"type": "tool_removal", "tool": peek}]
+    assert msgs[4]["content"] == [{"type": "tool_addition", "tool": peek}]
+    last_user = cast(list[dict[str, object]], msgs[3]["content"])
+    assert "cache_control" in last_user[-1]
+    model = Anthropic.from_key("k").model("example-1.0")
+    headers = cast(dict[str, str], model._build_kwargs(request, msgs)["extra_headers"])
+    assert "inline-tools-2026-09-15" in headers["anthropic-beta"]
+
+
+def test_an_unchanged_offer_sends_no_tool_change() -> None:
+    request = ModelRequest(
+        messages=[UserMessage(text="a", offered_tools=("Look", "Peek"))],
+        tools=[tool(_look, name="Look"), tool(_peek, name="Peek")],
+    )
+    msgs = _build_messages(request)
+    assert [m["role"] for m in msgs] == ["user"]
+    model = Anthropic.from_key("k").model("example-1.0")
+    headers = cast(
+        dict[str, str],
+        model._build_kwargs(request, msgs).get("extra_headers") or {},
+    )
+    assert "inline-tools" not in headers.get("anthropic-beta", "")
+
+
+def test_build_messages_keeps_cache_marks_within_anthropic_s_four() -> None:
+    """The API rejects a request with more than 4 ``cache_control`` blocks.
+
+    Each system block and the last message take one; the newest
+    ``cache_point``s keep what is left, as the ones nearest the reusable end.
+    """
+    docs = [UserMessage(text=f"doc {i}", cache_point=True) for i in range(3)]
+    cases: list[tuple[tuple[str, ...], list[str]]] = [
+        (("a", "b"), ["doc 2"]),
+        (("a", "", "c"), ["doc 2"]),
+        (("a",), ["doc 1", "doc 2"]),
+        (("a", "b", "c"), []),
+    ]
+    for system, kept in cases:
+        msgs = _build_messages(
+            ModelRequest(messages=[*docs, UserMessage(text="q")], system=system),
+        )
+        marked = [
+            b.get("text")
+            for m in msgs
+            for b in cast(list[dict[str, object]], m["content"])
+            if "cache_control" in b
+        ]
+        assert marked == [*kept, "q"]
 
 
 def test_build_messages_assistant_with_tool_call_remaps_id() -> None:
@@ -663,7 +817,7 @@ def test_parse_response_cache_tokens_split_correctly() -> None:
         cache_creation=200,
         cache_read=400,
     )
-    model = Anthropic.from_key("k").model("claude-opus-4-7")
+    model = Anthropic.from_key("k").model("wire-example")
     model._capability = replace(
         model.capability,
         prices=PriceCatalog(
@@ -711,15 +865,14 @@ def test_anthropic_from_env_reads(monkeypatch: pytest.MonkeyPatch) -> None:
     assert p._api_key == "sk-ant-key"
 
 
-def test_anthropic_model_known_id_returns_backend() -> None:
+def test_anthropic_model_known_id_returns_backend(
+    synthetic_catalog: ModelTable,
+) -> None:
     p = Anthropic.from_key("k")
-    m = p.model("haiku-4.5")
-    assert m.capability.model_id == "haiku-4.5"
-    assert m.capability.wire_model_id == "claude-haiku-4-5"
-    # Haiku supports thinking via ``enabled`` only (measured: 249 readable
-    # thinking chars; ``adaptive`` 400s 'not supported on this model').
-    assert m.capability.thinking.budget != frozenset({"none"})
-    assert m.limits.max_request_tokens == 200_000
+    m = p.model("example-1.0")
+    expected = synthetic_catalog["example"] & api()
+    assert m.capability == expected
+    assert m.limits == expected.context[""]
 
 
 def test_anthropic_model_unknown_id_raises() -> None:
@@ -728,16 +881,21 @@ def test_anthropic_model_unknown_id_raises() -> None:
         _ = p.model("unknown-claude")
 
 
+def _call(fn: Callable[..., object], *args: object, **kwargs: object) -> object:
+    """Call ``fn`` past its signature, as a caller with a typo would."""
+    return fn(*args, **kwargs)
+
+
 def test_anthropic_model_rejects_unknown_provider_options() -> None:
     p = Anthropic.from_key("k")
     with pytest.raises(TypeError, match="typoo"):
-        _ = operator.methodcaller("model", "opus-4.8", typoo=True)(p)
+        _ = _call(p.model, "example", typoo=True)
 
 
 def test_anthropic_model_strips_context_tag_for_profile_lookup() -> None:
     """``+200k`` selects the smaller context profile."""
     p = Anthropic.from_key("k")
-    m = p.model("claude-sonnet-4-6+200k")
+    m = p.model("wire-example+200k")
     assert m.limits.max_request_tokens == 200_000
 
 
@@ -747,28 +905,21 @@ def test_anthropic_default_model_resolves() -> None:
     assert m.capability.model_id == p.catalog.resolve("default")[0].model_id
 
 
-def test_anthropic_roles_resolve_to_the_latest_of_each_family() -> None:
-    """Opus 5.5 is natively 1M, so the default needs no context beta."""
+@pytest.mark.parametrize("role", ["best", "default", "everyday", "utility"])
+def test_anthropic_roles_resolve(role: str, synthetic_catalog: ModelTable) -> None:
     p = Anthropic.from_key("k")
-    assert p.catalog.resolve("best")[0].model_id == "fable-5.1"
-    assert p.catalog.resolve("default")[0].model_id == "opus-5.5"
-    assert p.catalog.resolve("utility")[0].model_id == "sonnet-5.5"
-    assert p.model().limits.max_request_tokens == 1_000_000
-    assert "context-1m-2025-08-07" not in p.model().limits.request_betas
+    assert p.model(role).capability.model_id == synthetic_catalog[role].model_id
 
 
-def test_anthropic_opus_5_5_defaults_to_full_window() -> None:
+def test_anthropic_context_selection_preserves_tag(
+    synthetic_catalog: ModelTable,
+) -> None:
     p = Anthropic.from_key("k")
-    full = p.model("opus-5.5")
-    small = p.model("opus-5.5+200k")
-    assert full.limits.max_request_tokens == 1_000_000
-    assert small.limits.max_request_tokens == 200_000
-
-
-def test_anthropic_utility_model_uses_latest_sonnet() -> None:
-    p = Anthropic.from_key("k")
-    m = p.model("utility")
-    assert m.capability.model_id == "sonnet-5.5"
+    full = p.model("example")
+    small = p.model("example+200k")
+    assert full.limits == synthetic_catalog["example"].context[""]
+    assert small.limits == synthetic_catalog["example"].context["+200k"]
+    assert small.tagged_model_id == "example-1.0+200k"
 
 
 def test_anthropic_subscription_property_false_on_api_key() -> None:
@@ -776,97 +927,32 @@ def test_anthropic_subscription_property_false_on_api_key() -> None:
 
 
 def test_anthropic_model_is_context_overflow_via_prompt_too_long() -> None:
-    p = Anthropic.from_key("k")
-    m = p.model("claude-haiku-4-5")
+    m = Anthropic.from_key("k").model("example")
     assert m.is_context_overflow(PromptTooLongError("too long")) is True
 
 
 def test_anthropic_model_token_estimate_uses_profile_approx_chars_per_token() -> None:
-    p = Anthropic.from_key("k")
-    m = p.model("claude-opus-4-7")
-    # approx_chars_per_token = 2.38 for the Claude 5 / 4.8 / 4.7 tokenizer.
+    m = Anthropic.from_key("k").model("example")
     assert m.approx_text_tokens("a" * 28) == 11
 
 
-def test_anthropic_model_pricing_exposed() -> None:
-    p = Anthropic.from_key("k")
-    m = p.model("claude-haiku-4-5")
-    assert m.capability.prices[PriceKey("auto")].request > 0
-
-
-def test_anthropic_fable_5_1_model_profile() -> None:
-    # Measured against the live API 2026-08-30: ``GET /v1/models/claude-fable-5-1``
-    # reports max_input_tokens 1000000, max_tokens 128000, efforts low..max,
-    # thinking.adaptive only (``enabled`` 400s), and no ``speed`` parameter.
-    p = Anthropic.from_key("k")
-    m = p.model("claude-fable-5-1")
-    assert m.limits.max_request_tokens == 1_000_000
-    assert m.limits.max_response_tokens == 128_000
-    assert m.capability.prices[PriceKey("auto")].request == 10.0
-    assert m.capability.prices[PriceKey("auto")].response == 50.0
-    assert m.capability.thinking.effort == frozenset(
-        {"none", "low", "medium", "high", "xhigh", "max"},
-    )
-    assert "priority" not in m.capability.service_tier
-    # ``enabled`` 400s, so the row offers the adaptive budget only.
-    assert m.capability.thinking.budget == frozenset({"none", "auto"})
-
-
-def test_anthropic_fable_5_1_smaller_context() -> None:
-    p = Anthropic.from_key("k")
-    m = p.model("fable-5.1+200k")
-    assert m.tagged_model_id == "fable-5.1+200k"
-    assert m.limits.max_request_tokens == 200_000
-
-
-def test_anthropic_fable_model_profile() -> None:
-    p = Anthropic.from_key("k")
-    m = p.model("claude-fable-5")
-    assert m.limits.max_request_tokens == 1_000_000
-    assert m.limits.max_response_tokens == 128_000
-    assert m.capability.prices[PriceKey("auto")].request == 10.0
-    assert m.capability.prices[PriceKey("auto")].response == 50.0
-    assert m.capability.prices[PriceKey("auto")].cache_write == 12.5
-    assert m.capability.prices[PriceKey("auto")].cache_read == 1.0
-
-
-def test_anthropic_fable_smaller_context() -> None:
-    p = Anthropic.from_key("k")
-    m = p.model("fable-5.0+200k")
-    assert m.tagged_model_id == "fable-5.0+200k"
-    assert m.limits.max_request_tokens == 200_000
-
-
-def test_anthropic_sonnet_5_model_profile() -> None:
-    p = Anthropic.from_key("k")
-    m = p.model("claude-sonnet-5")
-    assert m.limits.max_request_tokens == 1_000_000
-    assert m.limits.max_response_tokens == 128_000
-    # $2/$10 launched as introductory pricing through 2026-08-31; Anthropic
-    # cancelled the scheduled rise to $3/$15 and made it the standard rate.
-    assert m.capability.prices[PriceKey("auto")].request == 2.0
-    assert m.capability.prices[PriceKey("auto")].response == 10.0
-    assert m.capability.thinking.effort == frozenset(
-        {"none", "low", "medium", "high", "xhigh", "max"},
-    )
-
-
-def test_anthropic_sonnet_5_smaller_context() -> None:
-    p = Anthropic.from_key("k")
-    m = p.model("sonnet-5.0+200k")
-    assert m.tagged_model_id == "sonnet-5.0+200k"
-    assert m.limits.max_request_tokens == 200_000
+def test_anthropic_model_pricing_exposed(synthetic_catalog: ModelTable) -> None:
+    m = Anthropic.from_key("k").model("example")
+    assert m.capability.prices is synthetic_catalog["example"].prices
 
 
 @pytest.mark.asyncio
 async def test_anthropic_actual_request_tokens_calls_count_tokens() -> None:
     """``actual_request_tokens`` routes through the SDK's ``count_tokens``."""
     p = Anthropic.from_key("k")
-    m = p.model("claude-opus-4-7")
+    m = p.model("wire-example")
     fake_sdk = MagicMock()
     fake_result = MagicMock()
     fake_result.input_tokens = 42
-    fake_sdk.messages.count_tokens = AsyncMock(return_value=fake_result)
+    count_tokens = AsyncMock(return_value=fake_result)
+    messages = MagicMock()
+    messages.count_tokens = count_tokens
+    fake_sdk.messages = messages
     with patch.object(p, "get_sdk", AsyncMock(return_value=fake_sdk)):
         n = await m.actual_request_tokens(
             ModelRequest(messages=[UserMessage(text="ping")]),
@@ -874,12 +960,12 @@ async def test_anthropic_actual_request_tokens_calls_count_tokens() -> None:
     assert n == 42
     # ``count_tokens`` rejects kwargs that ``create`` accepts -- verify
     # we stripped them before the call.
-    await_args = fake_sdk.messages.count_tokens.await_args
+    await_args = count_tokens.await_args
     assert await_args is not None
     kwargs = cast(dict[str, object], await_args.kwargs)
     assert "max_tokens" not in kwargs
     assert "temperature" not in kwargs
-    assert kwargs["model"] == "claude-opus-4-7"
+    assert kwargs["model"] == "wire-example"
 
 
 def test_anthropic_token_count_default_typing() -> None:
@@ -891,27 +977,25 @@ def test_anthropic_token_count_default_typing() -> None:
 
 def test_anthropic_model_capability() -> None:
     p = Anthropic.from_key("k")
-    m = p.model("claude-opus-4-7")
+    m = p.model("wire-example")
     assert m.capability.thinking.effort != frozenset({"none"})
     assert m.capability.cache_ttl_sec == frozenset({300.0, 3600.0})
     assert m.capability.retries_internally is True
     assert m.capability.manage_context_server_side == frozenset({False, True})
     assert m.capability.account_auth is False
-    # 4-7 withdrew fast mode, so it prices no ``priority``; ``flex`` is not
-    # an Anthropic tier at all.
-    assert m.capability.service_tier == frozenset({"auto", "default"})
+    assert m.capability.service_tier == frozenset({"auto", "default", "priority"})
 
 
 def test_anthropic_model_supports_context_management_when_opted_in() -> None:
     p = Anthropic.from_key("k", server_side_context_management=True)
-    m = p.model("claude-opus-4-7")
+    m = p.model("wire-example")
     assert m.capability.manage_context_server_side == frozenset({False, True})
 
 
 def test_anthropic_build_kwargs_sends_default_tier_as_standard_only() -> None:
     """The Messages API ``service_tier`` enum is ``auto`` | ``standard_only``."""
     p = Anthropic.from_key("k")
-    m = p.model("claude-opus-4-7")
+    m = p.model("wire-example")
     m._settings = replace(m.settings, service_tier="default")
     kwargs = m._build_kwargs(ModelRequest(messages=[UserMessage(text="x")]), [])
     assert kwargs["service_tier"] == "standard_only"
@@ -920,20 +1004,15 @@ def test_anthropic_build_kwargs_sends_default_tier_as_standard_only() -> None:
 def test_anthropic_build_kwargs_omits_the_default_tier() -> None:
     """``auto`` is "let the vendor pick"; sending it pins nothing."""
     p = Anthropic.from_key("k")
-    m = p.model("claude-opus-4-7")
+    m = p.model("wire-example")
     kwargs = m._build_kwargs(ModelRequest(messages=[UserMessage(text="x")]), [])
     assert "service_tier" not in kwargs
 
 
 def test_anthropic_build_kwargs_enabled_thinking_respects_max_tokens_cap() -> None:
-    # A fixed budget must never push ``max_tokens`` past the model's
-    # output cap. opus-4-6's profile cap equals the API ceiling (128k), so
-    # the old unconditional ``max_tok * 2`` emitted 256k and the API
-    # rejected it. ``budget_tokens`` must stay strictly below
-    # ``max_tokens`` per Anthropic's contract. Uses 4-6 because it is the
-    # newest row that still offers the ``fixed`` budget.
+    # Doubling the reply budget must not exceed the row's output ceiling.
     p = Anthropic.from_key("k")
-    m = p.model("claude-opus-4-6")
+    m = p.model("wire-example")
     m._settings = replace(m.settings, thinking_budget="fixed")
     kwargs = m._build_kwargs(ModelRequest(messages=[UserMessage(text="x")]), [])
     max_tokens = from_plain(kwargs["max_tokens"], int)
@@ -945,7 +1024,7 @@ def test_anthropic_build_kwargs_enabled_thinking_respects_max_tokens_cap() -> No
 
 def test_anthropic_build_kwargs_fixed_thinking_budget_meets_api_floor() -> None:
     """Anthropic rejects ``budget_tokens < 1024``, however small the reply."""
-    m = Anthropic.from_key("k").model("claude-opus-4-6")
+    m = Anthropic.from_key("k").model("wire-example")
     m._settings = replace(m.settings, thinking_budget="fixed")
     kwargs = m._build_kwargs(
         ModelRequest(messages=[UserMessage(text="x")], max_response_tokens=500),
@@ -957,44 +1036,6 @@ def test_anthropic_build_kwargs_fixed_thinking_budget_meets_api_floor() -> None:
     assert budget < from_plain(kwargs["max_tokens"], int)
 
 
-def test_anthropic_thinking_axes_opus_4_6() -> None:
-    """opus-4-6 streams readable thinking and accepts a fixed budget."""
-    m = Anthropic.from_key("k").model("claude-opus-4-6")
-    assert m.capability.thinking.budget == frozenset({"none", "auto", "fixed"})
-    assert m.capability.thinking.output == frozenset({"none", "text", "redacted"})
-
-
-def test_anthropic_thinking_axes_opus_4_8_adaptive_only() -> None:
-    """opus-4-8 rejects ``enabled``; ``display: summarized`` returns text."""
-    p = Anthropic.from_key("k")
-    for model_id in ("claude-opus-4-8", "claude-opus-4-8+200k"):
-        m = p.model(model_id)
-        assert m.capability.thinking.budget == frozenset({"none", "auto"}), model_id
-        assert m.capability.thinking.output == frozenset(
-            {"none", "text", "redacted"},
-        ), model_id
-
-
-def test_anthropic_thinking_axes_4_5_generation_enabled_only() -> None:
-    """The 4-5 generation 400s on ``adaptive`` and streams readable text."""
-    p = Anthropic.from_key("k")
-    for model_id in ("claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-4-5"):
-        m = p.model(model_id)
-        assert m.capability.thinking.budget == frozenset({"none", "fixed"}), model_id
-        assert "text" in m.capability.thinking.output, model_id
-
-
-def test_anthropic_priority_tier_is_opus_only() -> None:
-    """Fast mode is Opus 5 and Opus 4.8 only; 4-7 withdrew it, 4-6 never had it."""
-    p = Anthropic.from_key("k")
-    assert "priority" in p.model("claude-opus-4-8").capability.service_tier
-    assert "priority" in p.model("claude-opus-4-8+200k").capability.service_tier
-    assert "priority" not in p.model("claude-fable-5-1").capability.service_tier
-    assert "priority" not in p.model("claude-fable-5").capability.service_tier
-    assert "priority" not in p.model("claude-sonnet-5").capability.service_tier
-    assert "priority" not in p.model("claude-haiku-4-5").capability.service_tier
-
-
 def test_anthropic_priority_tier_sets_speed_and_beta() -> None:
     """``speed`` rides ``extra_body``: the stream path is a raw POST.
 
@@ -1003,7 +1044,7 @@ def test_anthropic_priority_tier_sets_speed_and_beta() -> None:
     alone: ``priority`` is not a value of the API's ``service_tier`` enum.
     """
     p = Anthropic.from_key("k")
-    m = p.model("claude-opus-4-8")
+    m = p.model("wire-example")
     m._settings = replace(m.settings, service_tier="priority")
     kwargs = m._build_kwargs(ModelRequest(messages=[UserMessage(text="x")]), [])
     body = cast(dict[str, object], kwargs["extra_body"])
@@ -1015,7 +1056,7 @@ def test_anthropic_priority_tier_sets_speed_and_beta() -> None:
 
 def test_anthropic_priority_tier_is_unselectable_on_an_unsupported_model() -> None:
     """The capability rejects it up front rather than billing standard."""
-    m = Anthropic.from_key("k").model("claude-fable-5")
+    m = Anthropic.from_key("k").model("utility-example")
     with pytest.raises(ValueError, match="service_tier"):
         m.settings.service_tier = "priority"
 
@@ -1044,31 +1085,6 @@ def test_parse_response_bills_standard_when_server_falls_back() -> None:
     assert resp.spend.response == 25.0
 
 
-def test_anthropic_model_image_limits() -> None:
-    p = Anthropic.from_key("k")
-    m = p.model("claude-opus-4-7")
-    # opus-4-7 is a high-resolution model: native long edge 2576 px (server
-    # downscales above this), per the Anthropic Vision docs.
-    assert m.limits.max_image_edge_px == 2576
-    # 10 MB base64-encoded on the Claude API, i.e. 7.5 MB raw.
-    assert m.limits.max_image_bytes == 7_500_000
-
-
-def test_anthropic_standard_model_image_dim_is_native_1568() -> None:
-    """Pre-4.7 models cap the native long edge at 1568 px, not the high-res 2576."""
-    m = Anthropic.from_key("k").model("claude-sonnet-4-5")
-    assert m.limits.max_image_edge_px == 1568
-
-
-def test_anthropic_model_max_request_bytes() -> None:
-    """Anthropic's request wire ceiling is ~32 MB (distinct from per-image)."""
-    p = Anthropic.from_key("k")
-    m = p.model("claude-opus-4-7")
-    assert m.limits.max_request_bytes == 32 * 1024 * 1024
-    # The request ceiling is much larger than the per-image cap.
-    assert m.limits.max_request_bytes > m.limits.max_image_bytes
-
-
 def test_anthropic_image_byte_limits_read_from_the_row_not_a_constant() -> None:
     """The three byte/image limits come from the capability, per-model.
 
@@ -1077,7 +1093,7 @@ def test_anthropic_image_byte_limits_read_from_the_row_not_a_constant() -> None:
     without touching the provider class.
     """
     row = ModelCapability(
-        model_id="claude-opus-4-7",
+        model_id="wire-example",
         context=MappingProxyType(
             {
                 "": ModelLimits(
@@ -1100,7 +1116,7 @@ def test_anthropic_image_byte_limits_read_from_the_row_not_a_constant() -> None:
 
 def test_anthropic_model_is_context_overflow_non_api_status_error() -> None:
     p = Anthropic.from_key("k")
-    m = p.model("claude-opus-4-7")
+    m = p.model("wire-example")
     assert m.is_context_overflow(RuntimeError("anything")) is False
 
 
@@ -1112,7 +1128,7 @@ def test_anthropic_byte_limit_not_classified_as_context_overflow() -> None:
     return False so the byte case routes to byte-overflow recovery.
     """
     p = Anthropic.from_key("k")
-    m = p.model("claude-opus-4-7")
+    m = p.model("wire-example")
     err = _request_too_large_error("Request exceeds the maximum size")
     assert m.is_context_overflow(err) is False
 
@@ -1136,7 +1152,7 @@ def test_anthropic_byte_413_without_structured_body_stays_byte() -> None:
         body=None,  # No structured body -> falls to substring path.
     )
     p = Anthropic.from_key("k")
-    m = p.model("claude-opus-4-7")
+    m = p.model("wire-example")
     assert m.is_context_overflow(err) is False
 
 
@@ -1148,7 +1164,7 @@ async def test_anthropic_stream_request_too_large_raises_typed_error() -> None:
     diagnostics and the retry classifier can inspect the provider error.
     """
     p = Anthropic.from_key("k")
-    m = p.model("claude-opus-4-7")
+    m = p.model("wire-example")
     err = _request_too_large_error(
         "Request exceeds the maximum allowed number of bytes."
         " The maximum request size is 32 MB",
@@ -1227,14 +1243,14 @@ def test_anthropic_model_is_context_overflow_unusual_status_with_overflow_text()
     code adds nothing.
     """
     p = Anthropic.from_key("k")
-    m = p.model("claude-opus-4-7")
+    m = p.model("wire-example")
     err = _api_status_error(414, "Request size exceeds model context window")
     assert m.is_context_overflow(err) is True
 
 
 def test_anthropic_model_is_context_overflow_uses_structured_body() -> None:
     p = Anthropic.from_key("k")
-    m = p.model("claude-opus-4-7")
+    m = p.model("wire-example")
     err = _api_status_error(400, "Request size exceeds model context window")
     err.args = ("unrelated invalid request",)
 
@@ -1244,7 +1260,7 @@ def test_anthropic_model_is_context_overflow_uses_structured_body() -> None:
 @pytest.mark.asyncio
 async def test_anthropic_stream_uses_structured_overflow_body() -> None:
     p = Anthropic.from_key("k")
-    m = p.model("claude-opus-4-7")
+    m = p.model("wire-example")
     err = _api_status_error(400, "Request size exceeds model context window")
     err.args = ("unrelated invalid request",)
 
@@ -1272,7 +1288,7 @@ async def test_anthropic_stream_uses_structured_overflow_body() -> None:
 async def test_anthropic_stream_raises_policy_blocked_error(message: str) -> None:
     """Safeguard 400s preserve Anthropic's reason and stop same-context retries."""
     p = Anthropic.from_key("k")
-    m = p.model("claude-opus-4-7")
+    m = p.model("wire-example")
     request_id = "req_policy_block"
     err = _api_status_error(400, message, request_id=request_id)
 
@@ -1298,7 +1314,7 @@ async def test_anthropic_stream_raises_policy_blocked_error(message: str) -> Non
 async def test_anthropic_auth_retry_normalizes_policy_error() -> None:
     """The second request must pass through the same error boundary as the first."""
     p = Anthropic.from_key("k")
-    m = p.model("claude-opus-4-7")
+    m = p.model("wire-example")
     request = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
     response = httpx2.Response(401, request=request)
     auth_error = anthropic_sdk.AuthenticationError(
@@ -1329,7 +1345,7 @@ async def test_anthropic_auth_retry_normalizes_policy_error() -> None:
 async def test_anthropic_stream_preserves_unrelated_invalid_request() -> None:
     """An ordinary invalid request must retain the SDK's diagnostic taxonomy."""
     p = Anthropic.from_key("k")
-    m = p.model("claude-opus-4-7")
+    m = p.model("wire-example")
     err = _api_status_error(400, "tools.0.name is invalid")
 
     with (
@@ -1360,7 +1376,7 @@ async def test_anthropic_stream_does_not_misclassify_unrelated_block(
 ) -> None:
     """A rejection citing a non-safety policy is not a provider safety decision."""
     p = Anthropic.from_key("k")
-    m = p.model("claude-opus-4-7")
+    m = p.model("wire-example")
     err = _api_status_error(400, message)
 
     with (
@@ -1374,6 +1390,21 @@ async def test_anthropic_stream_does_not_misclassify_unrelated_block(
         await m.stream(ModelRequest(messages=[UserMessage(text="hi")]))
 
     assert raised.value is err
+
+
+@pytest.mark.asyncio
+async def test_anthropic_sdk_connect_timeout_outlasts_a_network_stall() -> None:
+    """The SDK default connect timeout is 5s; a Wi-Fi stall outlasted it.
+
+    Only ``send_with_retry`` retries: the SDK's own two retries made one stalled
+    attempt three 30s connects, so five attempts blocked for ~450s.
+    """
+    sdk = await Anthropic.from_key("k").get_sdk()
+    timeout = sdk.timeout
+    assert isinstance(timeout, httpx2.Timeout)
+    assert (timeout.connect, timeout.read) == (30.0, 600.0)
+    assert sdk.max_retries == 0
+    await sdk.close()
 
 
 @pytest.mark.asyncio
@@ -1403,7 +1434,7 @@ async def test_anthropic_raw_stream_reads_status_error_body() -> None:
         await _raw_message_stream(
             sdk,
             {
-                "model": "claude-opus-4-7",
+                "model": "wire-example",
                 "messages": [],
                 "max_tokens": 1,
             },
@@ -1444,14 +1475,14 @@ async def test_anthropic_stream_status_body_overflow_triggers_prompt_too_long() 
         patch.object(sdk._client, "send", AsyncMock(return_value=response)),
         patch.object(p, "get_sdk", AsyncMock(return_value=sdk)),
     ):
-        m = p.model("claude-opus-4-7")
+        m = p.model("wire-example")
         with pytest.raises(PromptTooLongError):
             await m.stream(ModelRequest(messages=[UserMessage(text="hi")]))
 
 
 def test_response_not_read_provider_error_preserves_retry_status() -> None:
     p = Anthropic.from_key("k")
-    m = p.model("claude-opus-4-7")
+    m = p.model("wire-example")
     err = _ResponseNotReadStatusError(529)
 
     assert is_retryable(err, m) is True
@@ -1465,7 +1496,7 @@ async def test_anthropic_stream_wraps_bare_response_not_read() -> None:
     # error (so the retry classifier deems it fatal). It must be wrapped
     # in a user-facing error rather than surface as a bare exception.
     p = Anthropic.from_key("k")
-    m = p.model("claude-opus-4-8")
+    m = p.model("wire-example")
     with (
         patch.object(p, "get_sdk", AsyncMock(return_value=MagicMock())),
         patch(
@@ -1482,7 +1513,7 @@ async def test_anthropic_stream_wraps_chained_response_not_read() -> None:
     # The SDK can chain ``ResponseNotRead`` under another exception while
     # formatting an error from an unread streaming body.
     p = Anthropic.from_key("k")
-    m = p.model("claude-opus-4-8")
+    m = p.model("wire-example")
     wrapped = RuntimeError("stream formatting failed")
     wrapped.__cause__ = httpx2.ResponseNotRead()
     with (
@@ -1506,7 +1537,7 @@ async def test_anthropic_stream_preserves_retryable_status_over_response_not_rea
     # fatal StreamingResponseNotReadError. The body-read crash is handled
     # downstream in retry.py::_response_body_excerpt.
     p = Anthropic.from_key("k")
-    m = p.model("claude-opus-4-8")
+    m = p.model("wire-example")
     err = _api_status_error(429, "Rate limited")
     err.__cause__ = httpx2.ResponseNotRead()
     with (
@@ -1527,12 +1558,13 @@ async def test_anthropic_provider_close_sdk_closes_shared_sdk() -> None:
     """The provider owns the client, so the provider closes it."""
     p = Anthropic.from_key("k")
     fake_sdk = MagicMock()
-    fake_sdk.close = AsyncMock()
+    close = AsyncMock()
+    fake_sdk.close = close
     p._sdk = cast("anthropic_sdk.AsyncAnthropic", fake_sdk)
 
     await p.close_sdk()
 
-    fake_sdk.close.assert_awaited_once()
+    close.assert_awaited_once()
     assert p._sdk is None
 
 
@@ -1545,55 +1577,56 @@ async def test_closing_one_model_leaves_a_sibling_model_usable() -> None:
     Tearing down the shared client there strands the advisor mid-call.
     """
     p = Anthropic.from_key("k")
-    model = p.model("claude-opus-4-7")
-    _advisor = p.model("claude-sonnet-4-5")
+    model = p.model("wire-example")
+    _advisor = p.model("utility-example")
     fake_sdk = MagicMock()
-    fake_sdk.close = AsyncMock()
+    close = AsyncMock()
+    fake_sdk.close = close
     p._sdk = cast("anthropic_sdk.AsyncAnthropic", fake_sdk)
 
     await model.close()
 
-    fake_sdk.close.assert_not_awaited()
+    close.assert_not_awaited()
     assert p._sdk is fake_sdk
 
 
 def test_anthropic_model_is_retryable_provider_error_rate_limit() -> None:
     p = Anthropic.from_key("k")
-    m = p.model("claude-opus-4-7")
+    m = p.model("wire-example")
     err = _BodyError({"type": "rate_limit_error"})
     assert m.is_retryable_provider_error(err) is True
 
 
 def test_anthropic_model_is_retryable_provider_error_nested_api_error() -> None:
     p = Anthropic.from_key("k")
-    m = p.model("claude-opus-4-7")
+    m = p.model("wire-example")
     err = _BodyError({"type": "error", "error": {"type": "api_error"}})
     assert m.is_retryable_provider_error(err) is True
 
 
 def test_anthropic_model_is_retryable_provider_error_nested_invalid_request() -> None:
     p = Anthropic.from_key("k")
-    m = p.model("claude-opus-4-7")
+    m = p.model("wire-example")
     err = _BodyError({"type": "error", "error": {"type": "invalid_request_error"}})
     assert m.is_retryable_provider_error(err) is False
 
 
 def test_anthropic_model_is_retryable_provider_error_unrelated_type() -> None:
     p = Anthropic.from_key("k")
-    m = p.model("claude-opus-4-7")
+    m = p.model("wire-example")
     err = _BodyError({"type": "permanent_error"})
     assert m.is_retryable_provider_error(err) is False
 
 
 def test_anthropic_model_is_retryable_provider_error_no_body_attr() -> None:
     p = Anthropic.from_key("k")
-    m = p.model("claude-opus-4-7")
+    m = p.model("wire-example")
     assert m.is_retryable_provider_error(RuntimeError("x")) is False
 
 
 def test_anthropic_provider_extra_headers_for_1m_omit_the_context_beta() -> None:
     p = Anthropic.from_key("k")
-    model = p.model("opus-4.7")
+    model = p.model("example")
     headers = p.extra_headers(model.capability, model.settings)
     assert "context-1m" not in headers.get("anthropic-beta", "")
 
@@ -1601,21 +1634,21 @@ def test_anthropic_provider_extra_headers_for_1m_omit_the_context_beta() -> None
 def test_anthropic_provider_extra_headers_includes_context_management() -> None:
     """Modern models opt into the context-management beta unconditionally."""
     p = Anthropic.from_key("k")
-    model = p.model("claude-haiku-4-5")
+    model = p.model("wire-example")
     headers = p.extra_headers(model.capability, model.settings)
     assert "context-management-2025-06-27" in headers.get("anthropic-beta", "")
 
 
 def test_anthropic_provider_extra_headers_redact_thinking_opt_in() -> None:
     p = Anthropic.from_key("k", redact_thinking=True)
-    model = p.model("claude-opus-4-7")
+    model = p.model("wire-example")
     headers = p.extra_headers(model.capability, model.settings)
     assert "redact-thinking-2026-02-12" in headers.get("anthropic-beta", "")
 
 
 def test_anthropic_provider_extra_headers_redact_thinking_default_off() -> None:
     p = Anthropic.from_key("k")
-    model = p.model("claude-opus-4-7")
+    model = p.model("wire-example")
     headers = p.extra_headers(model.capability, model.settings)
     assert "redact-thinking-2026-02-12" not in headers.get("anthropic-beta", "")
 
@@ -1623,7 +1656,7 @@ def test_anthropic_provider_extra_headers_redact_thinking_default_off() -> None:
 def test_anthropic_constructor_defaults_keep_optional_features_off() -> None:
     """Direct construction has the same conservative defaults as ``from_key``."""
     p = Anthropic(api_key="k")
-    model = p.model("claude-opus-4-7")
+    model = p.model("wire-example")
 
     assert p.server_side_context_management is False
     headers = p.extra_headers(model.capability, model.settings)
@@ -1650,8 +1683,8 @@ def test_build_kwargs_no_context_management_by_default() -> None:
     must be explicitly opted in (see session bd952b0c audit for rationale).
     """
     p = Anthropic.from_key("k")
-    model = p.model("claude-opus-4-7")
-    req = ModelRequest(messages=[UserMessage(text="hi")], system="s")
+    model = p.model("wire-example")
+    req = ModelRequest(messages=[UserMessage(text="hi")], system=("s",))
     msgs: list[MessageParam] = [
         {"role": "user", "content": [{"type": "text", "text": "hi"}]},
     ]
@@ -1663,10 +1696,10 @@ def test_build_kwargs_no_context_management_by_default() -> None:
 def test_build_kwargs_includes_context_management_when_opted_in() -> None:
     """``server_side_context_management=True`` injects the ``clear_tool_uses`` config."""
     p = Anthropic.from_key("k", server_side_context_management=True)
-    model = p.model("claude-opus-4-7")
+    model = p.model("wire-example")
     req = ModelRequest(
         messages=[UserMessage(text="hi")],
-        system="s",
+        system=("s",),
         max_response_tokens=128_000,
     )
     msgs: list[MessageParam] = [
@@ -1698,12 +1731,12 @@ def test_context_management_unclearable_tool_is_excluded() -> None:
 def test_build_kwargs_context_management_trigger_scales_with_context_window() -> None:
     """``trigger`` is half of the model's context window."""
     p = Anthropic.from_key("k", server_side_context_management=True)
-    req = ModelRequest(messages=[UserMessage(text="hi")], system="s")
+    req = ModelRequest(messages=[UserMessage(text="hi")], system=("s",))
     msgs: list[MessageParam] = [
         {"role": "user", "content": [{"type": "text", "text": "hi"}]},
     ]
 
-    m200 = p.model("claude-opus-4-7+200k")
+    m200 = p.model("wire-example+200k")
     kw200 = m200._build_kwargs(req, msgs)
     body200 = cast(dict[str, object], kw200["extra_body"])
     cm200 = cast(dict[str, object], body200["context_management"])
@@ -1711,13 +1744,13 @@ def test_build_kwargs_context_management_trigger_scales_with_context_window() ->
     trig200 = cast(dict[str, object], edit200["trigger"])
     assert trig200["value"] == 100_000
 
-    m1m = p.model("claude-opus-4-7")
+    m1m = p.model("wire-example")
     kw1m = m1m._build_kwargs(req, msgs)
     body1m = cast(dict[str, object], kw1m["extra_body"])
     cm1m = cast(dict[str, object], body1m["context_management"])
     edit1m = cast(list[dict[str, object]], cm1m["edits"])[0]
     trig1m = cast(dict[str, object], edit1m["trigger"])
-    assert trig1m["value"] == 500_000
+    assert trig1m["value"] == m1m.limits.max_request_tokens // 2
 
 
 def test_build_kwargs_preserves_provider_context_management() -> None:
@@ -1762,8 +1795,8 @@ def test_build_kwargs_preserves_provider_context_management() -> None:
     # Opt the base into server-side clearing so the gate is open -- the
     # test then proves the subclass policy wins over the base default.
     p = _CustomCmAnthropic.from_key("k", server_side_context_management=True)
-    model = p.model("claude-opus-4-7")
-    req = ModelRequest(messages=[UserMessage(text="hi")], system="s")
+    model = p.model("wire-example")
+    req = ModelRequest(messages=[UserMessage(text="hi")], system=("s",))
     msgs: list[MessageParam] = [
         {"role": "user", "content": [{"type": "text", "text": "hi"}]},
     ]
@@ -1781,22 +1814,59 @@ def test_build_kwargs_preserves_provider_context_management() -> None:
     assert trig["value"] == 180_000
 
 
-def test_anthropic_provider_build_system_passthrough() -> None:
+def test_anthropic_provider_build_system_marks_the_static_prefix() -> None:
+    """Requests sharing a system prompt but diverging after it reuse its cache.
+
+    Anthropic writes cache entries only at a breakpoint; a request whose only
+    mark is its last message never matches a sibling's differing tail.
+    """
     p = Anthropic.from_key("k")
-    assert p.build_system("hello") == "hello"
+    assert p.build_system(("hello",)) == [
+        {"type": "text", "text": "hello", "cache_control": {"type": "ephemeral"}},
+    ]
+    assert p.build_system(("hello",), cache_ttl="1h") == [
+        {
+            "type": "text",
+            "text": "hello",
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+        },
+    ]
 
 
 def test_anthropic_provider_build_system_empty_returns_not_given() -> None:
     p = Anthropic.from_key("k")
-    out = p.build_system("")
+    out = p.build_system(())
     # ``anthropic.NOT_GIVEN`` is a sentinel; type is anthropic.NotGiven.
     assert out is anthropic_sdk.NOT_GIVEN
 
 
-def test_anthropic_model_max_response_tokens_from_profile() -> None:
+def test_more_than_three_system_blocks_still_fit_the_four_cache_marks() -> None:
+    """The last message takes one mark; the system blocks may take only three."""
+    request = ModelRequest(
+        messages=[UserMessage(text="q")],
+        system=("a", "b", "c", "d"),
+    )
+    blocks = Anthropic.from_key("k").build_system(request.system)
+    assert isinstance(blocks, list)
+    assert ["cache_control" in b for b in blocks] == [False, True, True, True]
+    marked = [
+        b
+        for m in _build_messages(request)
+        for b in cast(list[dict[str, object]], m["content"])
+        if "cache_control" in b
+    ]
+    assert len(marked) == 1
+
+
+def test_anthropic_model_max_response_tokens_from_profile(
+    synthetic_catalog: ModelTable,
+) -> None:
     p = Anthropic.from_key("k")
-    m = p.model("claude-opus-4-7")
-    assert m.limits.max_response_tokens == 128_000
+    m = p.model("wire-example")
+    assert (
+        m.limits.max_response_tokens
+        == synthetic_catalog["example"].context[""].max_response_tokens
+    )
 
 
 if __name__ == "__main__":

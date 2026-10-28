@@ -230,8 +230,8 @@ class PaperDetails:
             op or "get",
             graph_source,
             s2_wire_id(kind, canonical),
-            bool(influential_only),
-            int(year_from) if year_from is not None else None,
+            influential_only,
+            year_from if year_from is not None else None,
             limit if op else 0,
             cap,
         )

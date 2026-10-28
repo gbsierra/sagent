@@ -26,8 +26,10 @@ That's the entire engine.
 History
 ~~~~~~~
 
-``list[UserMessage | AgentSendMessage | AssistantMessage | ToolResult]``
-(the ``ModelContextEvent`` union). Match on type, not string descriptors.
+``list[UserMessage | AgentSendMessage | AssistantMessage | ToolResult |
+SystemMessage]`` (the ``ModelContextEvent`` union). Match on type, not string
+descriptors. A ``SystemMessage`` is the harness's, no one's turn: alternation, tool
+pairing and the model-call gate all look past it.
 
 Tool task lifecycle
 ~~~~~~~~~~~~~~~~~~~
@@ -202,11 +204,13 @@ via ``runtime.publish(...)``):
 Composition
 ~~~~~~~~~~~
 
-No stubs, no hooks, no callbacks. Extension is via observers on
-published events. If something needs to happen outside the runtime
-(persist session, swap model, track cost, enforce budget), it's an
-event that an observer handles. If you're tempted to add a method
-stub or a callback parameter, publish an event instead.
+No stubs, no hooks. Extension is via observers on published events. If
+something needs to happen outside the runtime (persist session, swap model,
+track cost, enforce budget), it's an event that an observer handles. If
+you're tempted to add a method stub or a callback parameter, publish an
+event instead. The exceptions are the queries the runtime must have answered
+inline, mid-decision (``before_tool_spawn``, ``has_pending_background``,
+``context_updates``); each says why where it is declared.
 
 Why the runtime owns Model and Tool references: the alternative is a
 generic runtime that only processes events, with the Agent calling
@@ -243,6 +247,7 @@ from sagent.agent.context import (
     validate_context,
 )
 from sagent.types.exceptions import (
+    describe,
     log_exception_or_warning,
     log_task_exception,
 )
@@ -284,6 +289,7 @@ from sagent.types.runtime import (
     Recompact,
     RuntimeEvent,
     SaveSession,
+    SystemMessage,
     ToolCall,
     ToolResult,
     ToolResultKind,
@@ -305,9 +311,11 @@ from sagent.types.tape import (
     TapeRef,
     coalesce_roles,
     full_tape_mask,
+    last_turn,
     mask_contains_ref,
     mask_ranges_overlap,
     merge_mask_ranges,
+    same_sender,
     splice_safe_repair,
     unpaired_call_ids,
 )
@@ -790,6 +798,14 @@ class AgentRuntime:
         # predicate-evaluation time; an async one-directional event cannot
         # supply that. Same shape and rationale as ``before_tool_spawn``.
         self.has_pending_background: Callable[[], bool] | None = None
+        # Asked once per model round, as it is confirmed to fire, for the system messages
+        # the Agent layer has to add first (what its context no longer says).
+        # Each is appended as its own ``SystemMessage``, no one's turn, so it can
+        # never fire a round of its own. Not a pure query: the Agent records
+        # what it returned, but checks that record against the history each
+        # round, so a round that then aborts, or a history rewritten under it,
+        # only means the next answer tells it again.
+        self.context_updates: Callable[[], Sequence[SystemMessage]] | None = None
         # Lifted from run_forever locals for observer/REPL visibility.
         # Task[None]: tools/model post results to inbox, not via return.
         self.running_tools: dict[str, asyncio.Task[None]] = {}
@@ -1533,9 +1549,9 @@ class AgentRuntime:
         """Queue an error ``ToolResult`` pairing an already-emitted ``tool_use``."""
         self._pending_commits.append(_PendingCommit(kind="pairing", result=result))
 
-    def _defer_ride_along(self, user: UserMessage) -> None:
-        """Queue system-injected user-side context to ride the next real turn."""
-        self._pending_commits.append(_PendingCommit(kind="ride_along", user=user))
+    def _defer_ride_along(self, note: SystemMessage) -> None:
+        """Queue harness context to ride the next real turn."""
+        self._pending_commits.append(_PendingCommit(kind="ride_along", note=note))
 
     # The single drain for all deferred tape commits. Called at the model gate once a
     # round is confirmed firing (so nothing here wakes the model on its own) and
@@ -1548,10 +1564,11 @@ class AgentRuntime:
     # (``insert_after``), so a mimicked ``tool_use`` pairs in-slot and can never be
     # stranded by intervening turns. - ``forward``: append the synthetic
     # ``DetachedArrived`` pair (a user-role separator first when the tail is an
-    # assistant turn). - ``ride_along``: coalesce onto the user side.
+    # assistant turn). - ``ride_along``: append the system message.
     def _flush_pending(self) -> None:
         """Commit every queued :class:`_PendingCommit`, in arrival order, in-slot."""
-        pending, self._pending_commits = self._pending_commits, []
+        pending = self._pending_commits
+        self._pending_commits = []
         for commit in pending:
             if commit.kind == "pairing":
                 if commit.result is None:
@@ -1562,9 +1579,9 @@ class AgentRuntime:
                     raise ValueError("Expected commit.result is not None.")
                 self._append_detached_arrival(commit.result)
             else:
-                if commit.user is None:
-                    raise ValueError("Expected commit.user is not None.")
-                self.publish(self._append_or_coalesce_user(commit.user))
+                if commit.note is None:
+                    raise ValueError("Expected commit.note is not None.")
+                self.append_history(commit.note)
 
     # Only ``forward`` (a completed detached tool's real result) wakes the model: a
     # finished tool is worth surfacing promptly. ``pairing`` / ``ride_along`` are non-
@@ -1599,7 +1616,8 @@ class AgentRuntime:
     def _append_detached_arrival(self, result: ToolResult) -> None:
         """Append the synthetic ``DetachedArrived`` tool pair for ``result``."""
         messages = self.context().messages
-        if messages and isinstance(messages[-1], AssistantMessage):
+        at = last_turn(messages)
+        if at is not None and isinstance(messages[at], AssistantMessage):
             self._append_or_coalesce_user(
                 UserMessage(text=f"[detached tool {result.call_id} completed]"),
             )
@@ -2140,8 +2158,8 @@ class AgentRuntime:
                             # running-tools membership now -- otherwise the
                             # cohort never empties, the model-call gate
                             # (``not self.cohort``) never fires, and the deferred
-                            # pairing never flushes (deadlock). A ``UserMessage``
-                            # payload is ride-along system context.
+                            # pairing never flushes (deadlock). A ``SystemMessage``
+                            # payload is ride-along harness context.
                             if isinstance(payload, ToolResult):
                                 self.cohort.discard(payload.call_id)
                                 self.running_tools.pop(payload.call_id, None)
@@ -2170,7 +2188,8 @@ class AgentRuntime:
                     and self.model_call is None
                     and self.compact_task is None
                 ):
-                    pending, self._pending_switches = self._pending_switches, []
+                    pending = self._pending_switches
+                    self._pending_switches = []
                     for switch in pending:
                         self._apply_pending_switch(switch)
 
@@ -2224,6 +2243,9 @@ class AgentRuntime:
                     self._flush_pending()
 
                 if self._ready_to_advance and self._should_call_model():
+                    if self.context_updates is not None:
+                        for note in self.context_updates():
+                            self.append_history(note)
                     logger.debug(
                         "runtime model call start: history=%d detached=%d queued=%d",
                         len(self.context().messages),
@@ -2371,12 +2393,16 @@ class AgentRuntime:
         """
         return tuple(self._mid_stream_queue)
 
+    # A system message rides a round that real content drives and never drives one itself, so the
+    # entry that decides is the last turn before any trailing system messages.
     def _should_call_model(self) -> bool:
         """Return True when history ends with content the model should answer."""
         messages = self.context().messages
-        if not messages:
-            return False
-        return isinstance(messages[-1], (UserMessage, AgentSendMessage, ToolResult))
+        at = last_turn(messages)
+        return at is not None and isinstance(
+            messages[at],
+            (UserMessage, AgentSendMessage, ToolResult),
+        )
 
     # The model-call gate's last guard before firing the provider:
     #
@@ -2463,6 +2489,9 @@ class AgentRuntime:
         hr_orphan_refs: list[TapeRef] = []
 
         for idx, entry in enumerate(messages):
+            # No one's turn: a system message neither opens nor closes a tool pair.
+            if isinstance(entry, SystemMessage):
+                continue
             origin = origins[idx]
             origin_record = self._tape_by_ref.get(origin)
             origin_is_hr = isinstance(origin_record, ReferrableTapeEvent)
@@ -2571,37 +2600,32 @@ class AgentRuntime:
         r"""Append ``item`` to history; return the committed entry."""
         resolved = self.context()
         messages = resolved.messages
-        if not messages or wire_role(messages[-1]) != wire_role(item):
+        # The turn ``item`` meets is the last one before any trailing system messages: a
+        # round halted after its system message leaves the system message last, and the human's next
+        # line still joins their unanswered one, with the system message after both.
+        at = last_turn(messages)
+        if at is None or wire_role(messages[at]) != wire_role(item):
             self.append_history(item)
             return item
-        tail = messages[-1]
+        tail = messages[at]
         assert isinstance(tail, (UserMessage, AgentSendMessage))
-        text = f"{tail.text}\n\n{item.text}"
-        attachments = tail.attachments + item.attachments
-        # Same-type merges preserve the tail's id (downstream consumers key
-        # on it). Cross-type merges adopt the agent type when either side
-        # is an ``AgentSendMessage`` so the source attribution survives;
-        # the merged entry then gets a fresh id (the prior tail's identity
-        # is no longer applicable to the changed type).
-        if isinstance(tail, AgentSendMessage):
-            combined: UserMessage | AgentSendMessage = dataclasses.replace(
+        # One sender keeps the tail's type and id (downstream consumers key on
+        # it). Mixed senders take the canonical merge, which labels each part with
+        # its own sender: one ``[from A]`` over the whole named A as the author of
+        # the human's words, or of the agent's reminder.
+        combined = (
+            dataclasses.replace(
                 tail,
-                text=text,
-                attachments=attachments,
+                text=f"{tail.text}\n\n{item.text}",
+                attachments=tail.attachments + item.attachments,
+                # A part anyone saw keeps the whole visible, as ``coalesce_roles``
+                # does: the human's line merged onto a hidden one must still show.
+                hidden=tail.hidden and item.hidden,
             )
-        elif isinstance(item, AgentSendMessage):
-            combined = dataclasses.replace(
-                item,
-                text=text,
-                attachments=attachments,
-            )
-        else:
-            combined = dataclasses.replace(
-                tail,
-                text=text,
-                attachments=attachments,
-            )
-        tail_origin = resolved.origins[-1]
+            if same_sender(tail, item)
+            else _coalesce_user_side((tail, item))
+        )
+        tail_origin = resolved.origins[at]
         # When the visible tail is itself a coalesce splice's payload,
         # the new splice must absorb both that splice AND the original
         # ref(s) the splice was masking -- otherwise killing the splice
@@ -2621,6 +2645,7 @@ class AgentRuntime:
         # plain ``session_id`` match selects the right ones.
         prior_ranges: tuple[MaskRange, ...] = ()
         prior_head: tuple[ModelContextEvent, ...] = ()
+        prior_rest: tuple[ModelContextEvent, ...] = ()
         if isinstance(prior_record, ContextSplice):
             # EVERY range, not just this session's. Absorbing the prior
             # splice's ref kills it, and under undelete semantics that lapses
@@ -2636,8 +2661,13 @@ class AgentRuntime:
             # loses nothing, but a barrier -- resume's ``orphan_tool_result_
             # repair``, ``context_rescue``, ``summary`` -- carries the WHOLE
             # conversation, and dropping it truncated a resumed session to the
-            # one message that coalesced onto it.
-            prior_head = prior_record.payload[:-1]
+            # one message that coalesced onto it. A splice's payload resolves as
+            # one run, so ``tail``'s place in it is its offset from the run's
+            # start; what follows it there (the system messages a compaction kept with the
+            # last turn) is carried after the merge.
+            offset = at - resolved.origins.index(tail_origin)
+            prior_head = prior_record.payload[:offset]
+            prior_rest = prior_record.payload[offset + 1 :]
         own_range = MaskRange(
             session_id=sid,
             lo=tail_origin.ordinal,
@@ -2665,7 +2695,7 @@ class AgentRuntime:
             if record.ref.ordinal >= lo_ord:
                 break
             anchor = record.ref
-        payload = coalesce_roles((*prior_head, combined))
+        payload = coalesce_roles((*prior_head, combined, *prior_rest))
         self.append_splice(
             mask=mask,
             insert_after=anchor,
@@ -2943,9 +2973,10 @@ class AgentRuntime:
             slot = EXCLUSIVE_KEY if exclusive else key
             group = by_key.get(slot)
             if group is None:
-                group = by_key[slot] = []
+                group = by_key[slot] = [call]
                 groups.append(group)
-            group.append(call)
+            else:
+                group.append(call)
         return groups
 
     def _serialize_key(self, call: ToolCall) -> str | None:
@@ -3069,13 +3100,13 @@ class AgentRuntime:
                 parent_id,
             )
             result = await tool.run(call.args)
-            replacements: dict[str, object] = {}
-            if not result.call_id:
-                replacements["call_id"] = call.id
-            if result.parent_id == -1 and parent_id != -1:
-                replacements["parent_id"] = parent_id
-            if replacements:
-                result = dataclasses.replace(result, **replacements)
+            adopt_parent = result.parent_id == -1 and parent_id != -1
+            if not result.call_id or adopt_parent:
+                result = dataclasses.replace(
+                    result,
+                    call_id=result.call_id or call.id,
+                    parent_id=parent_id if adopt_parent else result.parent_id,
+                )
         except asyncio.CancelledError:
             logger.debug(
                 "runtime tool cancelled: call_id=%s tool=%s parent_id=%s",
@@ -3107,7 +3138,7 @@ class AgentRuntime:
             result = ToolResult(
                 call_id=call.id,
                 parent_id=parent_id,
-                content=f"{type(exc).__name__}: {exc}",
+                content=describe(exc),
                 is_error=True,
             )
         finally:
@@ -3333,13 +3364,13 @@ class _PendingCommit:
     - ``"forward"``: ``result`` is a completed detached tool's real output,
       delivered as a synthetic ``DetachedArrived`` pair (the original stub
       stays). A user-role separator precedes it after an assistant tail.
-    - ``"ride_along"``: ``user`` is system-injected context (e.g. a reminder)
-      coalesced onto the user side.
+    - ``"ride_along"``: ``note`` is context the harness tells the model (e.g. a
+      reminder), appended as its own system message.
     """
 
     kind: Literal["pairing", "forward", "ride_along"]
     result: ToolResult | None = None
-    user: UserMessage | None = None
+    note: SystemMessage | None = None
 
 
 def _message_from_queued(

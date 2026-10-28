@@ -148,7 +148,7 @@ def recipe_dict(key: str) -> dict[str, str]:
     if not isinstance(raw, dict):
         return {}
     d = cast(dict[str, object], raw)
-    return {str(k): str(v) for k, v in d.items()}
+    return {k: str(v) for k, v in d.items()}
 
 
 def recipe_list(section: str, key: str) -> list[str]:
@@ -205,7 +205,7 @@ def load_tool_description(name: str) -> str:
         )
         return _MISSING_TOOL_DESCRIPTION
     try:
-        text = read_asset(str(by_lower[key])).rstrip()
+        text = read_asset(by_lower[key]).rstrip()
     except FileNotFoundError:
         logger.exception(
             "Missing tool description asset for tool %r in recipe %s: %s",
@@ -359,7 +359,7 @@ def _build_schema(
         description = ""
         origin = typing.get_origin(t)
         if origin is typing.Annotated:
-            args = typing.get_args(t)
+            args = tuple[object, ...](typing.get_args(t))
             t = args[0]
             for arg in args[1:]:
                 if isinstance(arg, str):
@@ -369,7 +369,7 @@ def _build_schema(
         if description:
             prop["description"] = description
         properties[name] = prop
-        if param.default is inspect.Parameter.empty:
+        if cast(object, param.default) is inspect.Parameter.empty:
             required.append(name)
     schema: dict[str, object] = {
         "type": "object",

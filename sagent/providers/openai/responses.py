@@ -226,7 +226,7 @@ class _OpenAIResponsesModel(ModelDefaults):
                 max_image_dim=self.limits.max_image_edge_px,
                 max_image_bytes=self.limits.max_image_bytes,
             ),
-            "instructions": request.system,
+            "instructions": request.system_text,
             "stream": True,
             "store": False,
         }
@@ -235,6 +235,22 @@ class _OpenAIResponsesModel(ModelDefaults):
             # Independent reads and searches go out together in one round; the agent
             # runtime already runs a response's independent tool calls concurrently.
             body["parallel_tool_calls"] = True
+            # The gate names what may be called; every schema still ships, so the
+            # prefix the server cached is the same whatever the gate.
+            allowed = request.allowed_tools
+            if allowed is not None:
+                # A gate naming no tool the request carries allows none; an empty
+                # ``allowed_tools`` list is not a request the API accepts.
+                names = [t.name for t in request.tools if t.name in allowed]
+                body["tool_choice"] = (
+                    {
+                        "type": "allowed_tools",
+                        "mode": "auto",
+                        "tools": [{"type": "function", "name": n} for n in names],
+                    }
+                    if names
+                    else "none"
+                )
         effort = self._reasoning_effort()
         if effort is not None:
             body["reasoning"] = {"effort": effort, "summary": "auto"}
@@ -248,7 +264,14 @@ class _OpenAIResponsesModel(ModelDefaults):
         tier = self._effective_service_tier()
         if tier is not None:
             body["service_tier"] = tier
+        if request.cache_key:
+            body["prompt_cache_key"] = request.cache_key
         return body
+
+    def _headers(self, request: ModelRequest) -> dict[str, str]:
+        """Return per-request HTTP headers; the API-key endpoint takes none."""
+        del request
+        return {}
 
     @override
     async def stream(
@@ -282,7 +305,8 @@ class _OpenAIResponsesModel(ModelDefaults):
         )
         try:
             raw = await sdk.responses.with_raw_response.create(
-                **self._build_kwargs(request),
+                **self._build_kwargs(request),  # pyrefly: ignore[open-unpacking] -- The spread TypedDict is open; none of its extra keys collide here.
+                extra_headers=self._headers(request) or None,
             )
             self._last_usage = openai_usage(raw.headers)
             events = raw.parse(to=openai.AsyncStream[responses.ResponseStreamEvent])
@@ -480,14 +504,16 @@ def _terminal_metadata(response: object) -> tuple[str, str, int, int, int, int]:
     """Extract terminal response metadata, including SDK-extra usage fields."""
     message_id = str(getattr(response, "id", "") or "")
     status = str(getattr(response, "status", "") or "")
-    usage = getattr(response, "usage", None)
+    usage: object = getattr(response, "usage", None)
     if usage is None:
         return message_id, status, 0, 0, 0, 0
-    input_tokens = from_plain(getattr(usage, "input_tokens", None), int)
-    output_tokens = from_plain(getattr(usage, "output_tokens", None), int)
+    raw_input: object = getattr(usage, "input_tokens", None)
+    raw_output: object = getattr(usage, "output_tokens", None)
+    input_tokens = from_plain(raw_input, int)
+    output_tokens = from_plain(raw_output, int)
     cache_read = 0
     cache_write = 0
-    details = getattr(usage, "input_tokens_details", None)
+    details: object = getattr(usage, "input_tokens_details", None)
     if details is not None:
         # OpenAI SDK 2.44 predates the typed ``cache_write_tokens`` field, but
         # Stainless models preserve unknown response fields and expose them
@@ -615,11 +641,11 @@ async def _consume_stream(
                 elif isinstance(event, responses.ResponseOutputItemDoneEvent):
                     item = event.item
                     if item.type == "function_call":
-                        tc_id = str(item.call_id or "")
-                        tc_name = str(item.name or "")
+                        tc_id = item.call_id or ""
+                        tc_name = item.name or ""
                         item_id = item.id or ""
                         delta_args = "".join(tool_args.get(item_id, []))
-                        done_args = str(item.arguments or "")
+                        done_args = item.arguments or ""
                         args = _parse_tool_arguments(
                             delta_args,
                             done_args,
@@ -715,11 +741,13 @@ def _openai_stream_event_error(event: object) -> UserFacingError:
 def _openai_stream_response_error(response: object) -> UserFacingError:
     response_id = getattr(response, "id", "")
     status = getattr(response, "status", "")
-    error = getattr(response, "error", None)
-    message = getattr(error, "message", None) if error is not None else None
-    code = getattr(error, "code", None) if error is not None else None
-    incomplete = getattr(response, "incomplete_details", None)
-    reason = getattr(incomplete, "reason", None) if incomplete is not None else None
+    error: object = getattr(response, "error", None)
+    message: object = getattr(error, "message", None) if error is not None else None
+    code: object = getattr(error, "code", None) if error is not None else None
+    incomplete: object = getattr(response, "incomplete_details", None)
+    reason: object = (
+        getattr(incomplete, "reason", None) if incomplete is not None else None
+    )
     details = ["OpenAI stream ended without completion"]
     if isinstance(status, str) and status:
         details.append(f"status={status}")
@@ -825,10 +853,10 @@ def _spend_at_served_tier(
 # user instead of the real cause -- swallow and log it.
 async def _close_stream(stream: object) -> None:
     """Close a Responses stream after timeout, cancellation, or stream error."""
-    close = getattr(stream, "aclose", None)
+    close: object = getattr(stream, "aclose", None)
     if close is None:
         close = getattr(stream, "close", None)
-    if close is None:
+    if not callable(close):
         return
     try:
         result = close()

@@ -103,7 +103,7 @@ else:
     openai = lazy_import("openai")  # 493ms cold.
 
 
-from treekle import MutablePlainTree, ReadError, from_plain, json_loads
+from treekle import MutablePlainTree, from_plain, json_loads
 
 from sagent.catalog.openai import subscription, subscription_models
 from sagent.catalog.table import ModelCatalog
@@ -117,7 +117,10 @@ from sagent.providers.lib.oauth import (
 )
 from sagent.providers.lib.perloop import PerLoop
 from sagent.providers.openai.api import OpenAI
-from sagent.providers.openai.responses import _OpenAIResponsesModel
+from sagent.providers.openai.responses import (
+    _STREAM_IDLE_TIMEOUT,
+    _OpenAIResponsesModel,
+)
 from sagent.types.exceptions import (
     AuthRefreshError,
 )
@@ -507,6 +510,10 @@ class OpenAISubscription:
                     # signing (codex-rs/login/src/auth/default_client.rs).
                     "originator": "codex",
                 },
+                # ``send_with_retry`` owns retries, as for the API-key client.
+                max_retries=0,
+                # The SDK's 5s connect default fails on one Wi-Fi stall.
+                timeout=httpx2.Timeout(_STREAM_IDLE_TIMEOUT, connect=30.0),
             )
             self._authed.set((sdk, token))
             if cached is not None:
@@ -687,13 +694,13 @@ class OpenAISubscription:
         p = path or credentials_path(_default_credentials_path(), account)
         if not p.exists():
             raise FileNotFoundError(f"No credentials at {p}")
-        decoded: object = json.loads(p.read_text(encoding="utf-8"))
+        decoded = json_loads(p.read_text(encoding="utf-8"))
         if not isinstance(decoded, dict):
             raise _CredentialFileError(
                 f"{p} must contain a JSON object with OpenAI subscription "
                 "OAuth credentials.",
             )
-        raw = cast(dict[str, MutablePlainTree], decoded)
+        raw = decoded
         raw_tokens = raw.get("tokens")
         if not isinstance(raw_tokens, dict):
             auth_mode = raw.get("auth_mode")
@@ -754,12 +761,12 @@ class OpenAISubscription:
         existing: dict[str, MutablePlainTree] = {}
         if p.exists():
             with contextlib.suppress(json.JSONDecodeError, OSError):
-                decoded: object = json.loads(p.read_text(encoding="utf-8"))
+                decoded = json_loads(p.read_text(encoding="utf-8"))
                 # Shape-checked, not just parse-checked: valid JSON of the
                 # wrong shape (a list, or ``tokens`` as a list) would raise
                 # below and leave the caller unable to persist a re-login.
                 if isinstance(decoded, dict):
-                    existing = cast(dict[str, MutablePlainTree], decoded)
+                    existing = decoded
         raw_tokens = existing.get("tokens")
         tokens = raw_tokens if isinstance(raw_tokens, dict) else {}
         tokens["access_token"] = creds["access_token"]
@@ -998,16 +1005,25 @@ def login_info(creds: OpenAISubscription.Credentials) -> LoginInfo:
 
 
 class _OpenAISubModel(_OpenAIResponsesModel):
-    """OAuth retry and Codex-specific request restrictions."""
+    """OAuth retry and Codex-specific request restrictions.
 
-    _provider: OpenAISubscription
+    ``max_output_tokens`` passes through: Codex enforces it (measured 2026-10-18,
+    ``luna-6``: a 300 cap stopped at 300 with ``max_tokens``).
+    """
+
+    _provider: OpenAISubscription  # pyrefly: ignore[bad-override-mutable-attribute] -- Narrowed to the provider this model is built from; nothing assigns another.
 
     @override
     def _build_kwargs(self, request: ModelRequest) -> ResponseCreateParamsStreaming:
         body = super()._build_kwargs(request)
         body.pop("temperature", None)
-        body.pop("max_output_tokens", None)
         return body
+
+    @override
+    def _headers(self, request: ModelRequest) -> dict[str, str]:
+        # Codex routes its prefix cache by this header with the key, as the Codex
+        # CLI sends both; measured 2026-10-22, the key alone cached nothing.
+        return {"session_id": request.cache_key} if request.cache_key else {}
 
     @override
     async def stream(
@@ -1086,7 +1102,7 @@ def _jwt_payload(token: str) -> dict[str, object]:
     raw += "=" * (-len(raw) % 4)
     try:
         return json_loads(base64.urlsafe_b64decode(raw), dict[str, object])
-    except (ValueError, ReadError):
+    except ValueError:
         return {}
 
 

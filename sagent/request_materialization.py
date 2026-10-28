@@ -12,9 +12,12 @@ from sagent.types.runtime import (
     AgentSendMessage,
     AssistantMessage,
     ModelContextEvent,
+    SystemMessage,
     ToolResult,
     UserMessage,
+    WireMessage,
     labeled_agent_send_text,
+    reminder_text,
     wire_role,
 )
 
@@ -128,8 +131,8 @@ def materialize_messages(
     tool_result_budget_tokens: int = 0,
     prune_tail_turns: int = 6,
     elide_thinking: bool = True,
-) -> list[ModelContextEvent]:
-    """Return provider-visible messages with full results pruned and budgeted.
+) -> list[WireMessage]:
+    """Return provider-visible messages with full results under budget.
 
     Args:
       messages: Resolved provider-facing history.
@@ -138,7 +141,7 @@ def materialize_messages(
       prune_tail_turns: Active working tail turns protected from observation
           pruning (default 6).
       elide_thinking: Whether to elide historical thinking blocks older than N-1
-          (defaults to False for Step 2; enabled in Step 3).
+          (default True).
 
     Returns:
       materialized: Message list with excess tool results replaced by
@@ -152,12 +155,13 @@ def materialize_messages(
         tail_turns=prune_tail_turns,
         elide_thinking=elide_thinking,
     )
+    folded = _fold_system_messages(pruned)
+    labelled = list(_label_agent_sends(folded))
     if tool_result_budget_tokens <= 0:
-        return _coalesce_adjacent_users(_label_agent_sends(pruned))
-    labelled = list(_label_agent_sends(pruned))
+        return _coalesce_adjacent_users(labelled)
     used = 0
     keep_calls: set[str] = set()
-    out_reversed: list[ModelContextEvent] = []
+    out_reversed: list[WireMessage] = []
     older = _older_tool_result_counts(labelled)
     tag_cost = approx_tokens(ELIDED_TOOL_RESULT_TAG)
     for idx in range(len(labelled) - 1, -1, -1):
@@ -250,7 +254,7 @@ def materialize_messages(
 # The budget walk runs newest-first, so what a result may spend is bounded by what the
 # results BEHIND it still need. This is that count, precomputed once rather than
 # rescanned per entry (the walk is already O(n)).
-def _older_tool_result_counts(messages: Sequence[ModelContextEvent]) -> list[int]:
+def _older_tool_result_counts(messages: Sequence[WireMessage]) -> list[int]:
     """Return, per index, how many ``ToolResult`` entries precede it."""
     counts = [0] * len(messages)
     seen = 0
@@ -259,6 +263,29 @@ def _older_tool_result_counts(messages: Sequence[ModelContextEvent]) -> list[int
         if isinstance(entry, ToolResult):
             seen += 1
     return counts
+
+
+# A provider reads a system message as a reminder in the user turn it follows, which is how Claude
+# Code tells its model the same things. Anthropic's own mid-conversation ``system``
+# message was measured: the API accepts text in one only right after a user turn, and the
+# model then answered as though it had not been told. Folding here, ahead of the merge
+# below, sends every provider the bytes it was sent before system messages had a type of their own,
+# so the request's cached prefix is unchanged.
+def _fold_system_messages(
+    messages: Iterable[ModelContextEvent],
+) -> Iterable[WireMessage]:
+    """Turn each ``SystemMessage`` into the hidden user text it is sent as."""
+    for entry in messages:
+        if isinstance(entry, SystemMessage):
+            yield UserMessage(
+                id=entry.id,
+                timestamp=entry.timestamp,
+                text=reminder_text(entry),
+                hidden=True,
+                offered_tools=entry.offered_tools,
+            )
+        else:
+            yield entry
 
 
 # Applies the sender label before coalescing so that adjacent messages from different
@@ -272,8 +299,8 @@ def _older_tool_result_counts(messages: Sequence[ModelContextEvent]) -> list[int
 # labeled text, and this prepends one outer label to the whole -- correct, since one
 # source authored every segment.
 def _label_agent_sends(
-    messages: Iterable[ModelContextEvent],
-) -> Iterable[ModelContextEvent]:
+    messages: Iterable[WireMessage],
+) -> Iterable[WireMessage]:
     """Prepend ``[from <source>]: `` to each ``AgentSendMessage`` text."""
     for entry in messages:
         if isinstance(entry, AgentSendMessage):
@@ -294,11 +321,11 @@ def _label_agent_sends(
 # added by :func:`_label_agent_sends` upstream already carry per-sender attribution in
 # the merged text.
 def _coalesce_adjacent_users(
-    messages: Iterable[ModelContextEvent],
-) -> list[ModelContextEvent]:
+    messages: Iterable[WireMessage],
+) -> list[WireMessage]:
     """Merge adjacent user-side entries so the wire stays alternation-valid."""
     deferred = _defer_user_between_tool_pair(messages)
-    out: list[ModelContextEvent] = []
+    out: list[WireMessage] = []
     for entry in deferred:
         if (
             isinstance(entry, (AgentSendMessage, UserMessage))
@@ -309,14 +336,34 @@ def _coalesce_adjacent_users(
             assert isinstance(prev, (UserMessage, AgentSendMessage))
             text = f"{prev.text}\n\n{entry.text}"
             attachments = (*prev.attachments, *entry.attachments)
-            if _same_source(prev, entry):
+            # A folded system message's tool offer must reach the provider with the turn it
+            # joined; the later offer is the one in force at the turn's end.
+            offered = _offered(entry) if _offered(entry) is not None else _offered(prev)
+            # The provider caches at a marked message; the merged one ends where either did.
+            marked = any(
+                isinstance(m, UserMessage) and m.cache_point for m in (prev, entry)
+            )
+            if isinstance(prev, UserMessage) and _same_source(prev, entry):
+                out[-1] = dataclasses.replace(
+                    prev,
+                    text=text,
+                    attachments=attachments,
+                    offered_tools=offered,
+                    cache_point=marked,
+                )
+            elif _same_source(prev, entry):
                 out[-1] = dataclasses.replace(prev, text=text, attachments=attachments)
             else:
                 # Sources differ: the structured ``source`` field would
                 # silently claim one sender owns the other's content.
                 # Demote to ``UserMessage``; the in-text ``[from X]: ``
                 # labels (already applied upstream) preserve attribution.
-                out[-1] = UserMessage(text=text, attachments=attachments)
+                out[-1] = UserMessage(
+                    text=text,
+                    attachments=attachments,
+                    offered_tools=offered,
+                    cache_point=marked,
+                )
         else:
             out.append(entry)
     return out
@@ -329,12 +376,12 @@ def _coalesce_adjacent_users(
 # entries to immediately after the matching tool results close so the wire ordering
 # stays valid while the user content is preserved.
 def _defer_user_between_tool_pair(
-    messages: Iterable[ModelContextEvent],
-) -> list[ModelContextEvent]:
+    messages: Iterable[WireMessage],
+) -> list[WireMessage]:
     """Move user-side entries appearing between AM(tool_calls) and its TR."""
     deferred_buffer: list[UserMessage | AgentSendMessage] = []
     pending: set[str] = set()
-    out: list[ModelContextEvent] = []
+    out: list[WireMessage] = []
     for entry in messages:
         if isinstance(entry, AssistantMessage):
             # ``pending`` is "all still-unanswered tool calls", NOT "this AM's
@@ -366,13 +413,18 @@ def _defer_user_between_tool_pair(
 # the provider as adjacent turns) but *demotes* them to a plain ``UserMessage`` so the
 # structured ``source`` never falsely claims one sender authored the other's text; same-
 # source pairs preserve type.
-def _same_source(left: ModelContextEvent, right: ModelContextEvent) -> bool:
+def _same_source(left: WireMessage, right: WireMessage) -> bool:
     """Return True iff two user-side entries share sender identity."""
     if type(left) is not type(right):
         return False
     if isinstance(left, AgentSendMessage) and isinstance(right, AgentSendMessage):
         return left.source == right.source
     return True
+
+
+def _offered(entry: UserMessage | AgentSendMessage) -> tuple[str, ...] | None:
+    """Return the tool offer a user-side entry carries; a peer's carries none."""
+    return entry.offered_tools if isinstance(entry, UserMessage) else None
 
 
 def _render_truncated(content: str, kept: int) -> str:

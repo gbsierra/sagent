@@ -6,6 +6,7 @@ All tests stub the Slack SDK -- no network calls.
 from __future__ import annotations
 
 from collections import OrderedDict
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -14,6 +15,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import logging
 import os
 import time
 
@@ -30,9 +32,12 @@ pytest.importorskip("slack_sdk")
 
 from sagent.agent import Agent
 from sagent.agent.state import AgentLike, agent_registry
+from sagent.bin import slack
 from sagent.bin.slack import (
+    _AGENT_TOOL_NAMES,
     SlackAdapter,
     _AgentSlack,
+    _build_model,
     _extract_agent_mention,
     _extract_channel_from_text,
     _extract_event,
@@ -52,6 +57,11 @@ from sagent.bin.slack import (
 )
 from sagent.testing import FakeAgent
 from sagent.tools.slack import Slack
+from sagent.types.capability import (
+    ModelCapability,
+    ModelSettings,
+    ThinkingCapability,
+)
 from sagent.types.model import Model, ModelRecipe
 from sagent.types.runtime import (
     AssistantMessage,
@@ -69,6 +79,8 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
     from treekle import MutablePlainTree
+
+    from sagent.types.capability import ThinkingEffort
 
 
 @pytest.fixture(autouse=True)
@@ -108,7 +120,9 @@ class _SpySlack:
         self.sent: list[tuple[str, str, str]] = []
         # Swappable mock behind a real method: an instance ATTRIBUTE holding a
         # callable does not satisfy a Protocol's method member.
-        self.channel_maker: AsyncMock = AsyncMock(return_value="id=C_DEFAULT")
+        self.channel_maker: Callable[[str], Awaitable[object]] = AsyncMock(
+            return_value="id=C_DEFAULT",
+        )
 
     async def send(
         self,
@@ -208,6 +222,11 @@ def _reaction_event(
     return ev
 
 
+def test_a_child_gets_no_memory_tool_since_it_is_shown_no_memories() -> None:
+    """A child has no project context, so a save would land where it never reads."""
+    assert "Memory" not in _AGENT_TOOL_NAMES
+
+
 class TestExtractEvent:
     def test_valid_envelope(self) -> None:
         payload: dict[str, MutablePlainTree] = {
@@ -280,21 +299,23 @@ class TestListPersonas:
 
 
 class TestAgentSlack:
-    def test_prompt_lists_peers(self) -> None:
+    def test_peers_are_a_reminder_not_fixed_guidance(self) -> None:
+        """The system blocks are built once; peers that join later need retelling."""
         _ = _register("Sara", "Bob")
         tool = _AgentSlack(token="x", username="Sara")  # noqa: S106 -- Fixture credential in a test; never a real secret.
-        p = tool.prompt()
+        assert tool.prompt() == ""
+        p = tool.reminder()
         assert "Bob" in p
         assert "Sara" not in p
 
-    def test_prompt_empty_when_alone(self) -> None:
+    def test_reminder_empty_when_alone(self) -> None:
         _ = _register("Sara")
         tool = _AgentSlack(token="x", username="Sara")  # noqa: S106 -- Fixture credential in a test; never a real secret.
-        assert tool.prompt() == ""
+        assert tool.reminder() == ""
 
-    def test_prompt_empty_no_agents(self) -> None:
+    def test_reminder_empty_no_agents(self) -> None:
         tool = _AgentSlack(token="x", username="Sara")  # noqa: S106 -- Fixture credential in a test; never a real secret.
-        assert tool.prompt() == ""
+        assert tool.reminder() == ""
 
 
 class TestRouteHumanMessages:
@@ -759,6 +780,10 @@ class TestRenderEvent:
     def test_empty_user_message(self) -> None:
         assert _render_event(UserMessage(text="   ")) is None
 
+    def test_hidden_user_message(self) -> None:
+        """A reminder rides the model's input; no one typed it."""
+        assert _render_event(UserMessage(text="<system-reminder>", hidden=True)) is None
+
     def test_thinking(self) -> None:
         assert _render_event(ModelResponseThinking(text="pondering...")) == (
             "💭 pondering..."
@@ -811,11 +836,11 @@ class TestRenderEvent:
         # ``AssistantMessage`` isn't in the ``RuntimeEvent`` union but the
         # renderer accepts it for the cases where the agent runtime
         # publishes assistant messages as part of an observer fanout.
-        ev: RuntimeEvent = AssistantMessage(text="hello")  # ty: ignore[invalid-assignment] -- The fixture uses a runtime event outside the narrow static union.  # pyright: ignore[reportAssignmentType] -- The fixture uses a runtime event outside the narrow static union.
+        ev: RuntimeEvent = AssistantMessage(text="hello")  # ty: ignore[invalid-assignment] -- The fixture uses a runtime event outside the narrow static union.  # pyright: ignore[reportAssignmentType] -- The fixture uses a runtime event outside the narrow static union.  # pyrefly: ignore[bad-assignment] -- The fixture uses a runtime event outside the narrow static union.
         assert _render_event(ev) == "hello"
 
     def test_assistant_message_empty(self) -> None:
-        ev: RuntimeEvent = AssistantMessage(text="   ")  # ty: ignore[invalid-assignment] -- The fixture uses a runtime event outside the narrow static union.  # pyright: ignore[reportAssignmentType] -- The fixture uses a runtime event outside the narrow static union.
+        ev: RuntimeEvent = AssistantMessage(text="   ")  # ty: ignore[invalid-assignment] -- The fixture uses a runtime event outside the narrow static union.  # pyright: ignore[reportAssignmentType] -- The fixture uses a runtime event outside the narrow static union.  # pyrefly: ignore[bad-assignment] -- The fixture uses a runtime event outside the narrow static union.
         assert _render_event(ev) is None
 
     def test_tool_result_with_hint(self) -> None:
@@ -914,14 +939,15 @@ class TestResolveUser:
     async def test_resolves_via_web(self) -> None:
         adapter, _ = _make_adapter()
         mock_web = MagicMock()
-        mock_web.users_info = AsyncMock(
+        users_info = AsyncMock(
             return_value={"user": {"profile": {"display_name": "Josh"}}},
         )
+        mock_web.users_info = users_info
         adapter._web = cast(AsyncWebClient, mock_web)
         assert await adapter._resolve_user("U1") == "Josh"
         # Cached on subsequent call.
         assert await adapter._resolve_user("U1") == "Josh"
-        assert mock_web.users_info.await_count == 1
+        assert users_info.await_count == 1
 
     @pytest.mark.anyio
     async def test_falls_back_to_real_name(self) -> None:
@@ -1026,7 +1052,8 @@ class TestHandle:
     async def test_acks_and_ignores_non_event(self) -> None:
         adapter, _ = _make_adapter()
         client = MagicMock()
-        client.send_socket_mode_response = AsyncMock()
+        respond = AsyncMock()
+        client.send_socket_mode_response = respond
         req = MagicMock()
         req.type = "hello"
         req.envelope_id = "env1"
@@ -1034,7 +1061,7 @@ class TestHandle:
             cast(AsyncBaseSocketModeClient, client),
             cast(SocketModeRequest, req),
         )
-        client.send_socket_mode_response.assert_awaited_once()
+        respond.assert_awaited_once()
 
     @pytest.mark.anyio
     async def test_dispatches_event(self) -> None:
@@ -1060,7 +1087,7 @@ class TestHandle:
         req = MagicMock()
         req.type = "events_api"
         req.envelope_id = "env1"
-        req.payload = {}
+        req.payload = dict[str, object]()
         await adapter._handle(
             cast(AsyncBaseSocketModeClient, client),
             cast(SocketModeRequest, req),
@@ -1097,33 +1124,53 @@ class TestEnsureLogChannel:
     @pytest.mark.anyio
     async def test_creates_new(self) -> None:
         adapter, _ = _make_adapter()
-        with patch.object(
-            Slack,
-            "create_channel",
-            new=AsyncMock(return_value="id=C_NEW"),
+        create = AsyncMock(return_value="id=C_NEW")
+        sync = AsyncMock()
+        with (
+            patch.object(Slack, "create_channel", new=create),
+            patch.object(SlackAdapter, "_sync_members", new=sync),
         ):
             cid = await adapter.ensure_log_channel("sara")
         assert cid == "C_NEW"
+        create.assert_awaited_once_with("sara-log")
+        assert adapter._log_channels["sara-log"] == "C_NEW"
         assert adapter._log_channel_owners["C_NEW"] == "sara"
+        sync.assert_not_awaited()
+
+    @pytest.mark.anyio
+    async def test_creates_with_the_bot_token(self) -> None:
+        adapter, _ = _make_adapter()
+        tokens: list[str] = []
+
+        async def _create(slack: Slack, name: str) -> str:
+            del name
+            tokens.append(slack._token)
+            return "id=C_NEW"
+
+        with patch.object(Slack, "create_channel", new=_create):
+            await adapter.ensure_log_channel("sara")
+        assert tokens == [adapter._bot_token]
 
     @pytest.mark.anyio
     async def test_falls_back_to_find_when_create_fails(self) -> None:
         adapter, _ = _make_adapter()
         err = ToolResult(call_id="", content="exists", is_error=True)
+        find = AsyncMock(return_value="C_FOUND")
         with (
             patch.object(Slack, "create_channel", new=AsyncMock(return_value=err)),
-            patch.object(
-                SlackAdapter,
-                "_find_channel",
-                new=AsyncMock(return_value="C_FOUND"),
-            ),
+            patch.object(SlackAdapter, "_find_channel", new=find),
         ):
             cid = await adapter.ensure_log_channel("sara")
         assert cid == "C_FOUND"
+        find.assert_awaited_once_with("sara-log")
+        assert adapter._log_channels["sara-log"] == "C_FOUND"
         assert adapter._log_channel_owners["C_FOUND"] == "sara"
 
     @pytest.mark.anyio
-    async def test_returns_none_when_unfindable(self) -> None:
+    async def test_returns_none_when_unfindable(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
         adapter, _ = _make_adapter()
         err = ToolResult(call_id="", content="exists", is_error=True)
         with (
@@ -1133,9 +1180,12 @@ class TestEnsureLogChannel:
                 "_find_channel",
                 new=AsyncMock(return_value=None),
             ),
+            caplog.at_level(logging.WARNING),
         ):
             cid = await adapter.ensure_log_channel("sara")
         assert cid is None
+        assert "sara-log" not in adapter._log_channels
+        assert caplog.messages == ["Failed to create/find #sara-log: exists"]
 
     @pytest.mark.anyio
     async def test_unexpected_create_response_returns_none(self) -> None:
@@ -1158,7 +1208,7 @@ class TestEnsureLogChannel:
         ):
             cid = await adapter.ensure_log_channel("sara", source_channel="C_SRC")
         assert cid == "C_NEW"
-        sync_mock.assert_awaited_once()
+        sync_mock.assert_awaited_once_with("C_SRC", "C_NEW")
 
 
 class TestFindChannel:
@@ -1404,26 +1454,79 @@ class TestParseSlackArgs:
         assert args.resume is True
 
 
+class _OneModelProvider:
+    """Hands out one model whose settings offer ``efforts``."""
+
+    def __init__(self, efforts: frozenset[ThinkingEffort]) -> None:
+        capability = ModelCapability(thinking=ThinkingCapability(effort=efforts))
+        self.built = _SettingsOnlyModel(ModelSettings(capability=capability))
+
+    def model(self, model_id: str | None) -> _SettingsOnlyModel:
+        del model_id
+        return self.built
+
+    def build(self, *args: object, **kwargs: object) -> _OneModelProvider:
+        """Stand in for ``build_provider``: whatever is asked for, this."""
+        del args, kwargs
+        return self
+
+
+class _SettingsOnlyModel:
+    """The two members ``_build_model`` reads from a model."""
+
+    tagged_model_id = "fake-model"
+
+    def __init__(self, settings: ModelSettings) -> None:
+        self.settings = settings
+
+
+class TestBuildModel:
+    """The shared model takes ``--effort`` only when the flag was given."""
+
+    def test_no_effort_keeps_the_models_default(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Assigning None raised "thinking_effort=None is not offered", so the
+        # service died at startup whenever --effort was omitted.
+        provider = _OneModelProvider(frozenset({"none"}))
+        monkeypatch.setattr(slack, "build_provider", provider.build)
+        args, _ = parse_slack_args(argparse.ArgumentParser(), [])
+        _build_model(args)
+        assert provider.built.settings.thinking_effort == "none"
+
+    def test_effort_lands_on_the_shared_settings(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        provider = _OneModelProvider(frozenset({"none", "high"}))
+        monkeypatch.setattr(slack, "build_provider", provider.build)
+        args, _ = parse_slack_args(argparse.ArgumentParser(), ["--effort", "high"])
+        _, recipe = _build_model(args)
+        assert provider.built.settings.thinking_effort == "high"
+        assert recipe.model_id == "fake-model"
+
+
 class TestResolveTokens:
     def test_uses_explicit_args(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("SLACK_APP_TOKEN", raising=False)
         monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
-        ns = argparse.Namespace(
-            app_token="A1",  # noqa: S106 -- Fixture credential in a test; never a real secret.
-            bot_token="B1",  # noqa: S106 -- Fixture credential in a test; never a real secret.
+        ns, _ = parse_slack_args(
+            argparse.ArgumentParser(),
+            ["--app-token", "A1", "--bot-token", "B1"],
         )
         assert _resolve_tokens(ns) == ("A1", "B1")
 
     def test_falls_back_to_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SLACK_APP_TOKEN", "ENV_A")
         monkeypatch.setenv("SLACK_BOT_TOKEN", "ENV_B")
-        ns = argparse.Namespace(app_token="", bot_token="")
+        ns, _ = parse_slack_args(argparse.ArgumentParser(), [])
         assert _resolve_tokens(ns) == ("ENV_A", "ENV_B")
 
     def test_exits_on_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("SLACK_APP_TOKEN", raising=False)
         monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
-        ns = argparse.Namespace(app_token="", bot_token="")
+        ns, _ = parse_slack_args(argparse.ArgumentParser(), [])
         with pytest.raises(SystemExit):
             _ = _resolve_tokens(ns)
 
@@ -1508,7 +1611,9 @@ class TestAdapterConstruction:
 
         fake_child.serve_forever = _serve
         fake_child.shutdown = MagicMock()
-        fake_child.runtime.observers = []
+        runtime = MagicMock()
+        runtime.observers = list[Callable[[RuntimeEvent], None]]()
+        fake_child.runtime = runtime
 
         with (
             patch(
@@ -1542,10 +1647,12 @@ class TestAdapterConstruction:
     async def test_stop_agent_shuts_down_real_agent(self, tmp_path: Path) -> None:
         adapter, _ = _make_adapter(tmp_path=tmp_path)
         fake = MagicMock(spec=Agent)
+        shutdown = MagicMock()
+        fake.shutdown = shutdown
         agent_registry["Sara"] = cast(AgentLike, fake)
         adapter._active_agents["Sara"] = {"persona": "x", "system": "y"}
         adapter.stop_agent("Sara")
-        fake.shutdown.assert_called_once()
+        shutdown.assert_called_once()
         assert "Sara" not in adapter._active_agents
 
     @pytest.mark.anyio

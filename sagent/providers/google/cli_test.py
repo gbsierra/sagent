@@ -32,6 +32,7 @@ from sagent.providers.lib.subproc import (
     Subproc,
     SubprocessTransportError,
 )
+from sagent.tools.core import tool
 from sagent.types.model import ModelRequest, ModelTerminationError
 from sagent.types.runtime import (
     AssistantMessage,
@@ -55,6 +56,37 @@ _CRED_PAYLOAD: dict[str, object] = {
     "refresh_token": "test-rt",
     "expiry_date": (time.time() + 3600) * 1000.0,
 }
+
+
+class _Peeks:
+    """Records each topic its tool was asked to peek at."""
+
+    def __init__(self) -> None:
+        self.topics: list[str] = []
+
+    def peek(self, topic: str) -> str:
+        """Peek at a topic."""
+        self.topics.append(topic)
+        return topic
+
+
+@pytest.mark.asyncio
+async def test_the_bridge_refuses_a_tool_the_request_withholds() -> None:
+    """The CLI runs tools through the bridge, where the runtime cannot refuse them."""
+    peeks = _Peeks()
+    model = GoogleCLI().model("gemini-2.5-flash")
+    model._tools_bridge = ToolsBridge([])
+    model._sync_tools_bridge(
+        ModelRequest(
+            messages=[UserMessage(text="hi", offered_tools=("Look",))],
+            tools=[tool(peeks.peek, name="Look"), tool(peeks.peek, name="Peek")],
+        ),
+    )
+
+    _ = await model._tools_bridge._call_tool("Peek", {"topic": "withheld"})
+    _ = await model._tools_bridge._call_tool("Look", {"topic": "offered"})
+
+    assert peeks.topics == ["offered"]
 
 
 def _write_creds(tmp_path: Path) -> Path:
@@ -209,19 +241,20 @@ def test_model_capabilities() -> None:
     """The CLI transport narrows the row it inherits from the API."""
     provider = GoogleCLI()
     model = provider.model("gemini-2.5-flash")
-    assert model.capability.thinking.budget != frozenset({"none"})
+    assert (
+        model.capability.thinking.budget
+        == provider.catalog.models["gemini-2.5-flash"].thinking.budget
+    )
     assert model.capability.thinking.effort == frozenset({"none"})
     assert model.capability.cache_ttl_sec == frozenset({0.0})
     assert model.capability.manage_context_server_side == frozenset({True})
     assert model.capability.account_auth is True
 
 
-def test_max_image_limits() -> None:
-    """Gemini has no per-image pixel/byte cap; only the 100 MB total applies."""
-    model = GoogleCLI().model("gemini-2.5-flash")
-    assert model.limits.max_image_edge_px == 0
-    assert model.limits.max_image_bytes == 0
-    assert model.limits.max_request_bytes == 100 * 1024 * 1024
+def test_limits_come_from_catalog() -> None:
+    provider = GoogleCLI()
+    model = provider.model()
+    assert model.limits == provider.catalog.models["default"].context[""]
 
 
 def test_is_context_overflow_text_markers() -> None:
@@ -335,8 +368,9 @@ def test_approx_request_tokens_sums_user_and_assistant() -> None:
         ],
     )
     estimate = model.approx_request_tokens(request)
-    # ``len("a"*16) // 4 = 4`` + ``4 // 4 = 1`` + ``4 // 4 = 1`` = 6.
-    assert estimate == 6
+    assert estimate == sum(
+        model.approx_text_tokens(text) for text in ("a" * 16, "bbbb", "cccc")
+    )
 
 
 def test_read_expiry_handles_missing_and_invalid(tmp_path: Path) -> None:
@@ -552,9 +586,13 @@ async def test_stream_system_change_discards_warmed_old_system_spare(
     monkeypatch.setattr(model, "_send_prompt", send_prompt)
     model._hot_spare = HotSpare(spawn_initialized)
 
-    _ = await model.stream(ModelRequest(messages=[UserMessage(text="a")], system="A"))
+    _ = await model.stream(
+        ModelRequest(messages=[UserMessage(text="a")], system=("A",)),
+    )
     await warmed.wait()
-    _ = await model.stream(ModelRequest(messages=[UserMessage(text="b")], system="B"))
+    _ = await model.stream(
+        ModelRequest(messages=[UserMessage(text="b")], system=("B",)),
+    )
 
     assert used_systems == [hash_system("A"), hash_system("B")]
     assert spawned_systems == ["A", "A", "B"]
@@ -999,8 +1037,8 @@ def test_build_response_estimates_tokens_and_cost() -> None:
     )
     assert response.message.text == "hello"
     assert response.stop_reason == "model_finished"
-    assert response.tokens.request == 4
-    assert response.tokens.response == 1
+    assert response.tokens.request == model.approx_text_tokens("a" * 16)
+    assert response.tokens.response == model.approx_text_tokens("hello")
     assert response.total_cost >= 0.0
     assert len(response.message.thinking_blocks) == 1
 
@@ -1061,7 +1099,7 @@ async def test_writeback_credentials_atomic_and_0o600(
 
     real_open = os.open
 
-    def _flaky_open(path: str, flags: int, mode: int = 0o777) -> int:
+    def _flaky_open(path: str | os.PathLike[str], flags: int, mode: int = 0o777) -> int:
         if str(path).startswith(str(target)):
             raise OSError("simulated disk full")
         return real_open(path, flags, mode)

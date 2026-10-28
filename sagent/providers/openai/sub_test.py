@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
+from dataclasses import replace
+from typing import TYPE_CHECKING, Self, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import asyncio
@@ -13,11 +14,15 @@ import json
 import threading
 import time
 
+from treekle import from_plain, json_loads
+
 import httpx2
 import openai
 import pytest
 
-from sagent.catalog.openai import models, reasoning_effort, subscription_models
+from sagent.catalog import openai as catalog_openai
+from sagent.catalog.openai import reasoning_effort
+from sagent.catalog.table import ModelCatalog, ModelTable
 from sagent.providers import OpenAI
 from sagent.providers.lib.errors import (
     PER_ITEM_STRING_CAP_BODY,
@@ -35,7 +40,10 @@ from sagent.providers.openai.sub import (
 )
 from sagent.tools import tool
 from sagent.types.capability import (
+    ModelCapability,
+    ModelLimits,
     ModelSettings,
+    ThinkingCapability,
     ThinkingEffort,
 )
 from sagent.types.exceptions import AuthRefreshError
@@ -48,7 +56,7 @@ from sagent.types.runtime import (
 
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator
+    from collections.abc import AsyncGenerator, Iterator, Mapping
     from pathlib import Path
 
     from sagent.types.tools import Tool
@@ -64,37 +72,63 @@ def isolate_codex_home(
     monkeypatch.setenv("HOME", str(tmp_path_factory.mktemp("home")))
 
 
-def test_subscription_context_clamps_request_tokens() -> None:
-    clamped = subscription_models()["astra-6.0"].context[""]
-    assert clamped.max_request_tokens == 272_000
-    assert clamped.max_response_tokens == 32_000
+@pytest.fixture(autouse=True)
+def synthetic_catalog(monkeypatch: pytest.MonkeyPatch) -> Iterator[ModelTable]:
+    """Exercise subscription wiring without mirroring provider assets."""
+    row = ModelCapability(
+        model_id="example-1.0",
+        context={
+            "": ModelLimits(max_request_tokens=700_000, max_response_tokens=60_000),
+            "+272k": ModelLimits(
+                max_request_tokens=272_000,
+                max_response_tokens=30_000,
+            ),
+        },
+        thinking=ThinkingCapability(
+            effort=frozenset({"none", "low", "medium", "high", "xhigh", "max"}),
+            budget=frozenset({"none", "auto"}),
+            output=frozenset({"none", "text"}),
+        ),
+        service_tier=frozenset({"auto", "default", "flex", "priority"}),
+    )
+    table = ModelTable(
+        rows=(
+            row,
+            *(
+                replace(row, model_id=name, wire_model_id=wire)
+                for name, wire in (
+                    ("gpt-5.5", "gpt-5.5"),
+                    ("sol-5.6", "gpt-5.6-sol"),
+                    ("o-1.0", "o1"),
+                    ("o-mini-3.0", "o3-mini"),
+                    ("utility-example-1.0", "wire-utility"),
+                )
+            ),
+        ),
+        roles={"default": "example", "utility": "utility-example"},
+    )
 
+    def lookup(provider: str) -> ModelTable:
+        assert provider == "openai"
+        return table
 
-def test_subscription_context_keeps_small_windows() -> None:
-    clamped = subscription_models()["gpt-4.0"].context[""]
-    assert clamped.max_request_tokens == 8_192
-    assert clamped.max_response_tokens == 8_192
-
-
-def test_subscription_context_drops_the_long_window_tag() -> None:
-    """``+1m`` clamps to exactly the base id, so offering it would mislead."""
-    rows = subscription_models()
-    assert all(capability.context.keys() == {""} for capability in rows.values())
-
-
-def test_subscription_context_inherits_size_caps_from_parent() -> None:
-    # Only the token windows are subscription-specific; the image/wire byte
-    # caps are a property of the underlying model and must flow through
-    # unchanged, not be overwritten by a stale local constant. A divergent
-    # parent capability proves inheritance rather than a hardcoded match.
-    api = models()["astra-6.0"].context[""]
-    clamped = subscription_models()["astra-6.0"].context[""]
-    assert clamped.max_image_edge_px == api.max_image_edge_px
-    assert clamped.max_image_bytes == api.max_image_bytes
-    assert clamped.max_request_bytes == api.max_request_bytes
-
-
-# 1×1 transparent PNG -- smallest valid PNG ``image_lib.resize`` will accept.
+    monkeypatch.setattr(catalog_openai, "models", lookup)
+    catalog_openai.subscription_models.cache_clear()
+    monkeypatch.setattr(
+        OpenAI,
+        "catalog",
+        ModelCatalog(models=table, transport=catalog_openai.api()),
+    )
+    monkeypatch.setattr(
+        OpenAISubscription,
+        "catalog",
+        ModelCatalog(
+            models=catalog_openai.subscription_models(),
+            transport=catalog_openai.subscription(),
+        ),
+    )
+    yield table
+    catalog_openai.subscription_models.cache_clear()
 
 
 def _make_jwt(payload: dict[str, object]) -> str:
@@ -123,11 +157,13 @@ def test_login_manual_advertises_localhost_redirect_uri(
     )
     token_resp = MagicMock()
     token_resp.status_code = 200
-    token_resp.json.return_value = {
-        "access_token": access,
-        "refresh_token": "refresh-xyz",
-        "expires_in": 3600,
-    }
+    token_resp.json = MagicMock(
+        return_value={
+            "access_token": access,
+            "refresh_token": "refresh-xyz",
+            "expires_in": 3600,
+        },
+    )
     captured: dict[str, object] = {}
 
     def _post(url: str, *, data: dict[str, str], **_kw: object) -> MagicMock:
@@ -135,9 +171,10 @@ def test_login_manual_advertises_localhost_redirect_uri(
         captured["redirect_uri"] = data["redirect_uri"]
         return token_resp
 
+    http_context = MagicMock()
+    http_context.post = MagicMock(side_effect=_post)
     http_client = MagicMock()
-    http_context = cast(MagicMock, http_client.__enter__.return_value)
-    http_context.post.side_effect = _post
+    http_client.__enter__ = MagicMock(return_value=http_context)
 
     out = io.StringIO()
     with (
@@ -301,12 +338,13 @@ def test_save_preserves_existing_fields(tmp_path: Path) -> None:
     _write_creds_file(target, {"keep_me": True, "tokens": {"old": "x"}})
     creds = _make_creds(_make_jwt({"exp": 0.0}))
     OpenAISubscription.save(creds, path=target)
-    on_disk = json.loads(target.read_text(encoding="utf-8"))
+    on_disk = json_loads(target.read_text(encoding="utf-8"), dict[str, object])
+    tokens = from_plain(on_disk["tokens"], dict[str, object])
     assert on_disk["keep_me"] is True
     assert on_disk["auth_mode"] == "chatgpt"
-    assert on_disk["tokens"]["access_token"] == creds["access_token"]
+    assert tokens["access_token"] == creds["access_token"]
     # Old fields under ``tokens`` survive.
-    assert on_disk["tokens"]["old"] == "x"
+    assert tokens["old"] == "x"
 
 
 def test_load_missing_file_raises(tmp_path: Path) -> None:
@@ -348,8 +386,8 @@ def test_save_writes_id_token_when_present(tmp_path: Path) -> None:
     sentinel = "fake-jwt-marker"
     creds["id_token"] = sentinel
     OpenAISubscription.save(creds, path=target)
-    on_disk = json.loads(target.read_text(encoding="utf-8"))
-    assert on_disk["tokens"]["id_token"] == sentinel
+    on_disk = json_loads(target.read_text(encoding="utf-8"), dict[str, object])
+    assert from_plain(on_disk["tokens"], dict[str, object])["id_token"] == sentinel
 
 
 # Test-only token values; not credentials. Held in module variables so the
@@ -398,12 +436,15 @@ def test_subscription_model_uses_default_when_unset() -> None:
     )
 
 
-def test_subscription_default_model_is_openai_default_without_1m() -> None:
-    """Sub default = the API default's base id (``+1m`` is not in the catalog)."""
-    assert OpenAISubscription.catalog.resolve("default")[0].model_id == "sol-6.1"
-    assert OpenAI.catalog.resolve("default")[0].model_id == "sol-6.1"
-    # The narrowed default must resolve against the narrowed catalog.
-    assert "default" in OpenAISubscription.catalog.models
+def test_subscription_default_model_inherits_the_api_role(
+    synthetic_catalog: ModelTable,
+) -> None:
+    assert OpenAISubscription.catalog.resolve("default")[0].model_id == (
+        synthetic_catalog["default"].model_id
+    )
+    assert OpenAI.catalog.resolve("default")[0].model_id == (
+        synthetic_catalog["default"].model_id
+    )
 
 
 def test_subscription_default_utility_model_inherits_from_openai() -> None:
@@ -413,14 +454,15 @@ def test_subscription_default_utility_model_inherits_from_openai() -> None:
     )
 
 
-def test_subscription_utility_model_uses_utility_default() -> None:
-    m = _make_provider().model("utility")
-    assert m.capability.model_id == "luna-6.0"
+def test_subscription_utility_model_uses_utility_default(
+    synthetic_catalog: ModelTable,
+) -> None:
+    model = _make_provider().model("utility")
+    assert model.capability.model_id == synthetic_catalog["utility"].model_id
 
 
 def test_subscription_model_clamps_against_wire_contract() -> None:
     m = _make_provider().model("gpt-5.5")
-    # KNOWN_MODELS is clamped via ``_subscription_profile``.
     assert m.limits.max_request_tokens == 272_000
     assert m.limits.max_response_tokens == 32_000
 
@@ -471,15 +513,16 @@ async def test_subscription_provider_close_releases_sdk() -> None:
     provider = _make_provider()
     model = provider.model("gpt-5.5")
     sdk = MagicMock()
-    sdk.close = AsyncMock()
+    close = AsyncMock()
+    sdk.close = close
     provider._authed.set((cast(openai.AsyncOpenAI, sdk), "dummy-token"))
 
     await model.close()
-    sdk.close.assert_not_awaited()
+    close.assert_not_awaited()
     assert provider._authed.peek() == (sdk, "dummy-token")
 
     await provider.close_sdk()
-    sdk.close.assert_awaited_once()
+    close.assert_awaited_once()
     assert provider._authed.peek() is None
 
 
@@ -603,6 +646,42 @@ def test_a_request_with_tools_allows_parallel_tool_calls() -> None:
 
 def test_a_request_with_no_tools_says_nothing_about_parallel_calls() -> None:
     assert "parallel_tool_calls" not in _create_kwargs_for()
+
+
+def test_a_cache_key_routes_by_key_and_session_header() -> None:
+    """Live 2026-10-22: Codex reused a shared prefix only with both sent.
+
+    Four sol requests sharing a 5k-token prefix, differing after it: neither,
+    or the key alone, cached 0 tokens on every call; key plus the
+    ``session_id`` header cached 4,864 on calls 2-4.
+    """
+    model = _make_provider().model("sol-5.6")
+    request = ModelRequest(messages=[UserMessage(text="hi")], cache_key="run-1")
+
+    assert model._build_kwargs(request).get("prompt_cache_key") == "run-1"
+    assert model._headers(request) == {"session_id": "run-1"}
+
+
+def test_no_cache_key_sends_no_routing_hints() -> None:
+    model = _make_provider().model("sol-5.6")
+    request = ModelRequest(messages=[UserMessage(text="hi")])
+
+    assert "prompt_cache_key" not in model._build_kwargs(request)
+    assert model._headers(request) == {}
+
+
+def test_a_subscription_request_keeps_its_response_cap() -> None:
+    """Live 2026-10-18: Codex honors the cap; stripping it let a 300 cap ship 453.
+
+    The endpoint answered ``stop_reason=max_tokens`` at exactly the cap once the
+    field was sent, so dropping it disabled every caller's response budget.
+    """
+    model = _make_provider().model("sol-5.6")
+    request = ModelRequest(messages=[UserMessage(text="hi")], max_response_tokens=300)
+
+    body = dict(model._build_kwargs(request))
+
+    assert body["max_output_tokens"] == 300
 
 
 def _wire_effort_for(*, model_id: str, effort: ThinkingEffort) -> object:
@@ -1058,7 +1137,7 @@ class TestEnsureValidRace:
         assert provider._authed.peek() is None
 
 
-def _token_endpoint(access_token: str, *, expires_in: int = 3600) -> AsyncMock:
+def _token_endpoint(access_token: str, *, expires_in: int = 3600) -> _FakeAsyncClient:
     """Return a patched ``httpx2.AsyncClient`` whose POST issues ``access_token``."""
     response = MagicMock()
     response.status_code = 200
@@ -1069,11 +1148,21 @@ def _token_endpoint(access_token: str, *, expires_in: int = 3600) -> AsyncMock:
             "expires_in": expires_in,
         },
     )
-    http = AsyncMock()
-    http.post = AsyncMock(return_value=response)
-    http.__aenter__ = AsyncMock(return_value=http)
-    http.__aexit__ = AsyncMock(return_value=False)
-    return http
+    return _FakeAsyncClient(AsyncMock(return_value=response))
+
+
+class _FakeAsyncClient:
+    """An ``httpx2.AsyncClient`` stand-in: ``async with`` yields it; ``post`` records."""
+
+    def __init__(self, post: AsyncMock) -> None:
+        self.post = post
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *exc: object) -> bool:
+        del exc
+        return False
 
 
 class TestRefreshLifecycle:
@@ -1181,7 +1270,10 @@ class TestRefreshLifecycle:
             headers={"Content-Type": "application/json"},
             timeout=15.0,
         )
-        tokens = json.loads(slot.read_text(encoding="utf-8"))["tokens"]
+        tokens = from_plain(
+            json_loads(slot.read_text(encoding="utf-8"), dict[str, object])["tokens"],
+            dict[str, object],
+        )
         assert tokens == {
             "access_token": fresh,
             "refresh_token": _FRESH_REFRESH,
@@ -1267,17 +1359,25 @@ class TestRefreshLifecycle:
             await provider._refresh()
 
 
+def _sdk_raising(error: BaseException) -> tuple[MagicMock, AsyncMock]:
+    """Return an SDK whose ``responses.with_raw_response.create`` raises ``error``."""
+    create = AsyncMock(side_effect=error)
+    raw = MagicMock()
+    raw.create = create
+    responses = MagicMock()
+    responses.with_raw_response = raw
+    sdk = MagicMock()
+    sdk.responses = responses
+    return sdk, create
+
+
 class TestStreamResponseNotRead:
     """Unread SDK streaming errors must not leak raw httpx2 exceptions."""
 
     @pytest.mark.anyio
     async def test_create_response_not_read_is_user_facing(self) -> None:
         provider = _make_provider(expires_at=time.time() + 3600)
-        sdk = MagicMock()
-        sdk.responses = MagicMock()
-        sdk.responses.with_raw_response.create = AsyncMock(
-            side_effect=httpx2.ResponseNotRead(),
-        )
+        sdk, _ = _sdk_raising(httpx2.ResponseNotRead())
 
         with patch.object(provider, "get_sdk", AsyncMock(return_value=sdk)):
             model = provider.model("gpt-5.5")
@@ -1290,11 +1390,9 @@ class TestStreamResponseNotRead:
     @pytest.mark.anyio
     async def test_wrapped_response_not_read_is_user_facing(self) -> None:
         provider = _make_provider(expires_at=time.time() + 3600)
-        sdk = MagicMock()
-        sdk.responses = MagicMock()
         err = RuntimeError("SDK failed")
         err.__cause__ = httpx2.ResponseNotRead()
-        sdk.responses.with_raw_response.create = AsyncMock(side_effect=err)
+        sdk, _ = _sdk_raising(err)
 
         with patch.object(provider, "get_sdk", AsyncMock(return_value=sdk)):
             model = provider.model("gpt-5.5")
@@ -1334,12 +1432,8 @@ class TestStreamAuthRetry:
         # Return DIFFERENT SDKs from get_sdk so the test can prove the
         # retry call landed on a freshly-built SDK (with a rotated
         # bearer baked into default_headers), not the cached one.
-        sdk_stale = MagicMock()
-        sdk_stale.responses = MagicMock()
-        sdk_stale.responses.with_raw_response.create = AsyncMock(side_effect=auth_err)
-        sdk_fresh = MagicMock()
-        sdk_fresh.responses = MagicMock()
-        sdk_fresh.responses.with_raw_response.create = AsyncMock(side_effect=auth_err)
+        sdk_stale, create_stale = _sdk_raising(auth_err)
+        sdk_fresh, create_fresh = _sdk_raising(auth_err)
         get_sdk = AsyncMock(side_effect=[sdk_stale, sdk_fresh])
         with (
             patch.object(provider, "get_sdk", get_sdk),
@@ -1352,8 +1446,8 @@ class TestStreamAuthRetry:
         ha.assert_awaited_once()
         # Each SDK saw exactly one create call: the original attempt on
         # the stale SDK, the retry on the freshly-fetched one.
-        assert sdk_stale.responses.with_raw_response.create.await_count == 1
-        assert sdk_fresh.responses.with_raw_response.create.await_count == 1
+        assert create_stale.await_count == 1
+        assert create_fresh.await_count == 1
         assert get_sdk.await_count == 2
 
 
@@ -1484,13 +1578,9 @@ class _Lease:
         )
 
 
-def _answers(*responses: httpx2.Response) -> AsyncMock:
+def _answers(*responses: httpx2.Response) -> _FakeAsyncClient:
     """Return a patched ``httpx2.AsyncClient`` whose POSTs answer ``responses``."""
-    http = AsyncMock()
-    http.post = AsyncMock(side_effect=list(responses))
-    http.__aenter__ = AsyncMock(return_value=http)
-    http.__aexit__ = AsyncMock(return_value=False)
-    return http
+    return _FakeAsyncClient(AsyncMock(side_effect=list(responses)))
 
 
 def _answer(status: int, body: dict[str, object]) -> httpx2.Response:
@@ -1518,6 +1608,24 @@ async def test_a_leased_provider_never_posts_to_the_token_url() -> None:
     assert sdk.api_key == lease.fresh
     client.assert_not_called()
     assert not sub._default_credentials_path().parent.exists()
+
+
+@pytest.mark.anyio
+async def test_sdk_matches_the_api_key_client_transport() -> None:
+    """Connect waits out a network stall; only ``send_with_retry`` retries.
+
+    The SDK's own default (5s connect, two retries) failed fast and then
+    multiplied every attempt of the agent's retry loop by three.
+    """
+    lease = _Lease(_make_jwt({"exp": time.time() + 3600}))
+    provider = _borrowing(lease.fresh, lease=lease, expires_at=time.time() + 3600)
+    sdk = await provider.get_sdk()
+    await sdk.close()
+
+    timeout = sdk.timeout
+    assert isinstance(timeout, httpx2.Timeout)
+    assert (timeout.connect, timeout.read) == (30.0, 600.0)
+    assert sdk.max_retries == 0
 
 
 @pytest.mark.anyio
@@ -1549,12 +1657,14 @@ async def test_a_401_passes_the_rejected_token_to_the_lease() -> None:
     assert fresh.api_key == lease.fresh
 
 
-def _posted(http: AsyncMock) -> list[tuple[str, object]]:
+def _posted(http: _FakeAsyncClient) -> list[tuple[str, object]]:
     """Return each POST's URL and its JSON or form body, in order."""
-    return [
-        (str(call.args[0]), call.kwargs.get("json", call.kwargs.get("data")))
-        for call in http.post.await_args_list
-    ]
+    posted: list[tuple[str, object]] = []
+    for call in http.post.await_args_list:
+        url = cast(object, call.args[0])
+        body: Mapping[str, object] = call.kwargs
+        posted.append((str(url), body.get("json", body.get("data"))))
+    return posted
 
 
 @pytest.mark.anyio

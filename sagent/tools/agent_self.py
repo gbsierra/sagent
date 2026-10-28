@@ -875,8 +875,12 @@ def _commit_patch_plan(agent: AgentSelfAgent, plan: _PatchPlan) -> list[str]:
             context=incoming.context,
         )
         preview.adopt(agent.model.settings)
-        for name in ("thinking_effort", "thinking_budget", "service_tier"):
-            was, now = getattr(agent.model.settings, name), getattr(preview, name)
+        settings = agent.model.settings
+        for name, was, now in (
+            ("thinking_effort", settings.thinking_effort, preview.thinking_effort),
+            ("thinking_budget", settings.thinking_budget, preview.thinking_budget),
+            ("service_tier", settings.service_tier, preview.service_tier),
+        ):
             if was != now:
                 parts.append(f"{name}={now} (unsupported)")
         parts.extend(_describe_settings(plan))
@@ -1027,7 +1031,7 @@ def _plan_model(
             provider, inferred_auth = inferred
             auth = auth if auth is not None else inferred_auth
     allow = _allowed_providers()
-    if provider not in (None, spec.provider) and provider not in allow:
+    if provider is not None and provider != spec.provider and provider not in allow:
         return provider_not_allowed_result(provider, allow, spec.provider)
     try:
         return agent.prepare_model_change(

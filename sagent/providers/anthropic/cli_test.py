@@ -9,10 +9,11 @@ from unittest.mock import AsyncMock, MagicMock
 import asyncio
 import inspect
 import json
-import operator
 import os
 import re
 import tempfile
+
+from treekle import from_plain, json_loads
 
 import pytest
 
@@ -40,6 +41,7 @@ from sagent.providers.lib.subproc import (
     Subproc,
     SubprocessTransportError,
 )
+from sagent.tools.core import tool
 from sagent.types.model import ModelRequest, ModelResponse
 from sagent.types.runtime import (
     AgentSendMessage,
@@ -109,6 +111,37 @@ def _auth_status_logged_out(binary: str) -> bool | None:
     """Pretend the native CLI reports no active login."""
     del binary
     return False
+
+
+class _Peeks:
+    """Records each topic its tool was asked to peek at."""
+
+    def __init__(self) -> None:
+        self.topics: list[str] = []
+
+    def peek(self, topic: str) -> str:
+        """Peek at a topic."""
+        self.topics.append(topic)
+        return topic
+
+
+@pytest.mark.asyncio
+async def test_the_bridge_refuses_a_tool_the_request_withholds() -> None:
+    """The CLI runs tools through the bridge, where the runtime cannot refuse them."""
+    peeks = _Peeks()
+    model = AnthropicCLI().model("claude-haiku-4-5")
+    model._tools_bridge = ToolsBridge([])
+    model._sync_tools_bridge(
+        ModelRequest(
+            messages=[UserMessage(text="hi", offered_tools=("Look",))],
+            tools=[tool(peeks.peek, name="Look"), tool(peeks.peek, name="Peek")],
+        ),
+    )
+
+    _ = await model._tools_bridge._call_tool("Peek", {"topic": "withheld"})
+    _ = await model._tools_bridge._call_tool("Look", {"topic": "offered"})
+
+    assert peeks.topics == ["offered"]
 
 
 def test_cli_does_not_import_subscription_provider() -> None:
@@ -505,10 +538,15 @@ def test_model_unknown_raises() -> None:
         _ = provider.model("not-a-claude")
 
 
+def _call(fn: Callable[..., object], *args: object, **kwargs: object) -> object:
+    """Call ``fn`` past its signature, as a caller with a typo would."""
+    return fn(*args, **kwargs)
+
+
 def test_model_rejects_unknown_provider_options() -> None:
     provider = AnthropicCLI()
     with pytest.raises(TypeError, match="typoo"):
-        _ = operator.methodcaller("model", "opus-4.8", typoo=True)(provider)
+        _ = _call(provider.model, "opus-4.8", typoo=True)
 
 
 def test_model_resolves_context_tag_to_profile() -> None:
@@ -516,7 +554,7 @@ def test_model_resolves_context_tag_to_profile() -> None:
     provider = AnthropicCLI()
     model = provider.model("sonnet-4.6+200k")
     assert model.tagged_model_id == "sonnet-4.6+200k"
-    assert model.limits.max_request_tokens == 200_000
+    assert model.limits == provider.catalog.models["sonnet-4.6"].context["+200k"]
 
 
 def test_model_rejects_an_unknown_tag() -> None:
@@ -530,17 +568,20 @@ def test_catalog_inherits_from_anthropic() -> None:
     assert tuple(AnthropicCLI.catalog.models) == tuple(Anthropic.catalog.models)
 
 
-def test_utility_model_picks_latest_sonnet() -> None:
+def test_utility_model_resolves_role() -> None:
     provider = AnthropicCLI()
     model = provider.model("utility")
-    assert model.capability.model_id == "sonnet-5.5"
+    assert model.capability.model_id == provider.catalog.models["utility"].model_id
 
 
 def test_model_capabilities() -> None:
     """The CLI transport narrows the row it inherits from the API."""
     provider = AnthropicCLI()
     model = provider.model("claude-sonnet-4-5")
-    assert model.capability.thinking.budget != frozenset({"none"})
+    assert (
+        model.capability.thinking.budget
+        == provider.catalog.models["claude-sonnet-4-5"].thinking.budget
+    )
     assert model.capability.thinking.effort == frozenset({"none"})
     assert model.capability.cache_ttl_sec == frozenset({0.0})
     assert model.capability.manage_context_server_side == frozenset({True})
@@ -583,9 +624,10 @@ def test_argv_contains_required_flags() -> None:
     assert "--disable-slash-commands" in argv
     assert "bypassPermissions" in argv
     mcp_idx = argv.index("--mcp-config")
-    cfg = json.loads(argv[mcp_idx + 1])
-    assert cfg["mcpServers"]["sagent"]["type"] == "http"
-    assert cfg["mcpServers"]["sagent"]["url"].endswith("/mcp")
+    cfg = json_loads(argv[mcp_idx + 1], dict[str, object])
+    server = from_plain(cfg["mcpServers"], dict[str, dict[str, str]])["sagent"]
+    assert server["type"] == "http"
+    assert server["url"].endswith("/mcp")
 
 
 def test_argv_session_id_swaps_no_persistence_for_session_id_flag() -> None:
@@ -1158,7 +1200,7 @@ async def test_session_persistent_stream_returns_empty_when_history_cleared(
     # Stage 2: simulate post-``agent.clear()`` call: history is empty
     # but the provider's counters still think 2 messages were sent.
     request = ModelRequest(
-        system="terse",
+        system=("terse",),
         messages=[],
         tools=[],
     )
@@ -1174,7 +1216,7 @@ async def test_session_persistent_stream_returns_empty_when_history_cleared(
     # Provider state was reset: next real call will use ``--session-id``
     # (not ``--resume``).
     assert model._last_sent_index == 0
-    assert model._session_on_disk is False
+    assert model._session_on_disk is False  # pyrefly: ignore[unnecessary-comparison] -- pyrefly keeps the pre-call narrowing; the call mutates this state.
 
     # The stale on-disk JSONL was removed so the next ``--session-id``
     # spawn doesn't error with "Session ID is already in use".
@@ -1206,7 +1248,8 @@ class _ScriptedClaude:
                 },
             )
             return
-        text = json.loads(line)["message"]["content"]
+        message = json_loads(line, dict[str, object])["message"]
+        text = from_plain(message, dict[str, object])["content"]
         self._pending.extend(
             [
                 {
@@ -1528,11 +1571,11 @@ def test_clear_drops_pending_detached_buffer() -> None:
     model = provider.model("claude-haiku-4-5", session_id="sess-clear-detached")
     model._pending_detached_text = "[detached tool result] staged"
     model._reset_for_clear()
-    assert model._pending_detached_text is None, "session clear must drop the buffer"
+    assert model._pending_detached_text is None, "session clear must drop the buffer"  # pyrefly: ignore[unnecessary-comparison] -- pyrefly keeps the pre-call narrowing; the call mutates this state.
 
     model._pending_detached_text = "[detached tool result] staged"
     model._reset_active_state()
-    assert model._pending_detached_text is None, "respawn must drop the buffer"
+    assert model._pending_detached_text is None, "respawn must drop the buffer"  # pyrefly: ignore[unnecessary-comparison] -- pyrefly keeps the pre-call narrowing; the call mutates this state.
 
 
 @pytest.mark.asyncio
@@ -1607,7 +1650,7 @@ async def test_session_persistent_delivers_detached_result_as_trailing_entry(
     # ``request.messages`` carries only the already-sent history (no NEW
     # tape entry), but a detached result is pending.
     request = ModelRequest(
-        system="x",
+        system=("x",),
         messages=[UserMessage(text="old turn 1")],
         tools=[],
     )
@@ -1665,7 +1708,7 @@ async def test_stateless_exchange_delivers_pending_detached_result(
 
     # A real user turn plus a pending detached result.
     request = ModelRequest(
-        system="x",
+        system=("x",),
         messages=[UserMessage(text="hello")],
         tools=[],
     )
@@ -2371,7 +2414,7 @@ async def test_stream_failed_turn_keeps_proven_system_hash(
 
     with pytest.raises(SubprocessTransportError, match="boom"):
         _ = await model.stream(
-            ModelRequest(messages=[UserMessage(text="hi")], system=system),
+            ModelRequest(messages=[UserMessage(text="hi")], system=(system,)),
         )
 
     assert model._system_hash == hash_system("proven system")
@@ -2426,8 +2469,8 @@ async def test_stream_same_system_after_first_acquire_does_not_respawn(
 
     first = UserMessage(text="first")
     second = UserMessage(text="second")
-    _ = await model.stream(ModelRequest(messages=[first], system=system))
-    _ = await model.stream(ModelRequest(messages=[first, second], system=system))
+    _ = await model.stream(ModelRequest(messages=[first], system=(system,)))
+    _ = await model.stream(ModelRequest(messages=[first, second], system=(system,)))
 
     assert respawn_count == 0
     assert model._system_hash == hash_system(system)
@@ -2471,9 +2514,13 @@ async def test_stream_system_change_discards_warmed_old_system_spare(
     monkeypatch.setattr(model, "_send_entry", send_entry)
     monkeypatch.setattr(model, "_drain_until_result", drain_until_result)
 
-    _ = await model.stream(ModelRequest(messages=[UserMessage(text="a")], system="A"))
+    _ = await model.stream(
+        ModelRequest(messages=[UserMessage(text="a")], system=("A",)),
+    )
     await warmed.wait()
-    _ = await model.stream(ModelRequest(messages=[UserMessage(text="b")], system="B"))
+    _ = await model.stream(
+        ModelRequest(messages=[UserMessage(text="b")], system=("B",)),
+    )
 
     assert used_systems == ["A", "B"]
     assert spawned_systems == ["A", "A", "B"]
@@ -2510,9 +2557,12 @@ async def test_exchange_turn_skips_assistant_replay() -> None:
         publish=None,
     )
 
-    payloads = [json.loads(line) for line in lines]
+    messages = [
+        from_plain(json_loads(line, dict[str, object])["message"], dict[str, object])
+        for line in lines
+    ]
     assert response.message.text == ""
-    assert [payload["message"]["content"] for payload in payloads] == [
+    assert [message["content"] for message in messages] == [
         "first\n\nsecond",
     ]
 
@@ -2790,7 +2840,7 @@ async def test_stateless_stream_cancelled_interrupts_and_reraises(
     with pytest.raises(asyncio.CancelledError):
         await model.stream(request)
 
-    assert interrupted is True, "stream() must SIGINT the active proc on cancel"
+    assert interrupted is True, "stream() must SIGINT the active proc on cancel"  # pyrefly: ignore[unnecessary-comparison] -- pyrefly keeps the pre-call narrowing; the call mutates this state.
     assert respawn_count == 1, "stream() must respawn after a cancelled turn"
     assert model._last_sent_index == 0
 
@@ -2838,8 +2888,8 @@ async def test_session_persistent_stream_cancelled_interrupts_and_reraises(
     with pytest.raises(asyncio.CancelledError):
         await model.stream(request)
 
-    assert interrupted is True, "session stream must SIGINT the active proc on cancel"
-    assert closed is True, "session stream must close the proc on cancel"
+    assert interrupted is True, "session stream must SIGINT the active proc on cancel"  # pyrefly: ignore[unnecessary-comparison] -- pyrefly keeps the pre-call narrowing; the call mutates this state.
+    assert closed is True, "session stream must close the proc on cancel"  # pyrefly: ignore[unnecessary-comparison] -- pyrefly keeps the pre-call narrowing; the call mutates this state.
     assert model._active_proc is None
 
 
@@ -2905,7 +2955,7 @@ async def test_session_persistent_two_turns_mint_then_resume(
             return {
                 "type": "result",
                 "stop_reason": "end_turn",
-                "modelUsage": {},
+                "modelUsage": dict[str, object](),
                 "session_id": "s",
             }
 

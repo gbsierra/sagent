@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from http.client import HTTPResponse
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Thread
-from typing import TYPE_CHECKING, ClassVar, Final, Self, override
-from urllib import error, request
+from typing import TYPE_CHECKING, ClassVar, Final, Self, cast, override
+from urllib import request
 
 import atexit
 import os
@@ -16,7 +17,7 @@ import socket
 import subprocess
 import time
 
-from sagent.catalog.llamacpp import models
+from sagent.catalog.loader import models
 from sagent.catalog.openai import compatible
 from sagent.catalog.table import ModelCatalog
 from sagent.lib.userdirs import data_dir
@@ -27,7 +28,7 @@ from sagent.providers.openai.compat import (
 
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterable, Sequence
 
 
 class LlamaCpp(OpenAICompat):
@@ -36,7 +37,7 @@ class LlamaCpp(OpenAICompat):
     ENV_VAR: ClassVar[str] = "LLAMA_CPP_API_KEY"
     BASE_URL: ClassVar[str] = "http://127.0.0.1:8081/v1"
 
-    catalog = ModelCatalog(models=models(), transport=compatible())
+    catalog = ModelCatalog(models=models("llamacpp"), transport=compatible())
 
     def __init__(
         self,
@@ -266,12 +267,12 @@ def _start_log_reader(proc: subprocess.Popen[str], out: Queue[str]) -> None:
     if stream is None:
         return
 
-    def read_lines() -> None:
+    def read_lines(source: Iterable[str]) -> None:
         """Forward each stripped line from the subprocess stream to ``out``."""
-        for line in stream:
+        for line in source:
             out.put(line.rstrip())
 
-    Thread(target=read_lines, daemon=True).start()
+    Thread(target=read_lines, args=(stream,), daemon=True).start()
 
 
 def _looks_like_path(value: str) -> bool:
@@ -295,15 +296,15 @@ def _free_port() -> int:
     """Return an OS-assigned free localhost TCP port."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
+        return cast(tuple[str, int], sock.getsockname())[1]
 
 
 def _http_ok(url: str) -> bool:
     """Check whether a GET on ``url`` returns a 2xx response within 200ms."""
     try:
-        with request.urlopen(url, timeout=0.2) as response:  # noqa: S310 -- local/provider-supplied readiness URL only.
-            return bool(200 <= response.status < 300)
-    except (OSError, error.URLError):
+        with cast(HTTPResponse, request.urlopen(url, timeout=0.2)) as response:  # noqa: S310 -- local/provider-supplied readiness URL only.
+            return 200 <= response.status < 300
+    except OSError:
         return False
 
 

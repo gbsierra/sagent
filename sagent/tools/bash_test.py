@@ -741,7 +741,12 @@ async def test_a_descendant_that_leaves_the_group_cannot_hang_the_drain(
     state.bash_cwd = str(tmp_path)
     state.start_cwd = str(tmp_path)
     out = await asyncio.wait_for(
-        _run_foreground("setsid sleep 10 & echo started", state=state, timeout_s=0.2),
+        _run_foreground(
+            "setsid sleep 10 & echo started",
+            state=state,
+            timeout_s=0.05,
+            drain_sec=0.05,
+        ),
         timeout=5.0,
     )
     assert "started" in out, out
@@ -1429,7 +1434,7 @@ async def test_a_drain_returns_the_output_of_a_process_that_ends_once_the_pipes_
 
     comm = asyncio.ensure_future(ends_with_its_pipes())
     stdout = MagicMock()
-    stdout.feed_eof.side_effect = ended.set
+    stdout.feed_eof = MagicMock(side_effect=ended.set)
     proc = MagicMock(stdout=stdout, stderr=None)
     drained = await _drain(cast(asyncio.subprocess.Process, proc), comm, grace_sec=0.01)
     assert drained == (b"out", b"err")

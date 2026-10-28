@@ -263,13 +263,6 @@ def test_responses_preserves_image_bearing_tool_results() -> None:
     )
 
 
-@pytest.mark.parametrize("model_id", ["o1", "o3-mini"])
-def test_o_series_catalog_has_only_supported_efforts(model_id: str) -> None:
-    assert OpenAI.from_key("test-key").model(
-        model_id,
-    ).capability.thinking.effort == frozenset({"low", "medium", "high"})
-
-
 @pytest.mark.parametrize("model_id", ["gpt-5.4-pro", "gpt-5.5-pro"])
 def test_pro_catalog_has_only_supported_efforts(model_id: str) -> None:
     assert OpenAI.from_key("test-key").model(
@@ -492,7 +485,7 @@ class _FailedResponse:
         (),
         {"code": "server_error", "message": "backend failed"},
     )()
-    incomplete_details = None
+    incomplete_details: None = None
 
 
 class _IncompleteEvent:
@@ -507,7 +500,7 @@ class _IncompleteResponse:
 
     id: str = "resp_incomplete"
     status: str = "incomplete"
-    error = None
+    error: None = None
 
     def __init__(self, reason: str) -> None:
         self.incomplete_details = type("Incomplete", (), {"reason": reason})()

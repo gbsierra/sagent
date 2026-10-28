@@ -199,7 +199,7 @@ class PaperSearch:
             limit,
             year_from,
             year_to,
-            bool(open_access_only),
+            open_access_only,
             cap,
         )
         cached = _cache.get(cache_key)

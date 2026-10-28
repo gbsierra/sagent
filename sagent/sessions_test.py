@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from io import StringIO
 from pathlib import Path
+from typing import cast
 from unittest.mock import patch
 
 import dataclasses
@@ -747,7 +748,7 @@ def test_peek_session_reads_each_record_once(tmp_path: Path) -> None:
 
     def counting_loads(s: str | bytes, /) -> object:
         calls["n"] += 1
-        return real_loads(s)
+        return cast(object, real_loads(s))
 
     with patch.object(json, "loads", side_effect=counting_loads):
         info = _peek_session(sdir)
@@ -942,7 +943,7 @@ def test_migration_survives_one_unreadable_file(tmp_path: Path) -> None:
     def failing_copy2(source: str, target: str) -> str:
         if Path(source).name == "bad":
             raise OSError("unreadable")
-        return str(real_copy(source, target))
+        return real_copy(source, target)
 
     with patch.object(shutil, "copy2", failing_copy2):
         sessions._copy_tree_merge(src, tmp_path / "dst")

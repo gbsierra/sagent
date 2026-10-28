@@ -1158,7 +1158,9 @@ def test_next_line_keyboard_interrupt_preserves_queue() -> None:
         return "resumed"
 
     session.prompt_async = _prompt_async
+    printed = MagicMock()
     console = MagicMock()
+    console.print = printed
     queues = InputQueues(deferred=QueuedInputBlock(text="staged line"))
     src = PromptToolkitInputSource(
         cast("PromptSession[str]", session),
@@ -1168,7 +1170,7 @@ def test_next_line_keyboard_interrupt_preserves_queue() -> None:
     line = asyncio.run(src.next_line())
     assert line == "resumed"
     assert queues.has_any()
-    console.print.assert_not_called()
+    printed.assert_not_called()
 
 
 def test_quit_surfaces_queued_input_preview() -> None:
@@ -1179,7 +1181,9 @@ def test_quit_surfaces_queued_input_preview() -> None:
         return "/quit"
 
     session.prompt_async = _prompt_async
+    printed = MagicMock()
     console = MagicMock()
+    console.print = printed
     queues = InputQueues(deferred=QueuedInputBlock(text="queued line"))
     src = PromptToolkitInputSource(
         cast("PromptSession[str]", session),
@@ -1188,7 +1192,7 @@ def test_quit_surfaces_queued_input_preview() -> None:
     )
     line = asyncio.run(src.next_line())
     assert line is None
-    console.print.assert_called_once()
+    printed.assert_called_once()
     assert not queues.has_any()
 
 
@@ -1205,7 +1209,9 @@ def test_quit_discard_preview_includes_count_when_both_panes() -> None:
         return "/quit"
 
     session.prompt_async = _prompt_async
+    printed = MagicMock()
     console = MagicMock()
+    console.print = printed
     queues = InputQueues(
         queue=QueuedInputBlock(text="queued one"),
         deferred=QueuedInputBlock(text="deferred one"),
@@ -1217,8 +1223,8 @@ def test_quit_discard_preview_includes_count_when_both_panes() -> None:
     )
     line = asyncio.run(src.next_line())
     assert line is None
-    console.print.assert_called_once()
-    rendered = str(console.print.call_args.args[0])
+    printed.assert_called_once()
+    rendered = str(cast(object, printed.call_args.args[0]))
     assert "2" in rendered, f"discard preview must include count; got {rendered!r}"
     assert "messages" in rendered, (
         f"discard preview must use plural for >1 pane; got {rendered!r}"
@@ -1238,7 +1244,9 @@ def test_quit_discard_preview_shows_whole_body() -> None:
         return "/quit"
 
     session.prompt_async = _prompt_async
+    printed = MagicMock()
     console = MagicMock()
+    console.print = printed
     long_text = "x" * 200
     queues = InputQueues(deferred=QueuedInputBlock(text=long_text))
     src = PromptToolkitInputSource(
@@ -1248,7 +1256,7 @@ def test_quit_discard_preview_shows_whole_body() -> None:
     )
     line = asyncio.run(src.next_line())
     assert line is None
-    rendered = str(console.print.call_args.args[0])
+    rendered = str(cast(object, printed.call_args.args[0]))
     assert long_text in rendered, (
         f"discard preview must show the whole body; got {rendered!r}"
     )
@@ -1289,7 +1297,9 @@ def test_quit_discard_preview_shows_every_pane() -> None:
         return "/quit"
 
     session.prompt_async = _prompt_async
+    printed = MagicMock()
     console = MagicMock()
+    console.print = printed
     queues = InputQueues(
         queue=QueuedInputBlock(text="QUEUE-TEXT"),
         deferred=QueuedInputBlock(text="DEFERRED-TEXT"),
@@ -1300,7 +1310,7 @@ def test_quit_discard_preview_shows_every_pane() -> None:
         console=cast("Console", console),
     )
     assert asyncio.run(src.next_line()) is None
-    rendered = str(console.print.call_args.args[0])
+    rendered = str(cast(object, printed.call_args.args[0]))
     assert "QUEUE-TEXT" in rendered
     assert "DEFERRED-TEXT" in rendered, (
         f"deferred pane destroyed without being shown: {rendered!r}"

@@ -36,7 +36,8 @@ from treekle import MutablePlainTree, PlainTree, ReadError, from_plain, json_loa
 
 import fastjsonschema
 
-from sagent.catalog.anthropic import cli, models
+from sagent.catalog.anthropic import cli
+from sagent.catalog.loader import models
 from sagent.catalog.table import ModelCatalog
 from sagent.lib.atomic_file import atomic_write_bytes
 from sagent.providers.anthropic.api import Anthropic
@@ -340,7 +341,7 @@ class AnthropicCLI:
     the CLI emits on the terminal ``result`` event.
     """
 
-    catalog = ModelCatalog(models=models(), transport=cli())
+    catalog = ModelCatalog(models=models("anthropic"), transport=cli())
 
     supported_options: ClassVar[frozenset[str]] = frozenset[str]()
     """``from_credentials`` (the CLI wrapper) takes no construction options.
@@ -678,8 +679,10 @@ class _AnthropicCLIModel(CLISubprocessModel, ModelDefaults):
         # Tools the stateless ``stream`` stashes so ``_spawn_initialized``
         # can populate the bridge before launching ``claude`` (the CLI
         # lists tools right after launch). Empty in session mode, which
-        # syncs the bridge before its own spawn.
+        # syncs the bridge before its own spawn. The gate rides with them: a spare
+        # warmed mid-turn refreshes the bridge, and must not open what it withheld.
         self._pending_tools: list[Tool] = []
+        self._pending_allowed: frozenset[str] | None = None
         # Bridge ``list_tools`` count snapshotted per spawned proc (keyed
         # by ``id(proc)``); the turn's first ``_send_entry`` waits for the
         # count to exceed that proc's snapshot (proof THIS subprocess's MCP
@@ -830,7 +833,7 @@ class _AnthropicCLIModel(CLISubprocessModel, ModelDefaults):
               ``result`` event, or the CLI surfaced an error result.
 
         """
-        self._pending_system = request.system
+        self._pending_system = request.system_text
         # Clear the bridge sink when the turn ends (any exit) so a
         # stale runtime publisher never lingers on the long-lived bridge
         # -- e.g. a detached background ``call_tool`` firing between
@@ -850,8 +853,9 @@ class _AnthropicCLIModel(CLISubprocessModel, ModelDefaults):
             # ``_sync_tools_bridge`` below still refreshes the live
             # registry for the already-warm subprocess.
             self._pending_tools = list(request.tools)
+            self._pending_allowed = request.allowed_tools
             if self._should_respawn(request):
-                if hash_system(request.system) != self._system_hash:
+                if hash_system(request.system_text) != self._system_hash:
                     await self._hot_spare.discard_spare()
                 await self._hot_spare.respawn()
                 self._reset_active_state()
@@ -966,7 +970,7 @@ class _AnthropicCLIModel(CLISubprocessModel, ModelDefaults):
             return False
         return self._respawn_due(
             request.messages,
-            system=request.system,
+            system=request.system_text,
             max_request_tokens=self.limits.max_request_tokens,
         )
 
@@ -980,7 +984,10 @@ class _AnthropicCLIModel(CLISubprocessModel, ModelDefaults):
     ) -> None:
         """Refresh the MCP bridge's tool registry and runtime event sink."""
         if self._tools_bridge is not None:
-            self._tools_bridge.update_tools(list(request.tools))
+            self._tools_bridge.update_tools(
+                list(request.tools),
+                allowed=request.allowed_tools,
+            )
             self._tools_bridge.set_publish(publish)
 
     # The bridge runs background tool calls (those the model requested with
@@ -1186,7 +1193,10 @@ class _AnthropicCLIModel(CLISubprocessModel, ModelDefaults):
         # own ``_sync_tools_bridge`` before the spawn, leaving
         # ``_pending_tools`` empty (a no-op refresh).
         if self._pending_tools:
-            self._tools_bridge.update_tools(list(self._pending_tools))
+            self._tools_bridge.update_tools(
+                list(self._pending_tools),
+                allowed=self._pending_allowed,
+            )
         spawn_owned_tmpdir: Path | None
         tmpdir: Path | None
         if self._persistent_tmpdir is not None:
@@ -1696,7 +1706,7 @@ def _dispatch_stream_event(
     """Route one stream_event payload to the runtime ``publish`` sink."""
     event_type = event.get("type")
     if event_type == "content_block_start":
-        idx = int(cast(int, event.get("index") or 0))
+        idx = cast(int, event.get("index") or 0)
         block = cast(dict[str, MutablePlainTree], event.get("content_block") or {})
         if block.get("type") == "thinking":
             thinking_blocks.append(_new_thinking_block())
@@ -1711,7 +1721,7 @@ def _dispatch_stream_event(
         delta = cast(dict[str, MutablePlainTree], event.get("delta") or {})
         delta_type = delta.get("type")
         if delta_type == "input_json_delta":
-            idx = int(cast(int, event.get("index") or 0))
+            idx = cast(int, event.get("index") or 0)
             state = tool_use_blocks.get(idx)
             if state is not None:
                 partial = cast(str, delta.get("partial_json") or "")
@@ -1742,7 +1752,7 @@ def _dispatch_stream_event(
             return
         return
     if event_type == "content_block_stop":
-        idx = int(cast(int, event.get("index") or 0))
+        idx = cast(int, event.get("index") or 0)
         state = tool_use_blocks.pop(idx, None)
         if state is None:
             return
@@ -1790,12 +1800,12 @@ def _render_tool_args(raw_json: str) -> str:
     if not raw_json:
         return ""
     try:
-        args = json.loads(raw_json)
+        args = json_loads(raw_json)
     except (json.JSONDecodeError, ValueError):
         return f"({raw_json.replace(chr(10), ' ')})"
     if not isinstance(args, dict):
         return str(args)
-    arg_map = cast(dict[object, object], args)
+    arg_map = args
     for key in ("command", "file_path", "path", "pattern", "query", "to"):
         val = arg_map.get(key)
         if isinstance(val, str):

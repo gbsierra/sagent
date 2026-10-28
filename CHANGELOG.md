@@ -3,6 +3,77 @@
 All notable sagent changes are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Added
+
+- A `Memory` tool saves and forgets project memories and keeps `MEMORY.md`
+  in step with them, newest first. It is in the default toolset wherever the
+  model is shown the memory index: an `--ephemeral` session, or a recipe
+  without the `memory` section, leaves it out and refuses `--tools Memory`.
+- `--system-prompt` replaces the recipe's base prompt, and
+  `--append-system-prompt` adds instructions after it.
+- `Agent(append_system=..., prompt_context=...)`. A `prompt_context`
+  (`prompt.SagentContext` for the CLI's) renders the project instructions
+  and the environment. `Agent.reminders` holds standing context a host keeps
+  in force, and tools may implement `types.tools.Reminding`.
+- `SystemMessage`, a history entry for what the harness tells the model (the
+  environment, tool and host reminders, a tool-gate change). It is no one's
+  turn, is never merged into a human's or a peer's message, and persists as a
+  `system_message` record that session readers report as a system message. On the
+  wire it is a `<system-reminder>` in the user turn it follows, as before.
+- `UserMessage.offered_tools`, set on the wire turn a gate-changing system
+  message folds into, and `ModelRequest.allowed_tools`, read from the latest
+  one. `UserMessage.cache_point` now persists, and survives a merge.
+
+### Changed
+
+- The system prompt is a tuple of blocks (`ModelRequest.system`), built once
+  per context and rebuilt on `/clear`, compaction and resume, and when
+  `replace_tool` rewords a tool's prompt. Anthropic marks
+  each block as a cache point, so a child with its parent's tools reads the
+  parent's cached prefix. What changes -- the environment, the agents one can
+  message, the spawn budget, the tool gate -- reaches the model as an
+  appended `SystemMessage`, retold whenever the context stops holding it.
+- `Agent.tool_gate` masks tools instead of removing their schemas: Anthropic
+  withdraws them with the inline-tools beta, OpenAI receives
+  `tool_choice: allowed_tools`, and a call outside the gate its request
+  offered is refused on every provider.
+- The root agent gets `BackgroundTask` with `AgentSpawn`, as a child does.
+- A merge of user-side messages from different senders labels each part with
+  its own sender instead of giving the whole an `AgentSendMessage` source.
+
+### Removed
+
+- `sagent.lib.worker_count` is no longer part of the package. It moved, with
+  the pre-commit gates that use it, to `tools/gate/` at the repository root,
+  which the wheel does not ship.
+- `--system`, which added instructions; it now fails with a pointer to
+  `--append-system-prompt` and `--system-prompt`.
+- `AgentSpawn`'s `hot` argument and `Agent(frozen_system=...)`: every child
+  now shares its parent's system blocks. A persistent child a hot spawn saved
+  is not resumed: its saved prompt is its parent's whole rendered prompt.
+- `Agent(system=<callable>)` and `SystemPromptArg`; `system` is a string.
+- `prompt.build_system` and `prompt.build_system_dict`, replaced by
+  `prompt.static_prompt`, `prompt.project_context`,
+  `prompt.render_environment` and `prompt.SagentContext`.
+
+## 0.1.20 - 2026-10-21
+
+### Changed
+
+- Every Anthropic and OpenAI client waits 30 seconds to connect, up from the
+  SDKs' 5, and leaves retries to `send_with_retry` (`max_retries=0`). One
+  stalled attempt used to cost three connects.
+- An exception with no message renders as its type alone (`ConnectTimeout`,
+  not `ConnectTimeout: `) in retry notes, tool errors and the REPL; retry
+  delays show tenths of a second.
+- The wheel no longer ships `sagent.lib.testing` or the
+  `scripts/repro_ctrld_hang.py` repro, which import test-only modules.
+- `restore_model` keeps the default model with an info line, not an error and a
+  traceback, when the session's auth has no `from_<auth>` constructor (such as
+  a lease a caller builds itself); the caller's next turn sets its model.
+
 ## 0.1.19 - 2026-10-07
 
 ### Added
