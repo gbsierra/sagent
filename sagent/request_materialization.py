@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Final
 import dataclasses
 
 from sagent.agent.state import approx_tokens
+from sagent.compaction.pruner import prune_messages
 from sagent.types.runtime import (
     AgentSendMessage,
     AssistantMessage,
@@ -92,13 +93,19 @@ def materialize_request(
     request: ModelRequest,
     *,
     tool_result_budget_tokens: int = 0,
+    prune_tail_turns: int = 6,
+    elide_thinking: bool = True,
 ) -> ModelRequest:
-    """Return ``request`` with provider-visible messages budgeted.
+    """Return ``request`` with provider-visible messages budgeted and pruned.
 
     Args:
       request: Fully-built provider request.
       tool_result_budget_tokens: Aggregate TOKEN budget for full
           ``ToolResult.content`` values. ``0`` disables tool-result elision.
+      prune_tail_turns: Active working tail turns protected from observation
+          pruning (default 6).
+      elide_thinking: Whether to elide historical thinking blocks older than N-1
+          (default True).
 
     Returns:
       materialized: Request with the same knobs and budgeted messages.
@@ -109,6 +116,8 @@ def materialize_request(
         messages=materialize_messages(
             request.messages,
             tool_result_budget_tokens=tool_result_budget_tokens,
+            prune_tail_turns=prune_tail_turns,
+            elide_thinking=elide_thinking,
         ),
     )
 
@@ -117,22 +126,35 @@ def materialize_messages(
     messages: Sequence[ModelContextEvent],
     *,
     tool_result_budget_tokens: int = 0,
+    prune_tail_turns: int = 6,
+    elide_thinking: bool = True,
 ) -> list[ModelContextEvent]:
-    """Return provider-visible messages with full results under budget.
+    """Return provider-visible messages with full results pruned and budgeted.
 
     Args:
       messages: Resolved provider-facing history.
       tool_result_budget_tokens: Aggregate TOKEN budget for full
           ``ToolResult.content`` values. ``0`` disables tool-result elision.
+      prune_tail_turns: Active working tail turns protected from observation
+          pruning (default 6).
+      elide_thinking: Whether to elide historical thinking blocks older than N-1
+          (defaults to False for Step 2; enabled in Step 3).
 
     Returns:
       materialized: Message list with excess tool results replaced by
           non-empty placeholders while preserving message ordering and ids.
 
     """
+    # Deterministic observation pruning and thinking elision on wire assembly.
+    # Empirical: -32,634 observation tokens, -134,700 thinking tokens at Turn 50 in 0.07ms ($0 cost).
+    pruned = prune_messages(
+        messages,
+        tail_turns=prune_tail_turns,
+        elide_thinking=elide_thinking,
+    )
     if tool_result_budget_tokens <= 0:
-        return _coalesce_adjacent_users(_label_agent_sends(messages))
-    labelled = list(_label_agent_sends(messages))
+        return _coalesce_adjacent_users(_label_agent_sends(pruned))
+    labelled = list(_label_agent_sends(pruned))
     used = 0
     keep_calls: set[str] = set()
     out_reversed: list[ModelContextEvent] = []
