@@ -86,7 +86,12 @@ def post_process_result(
         persist_tokens=persist_tokens,
         max_chars=max_chars,
     ):
-        preview = _persist_oversized(result.call_id, content, session_dir=session_dir)
+        preview = _persist_oversized(
+            result.call_id,
+            content,
+            tool_name=tool_name,
+            session_dir=session_dir,
+        )
         if preview is not None:
             return dataclasses.replace(result, content=preview)
     return result
@@ -117,7 +122,7 @@ def stub_cost_tokens(content: str, *, preview_chars: int = 2_000) -> int:
         f"{'x' * 40}.txt\n\n"
         f"Preview (first {preview_chars:,} chars):\n"
         f"{content[:preview_chars]}\n...\n"
-        f'[Use Read(file_path="path", offset=1) or Read(start_line=1) to read remaining {total_lines} lines]\n'
+        f"[Use Read(offset=1, limit=500) or Read(start_line=1, limit=500) to read remaining {total_lines} lines]\n"
         f"</persisted-output>",
     )
 
@@ -126,6 +131,7 @@ def _persist_oversized(
     call_id: str,
     content: str,
     *,
+    tool_name: str = "",
     session_dir: Path | None,
     preview_chars: int = 2_000,
 ) -> str | None:
@@ -157,12 +163,22 @@ def _persist_oversized(
     has_more = len(content) > len(preview)
     next_line = preview_lines + 1
     remaining_lines = max(0, total_lines - preview_lines)
+    chunk_size = min(500, max(50, remaining_lines))
     if has_more:
-        more = (
-            f"\n...\n"
-            f'[Use Read(file_path="{filepath}", offset={next_line}) or '
-            f"Read(start_line={next_line}) to read remaining {remaining_lines} lines]\n"
-        )
+        if tool_name.lower() == "read":
+            more = (
+                f"\n...\n"
+                f"[Use Read(offset={next_line}, limit={chunk_size}) or "
+                f"Read(start_line={next_line}, limit={chunk_size}) to read next {chunk_size} lines. "
+                f"Full output archived to: {filepath}]\n"
+            )
+        else:
+            more = (
+                f"\n...\n"
+                f'[Use Read(file_path="{filepath}", offset={next_line}, limit={chunk_size}) '
+                f"to read next {chunk_size} lines, or inspect via Bash. "
+                f"Full output saved to: {filepath}]\n"
+            )
     else:
         more = "\n"
     return (

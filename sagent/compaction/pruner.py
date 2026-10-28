@@ -49,6 +49,8 @@ if TYPE_CHECKING:
 
 
 DEFAULT_TAIL_TURNS: Final = 6
+BASH_ELIDE_MIN_LINES: Final = 10
+BASH_ELIDE_MIN_CHARS: Final = 500
 
 _EXIT_CODE_PATTERN: Final = re.compile(r"\[exit code:\s*(-?\d+)\]")
 
@@ -155,7 +157,12 @@ def elide_historical_thinking(
             and isinstance(event, AssistantMessage)
             and event.thinking_blocks
         ):
-            out.append(dataclasses.replace(event, thinking_blocks=()))
+            # Preserve opaque encrypted reasoning tokens required by OpenAI's
+            # all_turns reasoning context, while eliding plain-text historical thinking.
+            preserved = tuple(
+                b for b in event.thinking_blocks if "encrypted_content" in b
+            )
+            out.append(dataclasses.replace(event, thinking_blocks=preserved))
         else:
             out.append(event)
 
@@ -241,9 +248,9 @@ def prune_messages(
                 for tc in event.tool_calls:
                     call_map[tc.id] = (tc, t_idx)
 
-    # 2. Identify superseded reads across pre-tail turns
+    # 2. Identify reads across ALL turns: path -> list of (turn_idx, call_id)
     reads_by_path: dict[str, list[tuple[int, str]]] = {}
-    for t_idx, turn in enumerate(pre_tail_turns):
+    for t_idx, turn in enumerate(turns):
         for event in turn:
             if isinstance(event, AssistantMessage):
                 for tc in event.tool_calls:
@@ -255,11 +262,14 @@ def prune_messages(
                                 (t_idx, tc.id)
                             )
 
+    # A read call in pre-tail turns is superseded if a subsequent read of the same
+    # path occurred at a later turn (either in pre-tail or within the active tail).
     superseded_call_ids: dict[str, str] = {}
     for path_str, read_list in reads_by_path.items():
         if len(read_list) > 1:
-            for _, call_id in read_list[:-1]:
-                superseded_call_ids[call_id] = path_str
+            for t_idx, call_id in read_list[:-1]:
+                if t_idx < pre_tail_count:
+                    superseded_call_ids[call_id] = path_str
 
     # 3. Assemble pruned messages
     out: list[ModelContextEvent] = []
@@ -278,7 +288,9 @@ def prune_messages(
                     out.append(dataclasses.replace(event, content=marker))
                     continue
 
-                # Case B: Clean bash stdout scrubbing (rc=0, older than 2 turns)
+                # Case B: Clean bash stdout scrubbing (rc=0, older than 2 turns outside tail)
+                # Only scrub verbose outputs (>10 lines or >500 chars). Short discovery
+                # commands (git log -1, git status, which, etc.) stay verbatim.
                 tc_info = call_map.get(cid)
                 if (
                     tc_info is not None
@@ -287,11 +299,14 @@ def prune_messages(
                     and not _is_failed_bash(event)
                 ):
                     line_count = len(event.content.splitlines()) if event.content else 0
-                    summary = (
-                        f"[Command succeeded: rc=0, {max(1, line_count)} lines elided]"
-                    )
-                    out.append(dataclasses.replace(event, content=summary))
-                    continue
+                    char_count = len(event.content) if event.content else 0
+                    if (
+                        line_count > BASH_ELIDE_MIN_LINES
+                        or char_count > BASH_ELIDE_MIN_CHARS
+                    ):
+                        summary = f"[Command succeeded: rc=0, {max(1, line_count)} lines elided]"
+                        out.append(dataclasses.replace(event, content=summary))
+                        continue
 
             out.append(event)
 

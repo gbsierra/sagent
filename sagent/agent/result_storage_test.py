@@ -380,6 +380,42 @@ def test_persist_raises_on_a_zero_byte_write_instead_of_spinning(
     assert PERSISTED_TAG not in out.content
 
 
+def test_read_oversized_hint_targets_original_file_with_limit(tmp_path: Path) -> None:
+    """Read hints direct agent to paginate the original file with limit to prevent re-spill."""
+    lines = [f"{i}\tprint({i})" for i in range(1, 1500)]
+    content = "\n".join(lines)
+    out = post_process_result(
+        ToolResult(call_id="call_read_hint", content=content),
+        "Read",
+        session_dir=tmp_path,
+        persist_tokens=100,
+        max_chars=5_000,
+    )
+    assert PERSISTED_TAG in out.content
+    assert "limit=" in out.content
+    assert "offset=" in out.content
+    assert (
+        "Read(file_path=" not in out.content
+    )  # Avoids double line numbers by reading original file
+    assert "Full output archived to:" in out.content
+
+
+def test_bash_oversized_hint_includes_limit(tmp_path: Path) -> None:
+    """Bash hints provide limit= to prevent infinite re-spill pagination loops."""
+    lines = [f"output_line_{i}" for i in range(1500)]
+    content = "\n".join(lines)
+    out = post_process_result(
+        ToolResult(call_id="call_bash_hint", content=content),
+        "Bash",
+        session_dir=tmp_path,
+        persist_tokens=100,
+        max_chars=5_000,
+    )
+    assert PERSISTED_TAG in out.content
+    assert "limit=" in out.content
+    assert "file_path=" in out.content
+
+
 if __name__ == "__main__":
     from sagent.lib.testing.runner import test_main
 

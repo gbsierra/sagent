@@ -289,6 +289,108 @@ def test_pruning_latency_under_1ms() -> None:
     assert elapsed_ms < 1.0
 
 
+def test_short_bash_discovery_stdout_preserved() -> None:
+    """Discovery bash outputs (<= 10 lines and <= 500 chars) are kept verbatim."""
+    events: list[ModelContextEvent] = [UserMessage(text="Inspect repository")]
+    discovery_stdout = "e512c8a15cf35fb44d990b691e669d7872de4584\n"
+    am1, tr1 = _create_bash_pair(
+        "c_bash_discovery", "git rev-parse HEAD", discovery_stdout, rc=0
+    )
+    events.extend([am1, tr1])
+
+    # Intermediary turn older than tail
+    events.append(UserMessage(text="Next step"))
+    events.append(AssistantMessage(text="Continuing..."))
+
+    # 6 active tail turns
+    for i in range(1, 7):
+        events.append(UserMessage(text=f"Tail user {i}"))
+        events.append(AssistantMessage(text=f"Tail asst {i}"))
+
+    pruned = prune_messages(events, tail_turns=6, elide_thinking=False)
+    res_bash = next(
+        e
+        for e in pruned
+        if isinstance(e, ToolResult) and e.call_id == "c_bash_discovery"
+    )
+    assert res_bash.content == discovery_stdout
+
+
+def test_read_in_pre_tail_superseded_by_read_in_active_tail() -> None:
+    """A pre-tail file read is superseded when re-read inside the active tail."""
+    events: list[ModelContextEvent] = [UserMessage(text="Initial inspection")]
+    am_old, tr_old = _create_read_pair(
+        "c_read_old", "config.py", "OLD CONFIG CONTENT\n"
+    )
+    events.extend([am_old, tr_old])
+
+    # Intermediary turn older than tail
+    events.append(UserMessage(text="Middle step"))
+    events.append(AssistantMessage(text="Continuing..."))
+
+    # Active tail turns: re-read config.py in turn 3 of tail
+    for i in range(1, 7):
+        events.append(UserMessage(text=f"Tail user {i}"))
+        if i == 3:
+            am_tail, tr_tail = _create_read_pair(
+                "c_read_tail", "config.py", "FRESH ACTIVE CONFIG CONTENT\n"
+            )
+            events.extend([am_tail, tr_tail])
+        else:
+            events.append(AssistantMessage(text=f"Tail asst {i}"))
+
+    pruned = prune_messages(events, tail_turns=6, elide_thinking=False)
+    res_old = next(
+        e for e in pruned if isinstance(e, ToolResult) and e.call_id == "c_read_old"
+    )
+    res_tail = next(
+        e for e in pruned if isinstance(e, ToolResult) and e.call_id == "c_read_tail"
+    )
+    assert "[Read of config.py superseded by later turn]" in res_old.content
+    assert res_tail.content == "FRESH ACTIVE CONFIG CONTENT\n"
+
+
+def test_elide_historical_thinking_preserves_encrypted_reasoning_blocks() -> None:
+    """Historical assistant messages preserve encrypted_content for OpenAI all_turns."""
+    encrypted_block = {
+        "type": "reasoning",
+        "encrypted_content": "opaque-token-for-openai-reasoning-context",
+    }
+    plaintext_thought_block = {
+        "type": "thinking",
+        "thinking": "This internal thinking text should be pruned",
+    }
+
+    turn1_asst = AssistantMessage(
+        text="Turn 1 answer",
+        thinking_blocks=(encrypted_block, plaintext_thought_block),
+    )
+    turn2_asst = AssistantMessage(
+        text="Turn 2 answer",
+        thinking_blocks=(plaintext_thought_block,),
+    )
+
+    events: list[ModelContextEvent] = [
+        UserMessage(text="Turn 1 prompt"),
+        turn1_asst,
+        UserMessage(text="Turn 2 prompt"),
+        turn2_asst,
+    ]
+
+    pruned = elide_historical_thinking(events)
+
+    # Turn 1 is historical relative to Turn 2:
+    asst1_pruned = pruned[1]
+    assert isinstance(asst1_pruned, AssistantMessage)
+    assert len(asst1_pruned.thinking_blocks) == 1
+    assert asst1_pruned.thinking_blocks[0] == encrypted_block
+
+    # Turn 2 is the latest assistant message: thinking blocks kept verbatim
+    asst2_pruned = pruned[3]
+    assert isinstance(asst2_pruned, AssistantMessage)
+    assert asst2_pruned.thinking_blocks == (plaintext_thought_block,)
+
+
 if __name__ == "__main__":
     from sagent.lib.testing.runner import test_main
 
