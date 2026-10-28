@@ -8,6 +8,7 @@ lets ``*`` skip ``.env`` while ``.*`` finds it.
 
 from __future__ import annotations
 
+from functools import cache
 from pathlib import Path
 from stat import S_ISDIR
 from typing import Final
@@ -188,6 +189,7 @@ def _glob_rignore(
 
 # Gitignore semantics, as fd and rignore read a glob: ``*`` and ``?`` stop at
 # ``/``, ``**`` spans directories (``**/`` also matches none), ``{a,b}`` picks one.
+@cache
 def _translate(pattern: str) -> str:
     """Return a regex matching exactly the root-relative paths ``pattern`` names."""
     out: list[str] = []
